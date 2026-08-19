@@ -791,6 +791,62 @@ describe("BrainOverview", () => {
     expect(screen.queryByText("loading data")).toBeNull();
   });
 
+  it("reports an honest partial refresh when a block is not configured", async () => {
+    const refreshedAt = new Date().toISOString();
+    const mixedView: ViewDefinition = {
+      ...populatedView,
+      slots: [
+        {
+          ...populatedView.slots[0],
+          value: {
+            ...populatedView.slots[0].value!,
+            artifactVersion: 3,
+            updatedAt: refreshedAt,
+          },
+        },
+        {
+          ...populatedView.slots[0],
+          id: "meeting-commitments",
+          title: "Meeting commitments",
+          order: 1,
+          binding: null,
+          value: null,
+        },
+      ],
+    };
+    mocks.listBrainViews.mockResolvedValue({
+      status: "ok",
+      data: [mixedView],
+    });
+    render(<BrainOverview />);
+
+    expect(
+      await screen.findByTestId("overview-unconfigured-blocks"),
+    ).toHaveTextContent("1 Block is not connected to a scheduled task");
+    expect(
+      screen.getByTestId("overview-card-source-status-meeting-commitments"),
+    ).toHaveTextContent("not configured");
+
+    fireEvent.click(screen.getByTestId("overview-refresh-data"));
+
+    expect(
+      await screen.findByTestId("live-view-data-status"),
+    ).toHaveTextContent("1 of 2 sections updated · 1 not configured");
+    await waitFor(() =>
+      expect(mocks.capture).toHaveBeenCalledWith(
+        "live_view_refresh_completed",
+        expect.objectContaining({
+          status: "partial",
+          requested_block_count: 2,
+          connected_block_count: 1,
+          unconfigured_block_count: 1,
+          refreshed_block_count: 1,
+          all_requested_blocks_refreshed: false,
+        }),
+      ),
+    );
+  });
+
   it("captures a failed refresh outcome without sending Pipe names", async () => {
     mocks.listBrainViews.mockResolvedValue({
       status: "ok",
@@ -912,7 +968,7 @@ describe("BrainOverview", () => {
       "live-view-ai-prompt",
     )) as HTMLTextAreaElement;
     expect(prompt).toBeDisabled();
-    expect(prompt.placeholder).toBe("Hosted AI limit reached");
+    expect(prompt.placeholder).toBe("AI limit reached");
     expect(screen.getByTestId("live-view-ai-options")).toHaveAttribute(
       "aria-hidden",
       "true",
@@ -1122,18 +1178,31 @@ describe("BrainOverview", () => {
 
     // Enabling alone is not enough: a `manual` schedule leaves the scheduler
     // with nothing to fire, so the block would freeze again after this refresh.
+    //
+    // The fields go at the top level. `POST /pipes/:id/config` flattens the
+    // request body into its update map, so a `config` envelope arrives as one
+    // unrecognized key, gets filed under free-form user config, and still
+    // answers `{"success": true}` with the schedule untouched. This assertion
+    // used to accept the envelope, which is how the write shipped applying
+    // nothing at all while every refresh reported success.
     await waitFor(() =>
       expect(
         calls.some((call) => {
-          const config = (call.body as { config?: Record<string, unknown> })?.config;
+          const body = call.body as Record<string, unknown> | null;
           return (
             call.path === "/pipes/daily-summary/config" &&
-            config?.schedule === "every 1h" &&
-            config?.enabled === true
+            body?.schedule === "every 1h" &&
+            body?.enabled === true
           );
         }),
       ).toBe(true),
     );
+    // No envelope: a nested `config` key would be silently ignored by the API.
+    expect(
+      calls.every(
+        (call) => !(call.body as { config?: unknown } | null)?.config,
+      ),
+    ).toBe(true);
     const configIndex = calls.findIndex((call) => call.path.endsWith("/config"));
     const runIndex = calls.findIndex((call) => call.path.endsWith("/run"));
     expect(configIndex).toBeGreaterThanOrEqual(0);
@@ -1193,6 +1262,9 @@ describe("BrainOverview", () => {
 
     await screen.findByTestId("brain-overview-scroll");
     expect(screen.queryByTestId("overview-freshness")).toBeNull();
+    expect(
+      screen.getByTestId("overview-unconfigured-blocks"),
+    ).toHaveTextContent("1 Block is not connected to a scheduled task");
   });
 
   it("keeps vertical scrolling on the dashboard while dense tables can scroll sideways", async () => {
@@ -1993,9 +2065,11 @@ describe("BrainOverview", () => {
         ],
       }),
     );
+    // jsdom has no tauri os plugin, so usePlatform resolves non-mac and the
+    // hint renders the Ctrl form (platform-correct hints, not hardcoded ⌘).
     expect(await screen.findByTestId("overview-undo")).toHaveAttribute(
       "title",
-      "Undo last Live View change (⌘Z)",
+      "Undo last Live View change (Ctrl+Z)",
     );
 
     fireEvent.keyDown(window, { key: "z", metaKey: true });

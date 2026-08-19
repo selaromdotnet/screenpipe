@@ -12,7 +12,10 @@ import {
   setFirstRunGuidePending,
   setFirstRunGuideReplayAfterOnboarding,
 } from "@/lib/first-run-guide";
-import { resetLearningWindow } from "@/lib/first-run/learning-window";
+import {
+  LEARNING_WINDOW_RESET_EVENT,
+  resetLearningWindow,
+} from "@/lib/first-run/learning-window";
 import type { OnboardingLiveViewFlowProperties } from "@/lib/analytics/onboarding-funnel";
 
 export type OnboardingCompletionContext = {
@@ -184,7 +187,14 @@ export const useOnboarding = create<OnboardingState>((set, get) => ({
         setFirstRunGuideReplayAfterOnboarding(false);
         // Clear any half-finished window so a replayed setup opens a fresh one
         // instead of resuming a countdown against the previous run's cutoff.
+        //
+        // Settings and the lifecycle owner both run in Home. The local write
+        // clears their shared storage; the event makes the already-mounted
+        // hook observe that reset immediately instead of waiting for a remount.
         resetLearningWindow();
+        await emit(LEARNING_WINDOW_RESET_EVENT).catch(() => {
+          // Storage is already clear; the mounted hook will recover on remount.
+        });
         // Update local state
         set((state) => ({
           onboardingData: {

@@ -17,6 +17,7 @@ use crate::{
     analytics,
     hot_frame_cache::HotFrameCache,
     routes::{
+        activity_ledger::get_activity_ledger,
         activity_summary::get_activity_summary,
         artifacts::{
             delete_artifact_handler, list_artifacts_handler, register_artifact_handler,
@@ -89,7 +90,7 @@ use std::{
     panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -207,9 +208,6 @@ pub struct AppState {
     pub archive_state: crate::archive::ArchiveState,
     /// Local data retention state (auto-delete old data)
     pub retention_state: crate::retention::RetentionState,
-    /// Product policy shared with the desktop shell. When true, direct local
-    /// API calls are clamped to enabled/7 days/all.
-    pub enforce_free_plan_retention: Arc<AtomicBool>,
     /// Vault lock manager — encrypts data at rest when locked
     pub vault: screenpipe_vault::VaultManager,
     /// Active manually-started meeting id (set via POST /meetings/start, cleared via POST /meetings/stop)
@@ -310,8 +308,6 @@ pub struct SCServer {
     /// because LAN clients cannot reach those addresses and Windows may show a
     /// firewall prompt for an otherwise local-only CLI run.
     pub advertise_mdns: bool,
-    /// Shared runtime switch for the desktop free-plan retention policy.
-    pub enforce_free_plan_retention: Arc<AtomicBool>,
 }
 
 fn should_advertise_mdns(addr: SocketAddr) -> bool {
@@ -410,7 +406,6 @@ impl SCServer {
             vision_manager: Arc::new(ArcSwap::from_pointee(None)),
             timeline_disabled: false,
             advertise_mdns: should_advertise_mdns(addr),
-            enforce_free_plan_retention: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -828,7 +823,6 @@ impl SCServer {
             hot_frame_cache,
             archive_state: crate::archive::ArchiveState::new(),
             retention_state: crate::retention::RetentionState::new(),
-            enforce_free_plan_retention: self.enforce_free_plan_retention.clone(),
             pipe_permissions: self.pipe_permissions.clone(),
             vault: screenpipe_vault::VaultManager::new(self.screenpipe_dir.clone()),
             manual_meeting: self
@@ -967,6 +961,7 @@ impl SCServer {
             .get("/elements", search_elements)
             .get("/frames/:frame_id/elements", get_frame_elements)
             .get("/activity-summary", get_activity_summary)
+            .get("/activity-ledger", get_activity_ledger)
             // Vault routes
             .get("/vault/status", crate::routes::vault::vault_status)
             .post("/vault/lock", crate::routes::vault::vault_lock)
@@ -977,6 +972,7 @@ impl SCServer {
             .get("/sync/status", sync_api::sync_status)
             .post("/sync/trigger", sync_api::sync_trigger)
             .post("/sync/lock", sync_api::sync_lock)
+            .post("/sync/reset-account", sync_api::sync_reset_account)
             .post("/sync/download", sync_api::sync_download)
             .post("/sync/pipes/push", sync_api::sync_pipes_push)
             .post("/sync/pipes/pull", sync_api::sync_pipes_pull)

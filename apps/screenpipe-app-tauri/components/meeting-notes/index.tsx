@@ -23,6 +23,7 @@ import type { MeetingStatusResponse } from "@/lib/utils/meeting-state";
 import type { MeetingRecord } from "@/lib/utils/meeting-format";
 import {
   attendeesToString,
+  calendarBindingKey,
   fetchUpcomingCalendarEvents,
   fetchUpcomingCalendarSnapshot,
   findOverlappingEvent,
@@ -34,6 +35,10 @@ import { ListView } from "./list-view";
 import { NoteView } from "./note-view";
 import type { ComingUpStatus } from "./coming-up";
 import type { TranscriptOpenIntent } from "./transcript-open-state";
+import {
+  extractMeetingSummary,
+  type MeetingWorkspaceTab,
+} from "./meeting-workspace";
 
 const PAGE_SIZE = 30;
 const CALENDAR_REFRESH_MS = 60_000;
@@ -45,6 +50,7 @@ interface MeetingNotesSectionProps {
     title?: string;
     attendees?: string;
     resumeMeetingId?: number;
+    calendarEventId?: string;
   }) => Promise<MeetingRecord | void> | MeetingRecord | void;
   captureDevices?: LiveCaptureDevice[];
   onCaptureDevicesRefresh?: () => void | Promise<void>;
@@ -67,6 +73,8 @@ export function MeetingNotesSection({
 }: MeetingNotesSectionProps) {
   const { health } = useHealthCheck();
   const [meetings, setMeetings] = useState<MeetingRecord[]>([]);
+  const meetingsRef = useRef<MeetingRecord[]>([]);
+  meetingsRef.current = meetings;
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
@@ -77,13 +85,22 @@ export function MeetingNotesSection({
     intent: TranscriptOpenIntent;
     token: number;
   } | null>(null);
+  const [initialWorkspaceTab, setInitialWorkspaceTab] =
+    useState<MeetingWorkspaceTab | null>(null);
   const selectMeeting = useCallback(
-    (id: number, { openTranscript }: { openTranscript: boolean }) => {
+    (
+      id: number,
+      {
+        openTranscript,
+        initialTab = null,
+      }: { openTranscript: boolean; initialTab?: MeetingWorkspaceTab | null },
+    ) => {
       setTranscriptOpenRequest({
         id,
         intent: openTranscript ? "open" : "closed",
         token: Date.now(),
       });
+      setInitialWorkspaceTab(initialTab);
       setSelectedId(id);
     },
     [],
@@ -174,12 +191,14 @@ export function MeetingNotesSection({
 
   // Fetch a single meeting by id, insert/update it in the list, and select it.
   const openMeetingNote = useCallback(
-    async (id: number, transcript: boolean) => {
+    async (id: number, transcript: boolean, preferBestView = false) => {
       pendingOpenRef.current = { id, at: Date.now() };
+      let openedMeeting: MeetingRecord | null = null;
       try {
         const res = await localFetch(`/meetings/${id}`);
         if (res.ok) {
           const meeting: MeetingRecord = await res.json();
+          openedMeeting = meeting;
           setMeetings((prev) => {
             const exists = prev.some((m) => m.id === meeting.id);
             return exists
@@ -193,7 +212,14 @@ export function MeetingNotesSection({
         console.warn("meeting notes: failed to open deep-linked meeting", err);
         await fetchPage(0, false, appliedQueryRef.current);
       }
-      selectMeeting(id, { openTranscript: transcript });
+      const meetingForView =
+        openedMeeting ?? meetingsRef.current.find((meeting) => meeting.id === id);
+      const initialTab = preferBestView
+        ? extractMeetingSummary(meetingForView?.note ?? "")
+          ? "summary"
+          : "notes"
+        : null;
+      selectMeeting(id, { openTranscript: transcript, initialTab });
     },
     [fetchPage, selectMeeting],
   );
@@ -201,19 +227,30 @@ export function MeetingNotesSection({
   // On mount, if the URL contains a meetingId param (set by Rust when the
   // user clicks a notification from /settings), open that meeting after
   // the initial fetchPage finishes.
-  const urlMeetingRef = useRef<{ id: number; transcript: boolean } | null>(
+  const urlMeetingRef = useRef<{
+    id: number;
+    transcript: boolean;
+    preferBestView: boolean;
+  } | null>(
     (() => {
       const params = new URLSearchParams(window.location.search);
       const id = Number(params.get("meetingId"));
       if (!Number.isFinite(id) || id <= 0) return null;
-      return { id, transcript: params.get("transcript") !== "false" };
+      const preferBestView = params.get("meetingView") === "best";
+      return {
+        id,
+        transcript: preferBestView
+          ? false
+          : params.get("transcript") !== "false",
+        preferBestView,
+      };
     })(),
   );
   useEffect(() => {
     if (loading || !urlMeetingRef.current) return;
-    const { id, transcript } = urlMeetingRef.current;
+    const { id, transcript, preferBestView } = urlMeetingRef.current;
     urlMeetingRef.current = null;
-    void openMeetingNote(id, transcript);
+    void openMeetingNote(id, transcript, preferBestView);
   }, [loading, openMeetingNote]);
 
   useEffect(() => {
@@ -408,9 +445,13 @@ export function MeetingNotesSection({
           : meeting.attendees || "",
       };
       try {
+        // The server claims the event for this meeting before applying these
+        // fields. If another meeting already owns it, they are dropped — one
+        // calendar event describes one meeting.
         const body: Record<string, string> = {
           title: next.title,
           attendees: next.attendees,
+          calendar_event_id: calendarBindingKey(overlap),
         };
         const res = await localFetch(`/meetings/${meeting.id}`, {
           method: "PUT",
@@ -418,13 +459,19 @@ export function MeetingNotesSection({
           body: JSON.stringify(body),
         });
         if (res.ok) {
+          // Take the row the server actually stored — it drops the calendar
+          // fields when another meeting already owns this event.
+          const saved = (await res.json()) as {
+            title?: string | null;
+            attendees?: string | null;
+          };
           setMeetings((prev) =>
             prev.map((m) =>
               m.id === meeting.id
                 ? {
                     ...m,
-                    title: next.title || null,
-                    attendees: next.attendees || null,
+                    title: saved.title ?? null,
+                    attendees: saved.attendees ?? null,
                   }
                 : m,
             ),
@@ -437,7 +484,11 @@ export function MeetingNotesSection({
   }, [meetings, meetingState.activeMeetingId]);
 
   const handleStart = useCallback(
-    async (seed?: { title?: string; attendees?: string }) => {
+    async (seed?: {
+      title?: string;
+      attendees?: string;
+      calendarEventId?: string;
+    }) => {
       if (meetingState.active) return;
       intendingToFocusRef.current = true;
       try {
@@ -488,6 +539,7 @@ export function MeetingNotesSection({
       await handleStart({
         title: event.title,
         attendees: attendeesToString(event.attendees),
+        calendarEventId: calendarBindingKey(event),
       });
     },
     [handleStart],
@@ -641,6 +693,7 @@ export function MeetingNotesSection({
             ? transcriptOpenRequest.token
             : undefined
         }
+        initialWorkspaceTab={initialWorkspaceTab ?? undefined}
       />
     );
   }

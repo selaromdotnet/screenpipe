@@ -47,6 +47,11 @@ pub struct StreamFramesRequest {
 const MAX_STREAM_FRAME_LIMIT: usize = 10_000;
 const DEFAULT_STREAM_FRAME_LIMIT: usize = MAX_STREAM_FRAME_LIMIT;
 const STREAM_BATCH_CAPACITY: usize = 100;
+/// Safari/Chromium accept very large WebSocket messages, but native clients
+/// commonly enforce a much smaller receive ceiling. Production transcript and
+/// screen-text payloads can make 100 otherwise-small timeline rows exceed that
+/// ceiling, so the wire batch must be bounded by encoded bytes as well as rows.
+const MAX_STREAM_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_BATCH_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
 fn stream_frame_limit(requested: Option<usize>) -> usize {
@@ -61,6 +66,34 @@ fn stream_db_fetch_limit(display_limit: usize) -> usize {
     } else {
         MAX_STREAM_FRAME_LIMIT
     }
+}
+
+/// Split a display budget at the hot-cache coverage boundary so a partial
+/// current-day cache cannot consume every slot before the older DB backfill
+/// runs. The split is proportional to wall-clock span because the timeline is
+/// a temporal overview: dense recent capture should not make the morning
+/// disappear. Any unused recent-cache slots remain available to the backfill.
+fn recent_cache_display_limit(
+    limit: usize,
+    start_time: DateTime<Utc>,
+    cache_start: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+) -> usize {
+    if limit <= 1 || cache_start <= start_time || cache_start >= end_time {
+        return limit;
+    }
+
+    let total_millis = end_time
+        .signed_duration_since(start_time)
+        .num_milliseconds()
+        .max(1) as i128;
+    let recent_millis = end_time
+        .signed_duration_since(cache_start)
+        .num_milliseconds()
+        .max(1) as i128;
+    let proportional = ((limit as i128 * recent_millis) + total_millis / 2) / total_millis;
+
+    (proportional as usize).clamp(1, limit - 1)
 }
 
 /// Reduce an already-display-ordered list to at most `limit` items by keeping an
@@ -375,11 +408,37 @@ async fn handle_stream_frames_socket(
                             let frames =
                                 cache_clone.get_frames_in_range(start_time, end_time).await;
 
+                            // Work out cache coverage before applying the display
+                            // cap. When coverage is partial, reserve a proportional
+                            // share of the cap for the older DB range. Previously we
+                            // downsampled the recent cache to `limit` first, leaving
+                            // a zero-sized backfill budget on dense days.
+                            let cache_start = cache_clone.earliest_coverage().await;
+                            let backfill_needed = match cache_start {
+                                Some(cs) if cs <= start_time => false,
+                                Some(cs) => {
+                                    // Cache only covers cs..now, backfill start_time..cs
+                                    info!(
+                                        "partial cache coverage: cache from {}, backfilling {}..{}",
+                                        cs, start_time, cs
+                                    );
+                                    true
+                                }
+                                None => true, // no cache coverage at all
+                            };
+                            let cache_display_limit = match (backfill_needed, cache_start) {
+                                (true, Some(cs)) => {
+                                    recent_cache_display_limit(limit, start_time, cs, end_time)
+                                }
+                                (true, None) => 0,
+                                (false, _) => limit,
+                            };
+
                             let mut sorted = frames;
                             if is_descending {
                                 sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                             }
-                            downsample_in_place(&mut sorted, limit);
+                            downsample_in_place(&mut sorted, cache_display_limit);
                             let initial_count = sorted.len();
 
                             // Record sent IDs first (fast, no async), then send
@@ -399,25 +458,6 @@ async fn handle_stream_frames_socket(
                             for frame in sorted {
                                 let _ = frame_tx.send(frame).await;
                             }
-
-                            // Only backfill from DB if the hot cache doesn't
-                            // cover the requested range. The cache knows its
-                            // earliest coverage timestamp from warm_from_db +
-                            // push_frame. If the cache covers start_time, we
-                            // skip the 60s+ find_video_chunks query entirely.
-                            let cache_start = cache_clone.earliest_coverage().await;
-                            let backfill_needed = match cache_start {
-                                Some(cs) if cs <= start_time => false,
-                                Some(cs) => {
-                                    // Cache only covers cs..now, backfill start_time..cs
-                                    info!(
-                                        "partial cache coverage: cache from {}, backfilling {}..{}",
-                                        cs, start_time, cs
-                                    );
-                                    true
-                                }
-                                None => true, // no cache coverage at all
-                            };
 
                             let backfill_limit = limit.saturating_sub(initial_count);
                             let backfill_fetch_limit = stream_db_fetch_limit(backfill_limit);
@@ -793,14 +833,52 @@ async fn send_batch(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     buffer: &mut Vec<StreamTimeSeriesResponse>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    for json in encode_stream_batches(buffer, MAX_STREAM_BATCH_BYTES)? {
+        sender.send(Message::Text(json)).await?;
+    }
+    Ok(())
+}
+
+/// Serialize buffered rows into independently decodable JSON arrays while
+/// keeping each WebSocket message below `max_bytes` whenever one row itself
+/// fits. The caller owns retrying the request if the socket closes mid-send.
+fn encode_stream_batches(
+    buffer: &mut Vec<StreamTimeSeriesResponse>,
+    max_bytes: usize,
+) -> Result<Vec<String>, serde_json::Error> {
     if buffer.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let json = serde_json::to_string(&buffer)?;
-    sender.send(Message::Text(json)).await?;
-    buffer.clear();
-    Ok(())
+    let rows = std::mem::take(buffer);
+    let mut messages = Vec::new();
+    let mut message = String::from("[");
+    let mut row_count = 0usize;
+
+    for row in rows {
+        let encoded = serde_json::to_string(&row)?;
+        let separator_bytes = usize::from(row_count > 0);
+        let next_size = message.len() + separator_bytes + encoded.len() + 1;
+        if row_count > 0 && next_size > max_bytes {
+            message.push(']');
+            messages.push(message);
+            message = String::from("[");
+            row_count = 0;
+        }
+
+        if row_count > 0 {
+            message.push(',');
+        }
+        message.push_str(&encoded);
+        row_count += 1;
+    }
+
+    if row_count > 0 {
+        message.push(']');
+        messages.push(message);
+    }
+
+    Ok(messages)
 }
 
 #[cfg(test)]
@@ -851,6 +929,54 @@ mod tests {
             timestamp: chrono::Utc::now(),
             devices: Vec::new(),
         }
+    }
+
+    #[test]
+    fn websocket_batches_are_split_by_encoded_size() {
+        let mut responses = Vec::new();
+        for frame_id in 0..24 {
+            let mut response = StreamTimeSeriesResponse::from(create_time_series_frame(
+                create_test_frame_data(1, 0),
+            ));
+            response.devices[0].frame_id = frame_id;
+            // `text` and its legacy `ocr_text` alias are both sent today. This
+            // deliberately makes the original 100-row batch larger than a
+            // native WebSocket receive ceiling without needing private data.
+            let payload = "x".repeat(512 * 1024);
+            response.devices[0].metadata.text = payload.clone();
+            response.devices[0].metadata.ocr_text = payload;
+            responses.push(response);
+        }
+
+        let messages = encode_stream_batches(&mut responses, MAX_STREAM_BATCH_BYTES).unwrap();
+        assert!(
+            responses.is_empty(),
+            "encoded rows must drain the pending buffer"
+        );
+        assert!(
+            messages.len() > 1,
+            "oversized production batch must be split"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.len() <= MAX_STREAM_BATCH_BYTES),
+            "every multi-row WebSocket message must fit the native receive ceiling"
+        );
+        let decoded_rows: usize = messages
+            .iter()
+            .map(|message| {
+                serde_json::from_str::<serde_json::Value>(message)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(
+            decoded_rows, 24,
+            "splitting must not drop or duplicate rows"
+        );
     }
 
     /// TEST: Demonstrate and verify the audio duplication bug is fixed
@@ -946,6 +1072,49 @@ mod tests {
             stream_db_fetch_limit(MAX_STREAM_FRAME_LIMIT),
             MAX_STREAM_FRAME_LIMIT
         );
+    }
+
+    #[test]
+    fn partial_today_cache_reserves_slots_for_older_db_frames() {
+        let start = DateTime::parse_from_rfc3339("2026-08-16T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cache_start = DateTime::parse_from_rfc3339("2026-08-16T15:34:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-08-16T23:24:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let display_limit = 2_500;
+
+        let cache_limit = recent_cache_display_limit(display_limit, start, cache_start, end);
+        let backfill_limit = display_limit - cache_limit;
+
+        assert!(
+            cache_limit > 0,
+            "recent cache must remain visible immediately"
+        );
+        assert!(
+            backfill_limit > 0,
+            "a full recent cache must not starve the older DB range"
+        );
+        assert_eq!(cache_limit + backfill_limit, display_limit);
+        assert!(
+            backfill_limit > cache_limit,
+            "the longer older span should receive more timeline slots"
+        );
+    }
+
+    #[test]
+    fn full_today_cache_keeps_the_entire_display_budget() {
+        let start = DateTime::parse_from_rfc3339("2026-08-16T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-08-16T23:24:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(recent_cache_display_limit(2_500, start, start, end), 2_500);
     }
 
     #[tokio::test]

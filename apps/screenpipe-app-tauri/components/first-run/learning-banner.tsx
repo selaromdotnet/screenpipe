@@ -12,36 +12,14 @@ import { Button } from "@/components/ui/button";
 import {
   formatCountdown,
   type FirstRunCapturedApp,
-  type FirstRunEmptyReason,
 } from "@/lib/first-run/learning-window";
 import { appIconUrl } from "@/lib/first-run/recent-activity";
+import { AgentHandoffPicker } from "@/components/first-run/agent-handoff-picker";
+import { useAgentHandoff } from "@/lib/first-run/use-agent-handoff";
 import {
   useLearningWindow,
   type LearningWindowOptions,
 } from "@/lib/first-run/use-learning-window";
-
-/**
- * Why the window closed with nothing, in the user's terms.
- *
- * The engine already distinguishes these cases, so we say which one happened
- * instead of a single vague "nothing yet" — the fix is different for each.
- */
-const EMPTY_COPY: Record<FirstRunEmptyReason, string> = {
-  not_recording:
-    "Recording is not running, so there was nothing to read. Start it and this fills in on its own.",
-  no_capture_in_range:
-    "Recording is on but nothing was captured yet. This usually means the screen did not change much.",
-  empty_but_recording:
-    "Recording is on and still warming up. Nothing has been indexed yet.",
-  no_frames_captured:
-    "Recording is on but no screens were captured in that window. If this keeps happening, check Screen Recording permission.",
-  below_frame_floor:
-    "Only a few screens were captured — not enough to say anything true about your work yet. Keep working and this fills in.",
-  single_app_below_floor:
-    "Everything captured came from a single app, which is too thin to summarize. This fills in as you move between apps.",
-  unknown:
-    "Nothing was captured in that window. Screenpipe keeps reading in the background as you work.",
-};
 
 function CapturedAppIcon({ app }: { app: FirstRunCapturedApp }) {
   const [failed, setFailed] = React.useState(false);
@@ -75,10 +53,21 @@ function CapturedAppIcon({ app }: { app: FirstRunCapturedApp }) {
  * on the surface the user lands on after onboarding.
  */
 export function FirstRunLearningBanner(props: LearningWindowOptions = {}) {
-  const { phase, capturedApps, remainingMs, chatId, emptyReason, dismiss } =
+  const { phase, capturedApps, remainingMs, chatId, showProgress, dismiss } =
     useLearningWindow(props);
+  const { targets: handoffTargets, hint: handoffHint, askAgent } =
+    useAgentHandoff(phase === "ready");
 
-  if (phase !== "learning" && phase !== "ready" && phase !== "empty") {
+  // Only show progress when setup just caused it, and only show a terminal
+  // outcome when there is something useful to open. Empty is an internal
+  // result/telemetry state, not a user task or an error they asked to inspect.
+  if (
+    phase !== "ready" &&
+    !(
+      showProgress &&
+      (phase === "learning" || phase === "writing")
+    )
+  ) {
     return null;
   }
 
@@ -101,7 +90,7 @@ export function FirstRunLearningBanner(props: LearningWindowOptions = {}) {
     <section
       data-testid="first-run-learning-banner"
       data-phase={phase}
-      className="border border-border bg-background p-4"
+      className="mx-auto mb-4 w-full max-w-3xl border border-border bg-background p-4"
     >
       {phase === "learning" && (
         <div className="flex flex-col gap-2">
@@ -139,6 +128,38 @@ export function FirstRunLearningBanner(props: LearningWindowOptions = {}) {
         </div>
       )}
 
+      {phase === "writing" && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-3">
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+            <p className="text-xs font-medium text-foreground">
+              Writing your summary
+            </p>
+          </div>
+          {/* No countdown. The clock measured how long we would keep waiting
+              for something to summarize, and that question is already
+              answered; the model can take tens of seconds and outlast the
+              ceiling, so a timer here would tick to 0:00 and then keep
+              spinning. */}
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Screenpipe saw enough. Putting the summary together now — this
+            takes a few seconds.
+          </p>
+          {capturedApps.length > 0 && (
+            <div className="flex items-center gap-2 pt-0.5">
+              <span className="shrink-0 text-[11px] text-muted-foreground">
+                Reading from
+              </span>
+              <span className="flex items-center gap-1">
+                {capturedApps.map((app) => (
+                  <CapturedAppIcon key={app.name} app={app} />
+                ))}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
       {phase === "ready" && (
         <div className="flex flex-col gap-2">
           <p className="text-xs font-medium text-foreground">
@@ -158,6 +179,14 @@ export function FirstRunLearningBanner(props: LearningWindowOptions = {}) {
             >
               Open the summary
             </Button>
+            {/* Setup already wired these agents over MCP, so they can answer
+                from real captured context. Offered second, never instead: the
+                summary is guaranteed to exist, the handoff depends on another
+                app being where we think it is. */}
+            <AgentHandoffPicker
+              targets={handoffTargets}
+              onPick={(target) => void askAgent(target)}
+            />
             <Button
               size="sm"
               variant="ghost"
@@ -167,31 +196,15 @@ export function FirstRunLearningBanner(props: LearningWindowOptions = {}) {
               Later
             </Button>
           </div>
-        </div>
-      )}
-
-      {phase === "empty" && (
-        <div className="flex flex-col gap-2">
-          <p className="text-xs font-medium text-foreground">
-            Nothing to summarize yet
-          </p>
-          <p
-            className="text-[11px] leading-relaxed text-muted-foreground"
-            data-testid="first-run-empty-reason"
-          >
-            {EMPTY_COPY[emptyReason ?? "unknown"]}
-          </p>
-          <div className="pt-1">
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 text-[11px]"
-              data-testid="first-run-dismiss-empty"
-              onClick={() => dismiss()}
+          {handoffHint && (
+            <p
+              className="text-[11px] leading-relaxed text-muted-foreground"
+              data-testid="first-run-ask-agent-hint"
+              role="status"
             >
-              Got it
-            </Button>
-          </div>
+              {handoffHint}
+            </p>
+          )}
         </div>
       )}
     </section>

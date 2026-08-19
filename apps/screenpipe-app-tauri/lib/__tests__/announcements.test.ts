@@ -37,7 +37,24 @@ describe("areRemoteAnnouncementsDisabled", () => {
     vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_E2E", "false");
     vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_DISABLE_REMOTE_ANNOUNCEMENTS", "false");
 
-    expect(areRemoteAnnouncementsDisabled(process.env, "tauri.localhost")).toBe(false);
+    expect(
+      areRemoteAnnouncementsDisabled(
+        process.env,
+        "tauri.localhost",
+        "http:",
+      ),
+    ).toBe(false);
+  });
+
+  it("allows remote announcements on the production macOS Tauri origin", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("TAURI_ENV_DEBUG", "false");
+    vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_E2E", "false");
+    vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_DISABLE_REMOTE_ANNOUNCEMENTS", "false");
+
+    expect(
+      areRemoteAnnouncementsDisabled(process.env, "localhost", "tauri:"),
+    ).toBe(false);
   });
 
   it("disables remote announcements in development", () => {
@@ -60,19 +77,23 @@ describe("areRemoteAnnouncementsDisabled", () => {
     expect(areRemoteAnnouncementsDisabled()).toBe(true);
   });
 
-  it("disables remote announcements on localhost dev hosts outside tests", () => {
-    expect(
-      areRemoteAnnouncementsDisabled(
-        {
-          NODE_ENV: "production",
-          TAURI_ENV_DEBUG: "false",
-          NEXT_PUBLIC_SCREENPIPE_E2E: "false",
-          NEXT_PUBLIC_SCREENPIPE_DISABLE_REMOTE_ANNOUNCEMENTS: "false",
-        },
-        "localhost",
-      ),
-    ).toBe(true);
-  });
+  it.each(["localhost", "127.0.0.1", "::1"])(
+    "disables remote announcements on browser dev host %s outside tests",
+    (hostname) => {
+      expect(
+        areRemoteAnnouncementsDisabled(
+          {
+            NODE_ENV: "production",
+            TAURI_ENV_DEBUG: "false",
+            NEXT_PUBLIC_SCREENPIPE_E2E: "false",
+            NEXT_PUBLIC_SCREENPIPE_DISABLE_REMOTE_ANNOUNCEMENTS: "false",
+          },
+          hostname,
+          "http:",
+        ),
+      ).toBe(true);
+    },
+  );
 });
 
 describe("isDevOrE2EAppIdentity", () => {
@@ -144,6 +165,58 @@ describe("parseAnnouncement", () => {
   it("drops a cta with no destination", () => {
     const a = parseAnnouncement({ ...VALID, cta: { label: "go" } });
     expect(a!.cta).toBeUndefined();
+  });
+
+  it("keeps a cta whose only destination is a pipe slug", () => {
+    const a = parseAnnouncement({ ...VALID, cta: { label: "install it", pipe: "daily-email-summary" } });
+    expect(a!.cta).toEqual({ label: "install it", pipe: "daily-email-summary" });
+  });
+
+  it("strips a pipe cta from a locally pushed announcement", () => {
+    // `POST /notify` is reachable by any same-user process and renders exactly
+    // like a first-party announcement, so it must not be able to open the
+    // installer. Routing to the Store page is still allowed.
+    const local = parseAnnouncement(
+      { ...VALID, cta: { label: "install it", pipe: "daily-email-summary" } },
+      "local",
+    );
+    expect(local!.cta).toBeUndefined();
+
+    const remote = parseAnnouncement({
+      ...VALID,
+      cta: { label: "install it", pipe: "daily-email-summary" },
+    });
+    expect(remote!.cta).toEqual({ label: "install it", pipe: "daily-email-summary" });
+  });
+
+  it("keeps route and url on a locally pushed announcement", () => {
+    const a = parseAnnouncement(
+      {
+        ...VALID,
+        cta: { label: "see it", route: "/home?section=pipes", pipe: "daily-email-summary" },
+      },
+      "local",
+    );
+    expect(a!.cta).toEqual({ label: "see it", route: "/home?section=pipes" });
+  });
+
+  it("rejects pipe slugs that could escape the registry source", () => {
+    // the slug is interpolated into `registry:<slug>`, so anything that could
+    // change what gets installed has to be dropped rather than sanitized.
+    for (const pipe of [
+      "../../etc/passwd",
+      "slug/../other",
+      "https://evil.example/pipe",
+      "Daily-Email-Summary",
+      "slug with spaces",
+      "slug:extra",
+      "-leading-hyphen",
+      "",
+      "a".repeat(81),
+    ]) {
+      const a = parseAnnouncement({ ...VALID, cta: { label: "go", pipe } });
+      expect(a!.cta, `expected ${JSON.stringify(pipe)} to be rejected`).toBeUndefined();
+    }
   });
 
   it("prefers route over url but keeps url when only url is set", () => {

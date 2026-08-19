@@ -12,6 +12,15 @@ import type { LearningWindowView } from "@/lib/first-run/use-learning-window";
 const mocks = vi.hoisted(() => ({
   view: {} as LearningWindowView,
   emit: vi.fn().mockResolvedValue(undefined),
+  handoff: {
+    targets: [],
+    hint: null,
+    askAgent: vi.fn().mockResolvedValue(undefined),
+  } as {
+    targets: { id: string; label: string; deeplink?: string; hint: string }[];
+    hint: string | null;
+    askAgent: ReturnType<typeof vi.fn>;
+  },
 }));
 
 vi.mock("@/lib/first-run/use-learning-window", () => ({
@@ -20,10 +29,15 @@ vi.mock("@/lib/first-run/use-learning-window", () => ({
 
 vi.mock("@tauri-apps/api/event", () => ({ emit: mocks.emit }));
 
+vi.mock("@/lib/first-run/use-agent-handoff", () => ({
+  useAgentHandoff: () => mocks.handoff,
+}));
+
 function view(over: Partial<LearningWindowView> = {}): LearningWindowView {
   return {
     phase: "learning",
     startedAt: new Date().toISOString(),
+    showProgress: true,
     seededAt: null,
     chatId: null,
     emptyReason: null,
@@ -36,6 +50,13 @@ function view(over: Partial<LearningWindowView> = {}): LearningWindowView {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default: no connected agent. Every handoff assertion opts in explicitly so
+  // the fallback path is what the other tests exercise.
+  mocks.handoff = {
+    targets: [],
+    hint: null,
+    askAgent: vi.fn().mockResolvedValue(undefined),
+  };
 });
 
 describe("first-run learning banner", () => {
@@ -53,6 +74,13 @@ describe("first-run learning banner", () => {
     mocks.view = view({ remainingMs: 61_000 });
     render(<FirstRunLearningBanner />);
     expect(screen.getByTestId("first-run-countdown")).toHaveTextContent("1:01");
+  });
+
+  it("explains foreground writing after the evidence gate clears", () => {
+    mocks.view = view({ phase: "writing", showProgress: true });
+    render(<FirstRunLearningBanner />);
+    expect(screen.getByText("Writing your summary")).toBeInTheDocument();
+    expect(screen.queryByTestId("first-run-countdown")).not.toBeInTheDocument();
   });
 
   it("shows captured apps as live proof once any arrive", () => {
@@ -91,27 +119,129 @@ describe("first-run learning banner", () => {
     expect(dismiss).toHaveBeenCalled();
   });
 
-  it("names the specific reason nothing was captured", () => {
-    mocks.view = view({ phase: "empty", emptyReason: "not_recording" });
+  it("keeps every empty result out of the interface", () => {
+    for (const emptyReason of [
+      "not_recording",
+      "no_capture_in_range",
+      "empty_but_recording",
+      "no_frames_captured",
+      "below_frame_floor",
+      "single_app_below_floor",
+      "unknown",
+    ] as const) {
+      mocks.view = view({ phase: "empty", emptyReason });
+      const rendered = render(<FirstRunLearningBanner />);
+      expect(rendered.container).toBeEmptyDOMElement();
+      rendered.unmount();
+    }
+  });
+
+  it("keeps a late learning or writing retry in the background", () => {
+    for (const phase of ["learning", "writing"] as const) {
+      mocks.view = view({ phase, showProgress: false });
+      const rendered = render(<FirstRunLearningBanner />);
+      expect(rendered.container).toBeEmptyDOMElement();
+      rendered.unmount();
+    }
+  });
+
+  it("surfaces a ready summary even when its run was in the background", () => {
+    mocks.view = view({
+      phase: "ready",
+      showProgress: false,
+      chatId: "late-summary",
+    });
     render(<FirstRunLearningBanner />);
-    expect(screen.getByTestId("first-run-empty-reason")).toHaveTextContent(
-      /Recording is not running/i,
+    expect(screen.getByTestId("first-run-open-summary")).toBeInTheDocument();
+  });
+});
+
+const CLAUDE = {
+  id: "claude",
+  label: "Claude",
+  deeplink: "claude://claude",
+  hint: "Claude opens with the question copied. Paste it to run.",
+};
+const CODEX = {
+  id: "codex",
+  label: "Codex",
+  hint: "Question copied. Paste it into your Codex terminal session.",
+};
+
+describe("agent handoff on the ready summary", () => {
+  beforeEach(() => {
+    mocks.view = view({ phase: "ready", chatId: "first-run-handoff" });
+  });
+
+  it("offers nothing extra when no agent is connected", () => {
+    render(<FirstRunLearningBanner />);
+    // Silent fallback is the contract. Advertising an app the user does not
+    // have is worse than only offering the summary.
+    expect(screen.queryByTestId("first-run-ask-agent")).not.toBeInTheDocument();
+    expect(screen.getByTestId("first-run-open-summary")).toBeInTheDocument();
+  });
+
+  it("offers to open a deeplinkable agent alongside the summary", () => {
+    mocks.handoff.targets = [CLAUDE];
+    render(<FirstRunLearningBanner />);
+
+    const ask = screen.getByTestId("first-run-ask-agent");
+    expect(ask).toHaveTextContent("Ask Claude");
+    expect(ask).toHaveAttribute("data-agent", "claude");
+    // The summary stays the primary action; the handoff never replaces it.
+    expect(screen.getByTestId("first-run-open-summary")).toBeInTheDocument();
+  });
+
+  it("says copy, not ask, for an agent it cannot bring forward", () => {
+    mocks.handoff.targets = [CODEX];
+    render(<FirstRunLearningBanner />);
+    expect(screen.getByTestId("first-run-ask-agent")).toHaveTextContent(
+      "Copy for Codex",
     );
   });
 
-  it("falls back to honest generic copy for an unrecognized reason", () => {
-    mocks.view = view({ phase: "empty", emptyReason: null });
+  it("runs the handoff on click", () => {
+    mocks.handoff.targets = [CLAUDE];
     render(<FirstRunLearningBanner />);
-    expect(screen.getByTestId("first-run-empty-reason")).toHaveTextContent(
-      /Nothing was captured/i,
+    fireEvent.click(screen.getByTestId("first-run-ask-agent"));
+    expect(mocks.handoff.askAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "claude" }),
     );
   });
 
-  it("lets the user close the empty state", () => {
-    const dismiss = vi.fn();
-    mocks.view = view({ phase: "empty", emptyReason: "unknown", dismiss });
+  it("fans out every connected agent, and sends to the one clicked", () => {
+    // Two connected agents is the case the old single-target button got
+    // wrong: it silently picked Claude and gave Codex users no way to choose.
+    mocks.handoff.targets = [CLAUDE, CODEX];
     render(<FirstRunLearningBanner />);
-    fireEvent.click(screen.getByTestId("first-run-dismiss-empty"));
-    expect(dismiss).toHaveBeenCalled();
+
+    expect(screen.getByTestId("first-run-ask-agent-picker")).toBeInTheDocument();
+    const asks = screen.getAllByTestId("first-run-ask-agent");
+    expect(asks.map((el) => el.getAttribute("data-agent"))).toEqual([
+      "claude",
+      "codex",
+    ]);
+    // Logos carry no text, so the accessible name is the only affordance a
+    // screen reader or keyboard user gets.
+    expect(asks[1]).toHaveAccessibleName("Copy for Codex");
+
+    fireEvent.click(asks[1]);
+    expect(mocks.handoff.askAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "codex" }),
+    );
+  });
+
+  it("shows the paste instruction only once there is one", () => {
+    mocks.handoff.targets = [CLAUDE];
+    const { rerender } = render(<FirstRunLearningBanner />);
+    expect(
+      screen.queryByTestId("first-run-ask-agent-hint"),
+    ).not.toBeInTheDocument();
+
+    mocks.handoff.hint = "Claude opens with the question copied. Paste it to run.";
+    rerender(<FirstRunLearningBanner />);
+    expect(screen.getByTestId("first-run-ask-agent-hint")).toHaveTextContent(
+      /paste it to run/i,
+    );
   });
 });

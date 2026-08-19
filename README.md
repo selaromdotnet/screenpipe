@@ -14,8 +14,8 @@
 
 
 
-<p align="center">screenpipe remembers how you actually work</p>
-<p align="center">It captures what you see, say, and do, locally, 24/7, then turns real work into searchable memory, SOPs, and automations for AI agents.</p>
+<p align="center">Screenpipe remembers how you actually work</p>
+<p align="center">Record your screen continuously locally and provide context to your agents (Claude, Codex, Openclaw, Hermes, Runner...)</p>
 
 
 
@@ -76,6 +76,7 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 - **search with ai** - find anything using natural language
 - **100% local** - your data lives on your machine only
 - **source-available** - inspect, modify, audit ([LICENSE.md](LICENSE.md))
+  **company brain** - share knowledge with your team without turning it into surveillance
 
 <p align="center">
    <a href ="https://screenpi.pe">
@@ -337,7 +338,7 @@ Screen frames, audio, transcripts, and the search index are stored locally by de
 
 - Product analytics is enabled by default through PostHog. It uses a stable installation identifier and, when you sign in, may associate account details such as your email with app, hostname, operating-system, hardware, and other device or feature metadata.
 - Sentry receives crash and error diagnostics while telemetry is enabled.
-- If you choose cloud transcription, hosted AI, or cloud sync, the audio, prompts and selected context, or synced data needed for that feature is processed remotely by the configured service.
+- If you choose cloud transcription, screenpipe cloud AI, or cloud sync, the audio, prompts and selected context, or synced data needed for that feature is processed remotely by the configured service.
 
 You can disable telemetry in **Settings → Privacy → Analytics**, then apply the settings change. To keep capture and AI processing local, leave cloud sync off and select local transcription and a local AI provider such as Ollama.
 

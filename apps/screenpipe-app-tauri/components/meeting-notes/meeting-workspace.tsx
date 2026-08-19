@@ -6,6 +6,7 @@
 import React from "react";
 import { MemoizedReactMarkdown } from "@/components/markdown";
 import { cn } from "@/lib/utils";
+import { Loader2 } from "lucide-react";
 
 export type MeetingWorkspaceTab = "notes" | "transcript" | "summary";
 
@@ -27,6 +28,12 @@ export const MEETING_READING_COLUMN_CLASS = "w-full";
 export const MEETING_QUIET_CONTROL_CLASS =
   "rounded-none border-0 bg-transparent text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground focus-visible:text-foreground";
 
+// Actions that sit on the tab rule share the tabs' own geometry so the row
+// reads as one band instead of a strip of floating boxes. Shared with the note
+// view now that the meeting actions live here rather than in a footer.
+export const MEETING_RULE_ACTION_CLASS =
+  "flex h-11 shrink-0 items-center gap-2 border-l border-border font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:z-10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground disabled:text-muted-foreground/50 disabled:hover:bg-transparent";
+
 const MEETING_TABS: ReadonlyArray<{
   value: MeetingWorkspaceTab;
   label: string;
@@ -40,10 +47,17 @@ export function MeetingWorkspaceTabs({
   value,
   onValueChange,
   summaryState,
+  trailing,
 }: {
   value: MeetingWorkspaceTab;
   onValueChange: (value: MeetingWorkspaceTab) => void;
-  summaryState?: "working" | "ready" | "attention" | null;
+  // Only states that want something from the reader get a dot. "finished
+  // normally" is not one of them.
+  summaryState?: "working" | "attention" | null;
+  // Rendered on the same rule as the tabs but outside the tablist, so a
+  // note-wide action stays reachable from every tab without becoming a
+  // fourth pseudo-tab for arrow-key navigation.
+  trailing?: React.ReactNode;
 }) {
   const tabRefs = React.useRef<Array<HTMLButtonElement | null>>([]);
 
@@ -54,11 +68,14 @@ export function MeetingWorkspaceTabs({
     tabRefs.current[normalized]?.focus();
   };
 
-  return (
+  const tablist = (
     <div
       role="tablist"
       aria-label="meeting workspace"
-      className="flex min-w-0 items-stretch overflow-x-auto border-b border-border [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className={cn(
+        "flex min-w-0 items-stretch overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+        !trailing && "border-b border-border",
+      )}
     >
       {MEETING_TABS.map((tab, index) => {
         const selected = value === tab.value;
@@ -103,8 +120,8 @@ export function MeetingWorkspaceTabs({
                 aria-label={`summary ${state}`}
                 className={cn(
                   "h-1.5 w-1.5 shrink-0",
-                  state === "working" && "animate-pulse bg-current",
-                  state === "ready" && "bg-current",
+                  state === "working" &&
+                    "animate-pulse bg-current motion-reduce:animate-none",
                   state === "attention" && "bg-amber-500",
                 )}
               />
@@ -112,6 +129,18 @@ export function MeetingWorkspaceTabs({
           </button>
         );
       })}
+    </div>
+  );
+
+  if (!trailing) return tablist;
+
+  // No border here: this row is the last thing in the meeting header, which
+  // already draws a full-bleed rule underneath it. Both together read as a
+  // doubled line, one inset and one not.
+  return (
+    <div className="flex min-w-0 items-stretch">
+      {tablist}
+      <div className="ml-auto flex shrink-0 items-stretch">{trailing}</div>
     </div>
   );
 }
@@ -134,6 +163,7 @@ export function MeetingSummarySurface({
   streamedSummary,
   onGenerate,
   canGenerate,
+  activity,
 }: {
   note: string;
   state: "idle" | "working" | "ready" | "attention";
@@ -141,6 +171,11 @@ export function MeetingSummarySurface({
   streamedSummary?: string;
   onGenerate: () => void;
   canGenerate: boolean;
+  // Replay scrubber and the "related during this meeting" list. They are
+  // evidence for the summary — what was on screen and open while it was
+  // written — so they belong under it. Under the note editor they sat below a
+  // draft of unbounded length, which is a place nobody scrolls to.
+  activity?: React.ReactNode;
 }) {
   const savedSummary = extractMeetingSummary(note);
   const isStreaming = state === "working" && Boolean(streamedSummary?.trim());
@@ -156,28 +191,47 @@ export function MeetingSummarySurface({
     >
       <div className={cn(MEETING_SHELL_CLASS, "py-8 sm:py-10")}>
         <div className="mb-8 flex items-start justify-between gap-5 border-b border-border pb-5">
-          <div className="min-w-0">
-            <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-              meeting summary
-            </p>
+          <div
+            className="min-w-0"
+            role={state === "working" ? "status" : undefined}
+            aria-live={state === "working" ? "polite" : undefined}
+          >
+            <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+              {state === "working" && (
+                <Loader2
+                  className="h-3 w-3 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
+              )}
+              <span>
+                {state === "working" ? "writing summary" : "meeting summary"}
+              </span>
+            </div>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
               {detail}
             </p>
           </div>
-          {(state === "idle" || state === "attention" || state === "ready") && (
-            <button
-              type="button"
-              onClick={onGenerate}
-              disabled={!canGenerate}
-              className="h-9 shrink-0 border border-foreground bg-foreground px-3 font-mono text-[10px] uppercase tracking-[0.12em] text-background transition-colors hover:bg-background hover:text-foreground disabled:border-border disabled:bg-muted disabled:text-muted-foreground"
-            >
-              {state === "attention"
-                ? "retry"
-                : state === "ready"
-                  ? "summarize again"
-                  : "generate"}
-            </button>
-          )}
+          <div className="flex shrink-0 items-center gap-2">
+            {/* Sharing the summary is the meeting-wide share control's job, on
+                the tab rule above. This header keeps only the action that is
+                unique to the summary tab: producing one. */}
+            {(state === "idle" ||
+              state === "attention" ||
+              state === "ready") && (
+              <button
+                type="button"
+                onClick={onGenerate}
+                disabled={!canGenerate}
+                className="h-9 shrink-0 border border-foreground bg-foreground px-3 font-mono text-[10px] uppercase tracking-[0.12em] text-background transition-colors hover:bg-background hover:text-foreground disabled:border-border disabled:bg-muted disabled:text-muted-foreground"
+              >
+                {state === "attention"
+                  ? "retry"
+                  : state === "ready"
+                    ? "summarize again"
+                    : "generate"}
+              </button>
+            )}
+          </div>
         </div>
 
         <div
@@ -185,47 +239,29 @@ export function MeetingSummarySurface({
           className={cn(MEETING_READING_COLUMN_CLASS, "select-text")}
         >
           {summary ? (
-            <>
-              {state === "working" && (
-                <p
-                  role="status"
-                  className="mb-5 border-l border-foreground pl-3 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground"
-                >
-                  {isStreaming ? "writing summary" : "refreshing summary"}
-                </p>
+            <div aria-busy={isStreaming}>
+              <MemoizedReactMarkdown className="prose prose-sm max-w-none break-words text-foreground dark:prose-invert prose-headings:font-mono prose-headings:text-xs prose-headings:uppercase prose-headings:tracking-[0.12em] prose-p:leading-7 prose-li:leading-7 [&>*:first-child]:mt-0">
+                {summary}
+              </MemoizedReactMarkdown>
+              {isStreaming && (
+                <span
+                  aria-hidden="true"
+                  data-testid="meeting-summary-stream-cursor"
+                  className="mt-1 block h-4 w-px animate-pulse bg-foreground"
+                />
               )}
-              <div aria-busy={isStreaming}>
-                <MemoizedReactMarkdown className="prose prose-sm max-w-none break-words text-foreground dark:prose-invert prose-headings:font-mono prose-headings:text-xs prose-headings:uppercase prose-headings:tracking-[0.12em] prose-p:leading-7 prose-li:leading-7 [&>*:first-child]:mt-0">
-                  {summary}
-                </MemoizedReactMarkdown>
-                {isStreaming && (
-                  <span
-                    aria-hidden="true"
-                    data-testid="meeting-summary-stream-cursor"
-                    className="mt-1 block h-4 w-px animate-pulse bg-foreground"
-                  />
-                )}
-              </div>
-            </>
+            </div>
           ) : state === "working" ? (
-            <div role="status" className="border-l border-foreground pl-5">
-              <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-                writing summary
+            <div
+              data-testid="meeting-summary-writing-placeholder"
+              className="min-h-64 py-2"
+            >
+              <p className="text-sm font-medium text-foreground">
+                Draft will appear here
               </p>
-              <div aria-hidden className="mt-7 space-y-7">
-                {["w-2/3", "w-5/6", "w-3/4"].map((width) => (
-                  <div key={width} className="space-y-3">
-                    <div
-                      className={cn(
-                        "h-2 animate-pulse bg-foreground/20",
-                        width,
-                      )}
-                    />
-                    <div className="h-px w-full bg-border" />
-                    <div className="h-px w-4/5 bg-border" />
-                  </div>
-                ))}
-              </div>
+              <p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">
+                The first section replaces this message as soon as it is ready.
+              </p>
             </div>
           ) : (
             <div className="border-l border-border py-2 pl-5">
@@ -239,6 +275,15 @@ export function MeetingSummarySurface({
             </div>
           )}
         </div>
+
+        {activity && (
+          <div
+            data-testid="meeting-summary-activity"
+            className="mt-10 select-text space-y-6"
+          >
+            {activity}
+          </div>
+        )}
       </div>
     </section>
   );

@@ -57,6 +57,15 @@ async function openSettings(): Promise<void> {
   const navSettings = await $('[data-testid="nav-settings"]');
   await navSettings.waitForExist({ timeout: t(15_000) });
   await navSettings.click();
+  // The sidebar button calls openSettings() with no argument, which resolves to
+  // readLastSettingsSection() — the *persisted* section, not General. These tests
+  // walk every section, so the first run leaves a non-General section behind and
+  // every retry (specFileRetries) would then hang here waiting for a General
+  // panel the app never opened. Select General explicitly so the hook is
+  // idempotent no matter which section the previous attempt ended on.
+  const navGeneral = await $('[data-testid="settings-nav-general"]');
+  await navGeneral.waitForExist({ timeout: t(30_000) });
+  await navGeneral.click();
   const generalSection = await $('[data-testid="section-settings-general"]');
   await generalSection.waitForExist({ timeout: t(30_000) });
 }
@@ -130,7 +139,7 @@ describe('Settings sections', () => {
     expect(existsSync(filepath)).toBe(true);
   });
 
-  it('keeps audio and meeting notes separate and applies screen-share privacy live', async () => {
+  it('keeps audio and meeting notes separate from screen capture visibility', async () => {
     const navAudio = await $('[data-testid="settings-nav-audio"]');
     await navAudio.waitForExist({ timeout: 8_000 });
     expect((await navAudio.getText()).toLowerCase()).toContain('audio & meetings');
@@ -144,12 +153,19 @@ describe('Settings sections', () => {
       )) as string
     ).toLowerCase();
     expect(sectionText).toContain('audio recording');
-    expect(sectionText).toContain('hide screenpipe from screen capture');
+    expect(sectionText).not.toContain('hide screenpipe from screen capture');
     expect(sectionText).not.toContain('screen context capture');
     expect(sectionText).not.toContain('screenshot images');
+  });
 
-    const toggle = await $('[data-testid="hide-app-in-screen-share-toggle"]');
+  it('applies screen capture protection only to the overlay', async () => {
+    const navDisplay = await $('[data-testid="settings-nav-display"]');
+    await navDisplay.waitForExist({ timeout: 8_000 });
+    await navDisplay.click();
+
+    const toggle = await $('[data-testid="hide-overlay-in-screen-recording-toggle"]');
     await toggle.waitForExist({ timeout: 5_000 });
+
     const initial = await invokeOrThrow<{
       requestedHidden: boolean;
       effectiveHidden: boolean;
@@ -157,7 +173,7 @@ describe('Settings sections', () => {
       e2eBypass: boolean;
       windowLabels: string[];
     }>('get_app_screen_capture_protection');
-    expect(initial.requestedHidden).toBe(true);
+    expect(initial.requestedHidden).toBe(false);
     // Content protection is a macOS/Windows capability (capture_protection.rs
     // gates platform_supported on exactly those two). Linux has no equivalent,
     // so asserting support unconditionally fails there on a platform gap rather
@@ -171,23 +187,9 @@ describe('Settings sections', () => {
     // the supported platforms, and Linux cannot hide them at all.
     expect(initial.effectiveHidden).toBe(false);
     expect(initial.windowLabels).toContain('home');
-    expect(await toggle.getAttribute('data-state')).toBe('checked');
+    expect(await toggle.getAttribute('data-state')).toBe('unchecked');
 
     try {
-      await toggle.click();
-      await browser.waitUntil(
-        async () =>
-          !(await invokeOrThrow<{ requestedHidden: boolean }>(
-            'get_app_screen_capture_protection',
-          )).requestedHidden,
-        {
-          timeout: t(8_000),
-          interval: 100,
-          timeoutMsg: 'screen-share privacy opt-out did not persist',
-        },
-      );
-      expect(await toggle.getAttribute('data-state')).toBe('unchecked');
-
       await toggle.click();
       await browser.waitUntil(
         async () =>
@@ -197,18 +199,32 @@ describe('Settings sections', () => {
         {
           timeout: t(8_000),
           interval: 100,
-          timeoutMsg: 'screen-share privacy opt-in did not persist',
+          timeoutMsg: 'overlay capture protection did not persist',
         },
       );
       expect(await toggle.getAttribute('data-state')).toBe('checked');
 
-      const filepath = await saveScreenshot('settings-audio-meetings-privacy');
+      await toggle.click();
+      await browser.waitUntil(
+        async () =>
+          !(await invokeOrThrow<{ requestedHidden: boolean }>(
+            'get_app_screen_capture_protection',
+          )).requestedHidden,
+        {
+          timeout: t(8_000),
+          interval: 100,
+          timeoutMsg: 'overlay capture visibility did not persist',
+        },
+      );
+      expect(await toggle.getAttribute('data-state')).toBe('unchecked');
+
+      const filepath = await saveScreenshot('settings-display-overlay-capture');
       expect(existsSync(filepath)).toBe(true);
     } finally {
       const status = await invokeOrThrow<{ requestedHidden: boolean }>(
         'get_app_screen_capture_protection',
       );
-      if (!status.requestedHidden) {
+      if (status.requestedHidden) {
         await toggle.click();
       }
     }

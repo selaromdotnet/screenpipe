@@ -9,7 +9,7 @@
  * shared WebDriver session.
  *
  * Why only the banner (and not a real check / download / install):
- *   - The WDIO suite drives a `--debug --features e2e` build, and
+ *   - The WDIO suite drives a `--profile debug-dev --features e2e` build, and
  *     `check_for_updates` early-returns under `cfg!(debug_assertions)`
  *     (src-tauri/src/updates.rs) — so the real Tauri-updater check never runs.
  *   - That debug build also ships empty updater `endpoints` + `pubkey`
@@ -129,6 +129,10 @@ describe("Update banner surfacing", function () {
     const navSettings = await $('[data-testid="nav-settings"]');
     await navSettings.waitForDisplayed({ timeout: t(15_000) });
     await navSettings.click();
+    // nav-settings reopens the last-visited section (readLastSettingsSection),
+    // so select General explicitly — the auto-update toggle only exists there.
+    const navGeneral = await waitForTestId("settings-nav-general", 15_000);
+    await navGeneral.click();
     await waitForTestId("section-settings-general", 15_000);
 
     const toggle = await $("#auto-update-toggle");
