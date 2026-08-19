@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(winget install *)",
+      "Bash(powershell -NoProfile -Command \"rustup show\")",
+      "Bash(powershell -NoProfile -Command \"cargo --version\")",
+      "Bash(powershell -NoProfile -Command \"Start-Process -FilePath 'N:\\\\Git\\\\ScreenPipe\\\\apps\\\\screenpipe-app-tauri\\\\src-tauri\\\\target\\\\x86_64-pc-windows-msvc\\\\release\\\\bundle\\\\nsis\\\\screenpipe - Development_2.6.4_x64-setup.exe' -ArgumentList '/S' -Wait; Write-Host 'install finished'\" 2>&1)"
+    ]
+  }
+}
