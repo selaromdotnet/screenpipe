@@ -25,7 +25,12 @@ describe("meeting share control", () => {
     {
       label: "meeting",
       items: [
-        { key: "resume", label: "resume meeting", icon: Play, onSelect: vi.fn() },
+        {
+          key: "resume",
+          label: "resume meeting",
+          icon: Play,
+          onSelect: vi.fn(),
+        },
         {
           key: "delete",
           label: "delete meeting",
@@ -39,7 +44,7 @@ describe("meeting share control", () => {
 
   const openMenu = () =>
     fireEvent.keyDown(
-      screen.getByRole("button", { name: "more meeting actions" }),
+      screen.getByRole("button", { name: "More meeting actions" }),
       { key: "Enter" },
     );
 
@@ -55,12 +60,12 @@ describe("meeting share control", () => {
 
     // copy, send, more — and nothing else, however many actions exist below.
     expect(screen.getAllByRole("button")).toHaveLength(3);
-    expect(screen.getByRole("button", { name: "copy summary" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Copy summary" })).toBeVisible();
     expect(
-      screen.getByRole("button", { name: "send to an app…" }),
+      screen.getByRole("button", { name: "Send to an app…" }),
     ).toBeVisible();
     expect(
-      screen.getByRole("button", { name: "more meeting actions" }),
+      screen.getByRole("button", { name: "More meeting actions" }),
     ).toBeVisible();
   });
 
@@ -75,7 +80,7 @@ describe("meeting share control", () => {
     const onShare = vi.fn();
     render(<MeetingShareMenu canShareSummary onShare={onShare} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "copy summary" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy summary" }));
     expect(onShare).toHaveBeenCalledWith("summary");
   });
 
@@ -88,7 +93,7 @@ describe("meeting share control", () => {
     // rest: fewer than 1 in 10 people who open a meeting use any share action,
     // so a visible word here competed with the tabs beside it.
     const primary = screen.getByRole("button", {
-      name: "copy meeting + transcript",
+      name: "Copy meeting + transcript",
     });
     expect(primary).toHaveTextContent("");
     fireEvent.click(primary);
@@ -107,8 +112,8 @@ describe("meeting share control", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "copy meeting + transcript" }),
-    ).toHaveTextContent("copied");
+      screen.getByRole("button", { name: "Copy meeting + transcript" }),
+    ).toHaveTextContent("Copied");
   });
 
   // Sending has a consequence outside the app, so unlike `copy` it says what
@@ -122,9 +127,52 @@ describe("meeting share control", () => {
     // Visible fixes the discoverability bug; unlabelled keeps the rule's
     // scarcest slot off an action measured at 2 users in 30 days.
     expect(send).toHaveTextContent("");
-    expect(send).toHaveAccessibleName("send to an app…");
+    expect(send).toHaveAccessibleName("Send to an app…");
     fireEvent.click(send);
     expect(onShare).toHaveBeenCalledWith("send");
+  });
+
+  it("fans out locally ranked connected apps and opens the chosen review", () => {
+    const onDestinationSelect = vi.fn();
+    render(
+      <MeetingShareMenu
+        canShareSummary
+        canSend
+        suggestedDestinations={[
+          {
+            app: "obsidian",
+            destination: "chat-obsidian",
+            name: "Obsidian",
+            observed: true,
+          },
+          {
+            app: "notion",
+            destination: "chat-notion",
+            name: "Notion",
+            observed: false,
+          },
+        ]}
+        onDestinationSelect={onDestinationSelect}
+        onShare={vi.fn()}
+      />,
+    );
+
+    const stack = screen.getByTestId("meeting-share-destinations");
+    expect(stack).toBeVisible();
+    const destinations = screen.getAllByRole("button", {
+      name: /Review and send to/,
+    });
+    expect(
+      destinations.map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["Review and send to Obsidian", "Review and send to Notion"]);
+    expect(screen.getByTestId("meeting-send-obsidian")).toHaveAttribute(
+      "title",
+      "Obsidian · used during this meeting",
+    );
+
+    fireEvent.click(screen.getByTestId("meeting-send-notion"));
+    expect(onDestinationSelect).toHaveBeenCalledWith("chat-notion");
+    expect(screen.queryByTestId("meeting-send-button")).not.toBeInTheDocument();
   });
 
   // The control shipped with no telemetry, so nobody could answer whether
@@ -141,7 +189,7 @@ describe("meeting share control", () => {
     );
 
     openMenu();
-    await screen.findByRole("menuitem", { name: /copy transcript/ });
+    await screen.findByRole("menuitem", { name: /Copy transcript/ });
     expect(onMenuOpenChange).toHaveBeenCalledWith(true);
   });
 
@@ -169,30 +217,30 @@ describe("meeting share control", () => {
     openMenu();
 
     const email = await screen.findByRole("menuitem", {
-      name: /email summary/,
+      name: /Email summary/,
     });
     expect(
-      await screen.findByRole("menuitem", { name: /copy transcript/ }),
+      await screen.findByRole("menuitem", { name: /Copy transcript/ }),
     ).toBeVisible();
     expect(
       await screen.findByRole("menuitem", {
-        name: /copy meeting \+ transcript/,
+        name: /Copy meeting \+ transcript/,
       }),
     ).toBeVisible();
     // The primary action is not repeated inside its own menu, and neither is
     // send now that it has its own button.
     expect(
-      screen.queryByRole("menuitem", { name: /^copy summary/ }),
+      screen.queryByRole("menuitem", { name: /^Copy summary/ }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("menuitem", { name: /send/ }),
+      screen.queryByRole("menuitem", { name: /Send/ }),
     ).not.toBeInTheDocument();
 
     fireEvent.click(email);
     expect(onShare).toHaveBeenCalledWith("email");
   });
 
-  // `email summary` shipped inside the group headed `copy`, where it was the
+  // `Email summary` shipped inside the group headed `copy`, where it was the
   // only row that wrote nothing to the clipboard — it opens a mailto: draft.
   // The heading named a verb while the grouping followed the payload, so the
   // one row that behaved differently was the one the label mispromised.
@@ -201,11 +249,11 @@ describe("meeting share control", () => {
 
     openMenu();
 
-    await screen.findByRole("menuitem", { name: /email summary/ });
+    await screen.findByRole("menuitem", { name: /Email summary/ });
 
     // Both headings exist, so the mail draft has somewhere honest to live.
-    expect(screen.getByText("copy")).toBeVisible();
-    expect(screen.getByText("send")).toBeVisible();
+    expect(screen.getByText("Copy")).toBeVisible();
+    expect(screen.getByText("Send")).toBeVisible();
 
     // The clipboard rows come first, and the mail draft sorts after them —
     // under `send`, not inside `copy`.
@@ -213,9 +261,9 @@ describe("meeting share control", () => {
       .getAllByRole("menuitem")
       .map((item) => item.textContent ?? "");
     const lastClipboardIndex = labels.findLastIndex((label) =>
-      /^copy /.test(label),
+      /^Copy /.test(label),
     );
-    const emailIndex = labels.findIndex((label) => /email summary/.test(label));
+    const emailIndex = labels.findIndex((label) => /Email summary/.test(label));
     expect(lastClipboardIndex).toBeGreaterThanOrEqual(0);
     expect(emailIndex).toBeGreaterThan(lastClipboardIndex);
   });
@@ -226,10 +274,10 @@ describe("meeting share control", () => {
     openMenu();
 
     expect(
-      await screen.findByRole("menuitem", { name: /copy transcript/ }),
+      await screen.findByRole("menuitem", { name: /Copy transcript/ }),
     ).toBeVisible();
     expect(
-      screen.queryByRole("menuitem", { name: /summary/ }),
+      screen.queryByRole("menuitem", { name: /Summary/ }),
     ).not.toBeInTheDocument();
   });
 
@@ -257,16 +305,74 @@ describe("meeting share control", () => {
 
     // Both worlds are reachable from the single trigger.
     expect(
-      await screen.findByRole("menuitem", { name: /copy transcript/ }),
+      await screen.findByRole("menuitem", { name: /Copy transcript/ }),
     ).toBeVisible();
     const resume = await screen.findByRole("menuitem", {
       name: /resume meeting/,
     });
-    expect(screen.getByText("copy")).toBeVisible();
+    expect(screen.getByText("Copy")).toBeVisible();
     expect(screen.getByText("meeting")).toBeVisible();
 
     fireEvent.click(resume);
     expect(onSelect).toHaveBeenCalled();
+  });
+
+  it("chooses the summary model from a submenu in the one overflow", async () => {
+    const chooseLocal = vi.fn();
+    render(
+      <MeetingShareMenu
+        canShareSummary
+        moreGroups={[
+          {
+            label: "summary",
+            items: [
+              {
+                key: "summary-model",
+                label: "summary model",
+                icon: Play,
+                submenu: {
+                  selectedKey: "screenpipe",
+                  selectedLabel: "auto",
+                  options: [
+                    {
+                      key: "screenpipe",
+                      label: "screenpipe",
+                      detail: "auto",
+                      onSelect: vi.fn(),
+                    },
+                    {
+                      key: "local",
+                      label: "local",
+                      detail: "llama 3.2",
+                      onSelect: chooseLocal,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ]}
+        onShare={vi.fn()}
+      />,
+    );
+
+    openMenu();
+    const modelMenu = await screen.findByRole("menuitem", {
+      name: /summary model auto/,
+    });
+    fireEvent.keyDown(modelMenu, { key: "ArrowRight" });
+
+    expect(
+      await screen.findByRole("menuitemradio", {
+        name: /screenpipe auto/,
+      }),
+    ).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(
+      await screen.findByRole("menuitemradio", {
+        name: /local llama 3\.2/,
+      }),
+    );
+    expect(chooseLocal).toHaveBeenCalledOnce();
   });
 
   it("keeps a destructive action out of the group it would be misclicked in", async () => {
@@ -324,8 +430,8 @@ describe("meeting share control", () => {
       />,
     );
     expect(
-      screen.getByRole("button", { name: "copy summary" }),
-    ).toHaveTextContent("copied");
+      screen.getByRole("button", { name: "Copy summary" }),
+    ).toHaveTextContent("Copied");
 
     // A transcript copy came from the menu, so the primary label must not claim
     // the summary was copied.
@@ -337,14 +443,12 @@ describe("meeting share control", () => {
       />,
     );
     expect(
-      screen.getByRole("button", { name: "copy summary" }),
-    ).not.toHaveTextContent("copied");
+      screen.getByRole("button", { name: "Copy summary" }),
+    ).not.toHaveTextContent("Copied");
   });
 
   it("locks every control while a copy is in flight", () => {
-    render(
-      <MeetingShareMenu canShareSummary canSend busy onShare={vi.fn()} />,
-    );
+    render(<MeetingShareMenu canShareSummary canSend busy onShare={vi.fn()} />);
 
     for (const button of screen.getAllByRole("button")) {
       expect(button).toBeDisabled();

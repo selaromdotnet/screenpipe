@@ -16,12 +16,15 @@ import { formatShortcut } from "./format-shortcut";
 
 const mocks = vi.hoisted(() => ({
   getRecordingHealthState: vi.fn(),
+  overlayRestartRecording: vi.fn(),
   listen: vi.fn(),
   storeGet: vi.fn(),
   storeSet: vi.fn(),
   hideShortcutReminder: vi.fn(),
   snoozeShortcutReminderForHour: vi.fn(),
   showWindow: vi.fn(),
+  toggleStarredSessions: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+  platform: { isMac: true, isWindows: false, isLoading: false },
   setSize: vi.fn(),
   setPosition: vi.fn(),
   setShortcutOverlayAnchor: vi.fn(),
@@ -101,7 +104,7 @@ vi.mock("posthog-js", () => ({
 }));
 
 vi.mock("@/lib/hooks/use-platform", () => ({
-  usePlatform: () => ({ isMac: true, isLoading: false }),
+  usePlatform: () => mocks.platform,
 }));
 
 vi.mock("@/lib/hooks/use-settings", () => ({
@@ -116,11 +119,12 @@ vi.mock("@/lib/hooks/use-settings", () => ({
 vi.mock("@/lib/utils/tauri", () => ({
   commands: {
     getRecordingHealthState: mocks.getRecordingHealthState,
-    overlayRestartRecording: vi.fn(),
+    overlayRestartRecording: mocks.overlayRestartRecording,
     overlayDismissIncident: vi.fn(),
     hideShortcutReminder: mocks.hideShortcutReminder,
     snoozeShortcutReminderForHour: mocks.snoozeShortcutReminderForHour,
     showWindow: mocks.showWindow,
+    toggleStarredSessions: mocks.toggleStarredSessions,
     setShortcutOverlayAnchor: mocks.setShortcutOverlayAnchor,
   },
 }));
@@ -155,6 +159,7 @@ describe("recording health hover detail", () => {
     mocks.meetingOverlayState.stopping = false;
     mocks.meetingOverlayState.stopError = null;
     mocks.stopMeeting.mockReset();
+    mocks.overlayRestartRecording.mockReset();
     mocks.storeSet.mockReset();
     mocks.hideShortcutReminder.mockReset();
     mocks.snoozeShortcutReminderForHour.mockReset();
@@ -181,6 +186,39 @@ describe("recording health hover detail", () => {
     );
   });
 
+  it("keeps terminal native recovery advisory and never invokes a restart action", async () => {
+    mocks.getRecordingHealthState.mockResolvedValue(
+      "failure|quit and reopen screenpipe to restore screen capture|screen|manual-reopen",
+    );
+
+    render(<ShortcutReminderPage />);
+
+    const failureButton = await screen.findByRole("button", {
+      name: "Screen capture needs help: quit and reopen screenpipe to restore screen capture",
+    });
+    expect(failureButton).toBeDisabled();
+    expect(screen.getByText("Quit & reopen")).toBeVisible();
+
+    fireEvent.click(failureButton);
+    expect(mocks.overlayRestartRecording).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /restart recording/i })).toBeNull();
+  });
+
+  it("does not infer recovery behavior from user-facing wording", async () => {
+    mocks.getRecordingHealthState.mockResolvedValue(
+      "failure|quit and reopen screenpipe wording without an action|screen",
+    );
+
+    render(<ShortcutReminderPage />);
+
+    const failureButton = await screen.findByRole("button", {
+      name: /restart recording/i,
+    });
+    expect(failureButton).toBeEnabled();
+    fireEvent.click(failureButton);
+    await waitFor(() => expect(mocks.overlayRestartRecording).toHaveBeenCalledTimes(1));
+  });
+
   it("shows recovery confirmation instead of a broken or restart state", async () => {
     mocks.getRecordingHealthState.mockResolvedValue(
       "recovering|screen capture is not updating|screen",
@@ -188,7 +226,7 @@ describe("recording health hover detail", () => {
 
     render(<ShortcutReminderPage />);
 
-    expect(await screen.findByText("checking recovery...")).toBeVisible();
+    expect(await screen.findByText("Checking recovery...")).toBeVisible();
     expect(screen.queryByText("screen capture needs help")).toBeNull();
     expect(screen.queryByRole("button", { name: /restart/i })).toBeNull();
   });
@@ -301,10 +339,10 @@ describe("recording health hover detail", () => {
 
     expect(await screen.findByRole("status", { name: "Meeting live" })).toBeVisible();
     fireEvent.mouseEnter(screen.getByTestId("shortcut-reminder-root"));
-    expect(screen.getByText("meeting live · zoom")).toBeVisible();
+    expect(screen.getByText("Meeting live · zoom")).toBeVisible();
     expect(screen.getByText("the live transcript keeps moving")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "stop" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     expect(mocks.stopMeeting).toHaveBeenCalledTimes(1);
   });
 
@@ -318,7 +356,7 @@ describe("recording health hover detail", () => {
 
     const meetingDot = await screen.findByRole("status", { name: "Meeting live" });
     expect(screen.getByTitle("Open timeline")).toContainElement(meetingDot);
-    expect(screen.queryByTitle("notifications")).toBeNull();
+    expect(screen.queryByTitle("Notifications")).toBeNull();
     expect(meetingDot.className).toContain("pointer-events-none");
   });
 
@@ -329,7 +367,7 @@ describe("recording health hover detail", () => {
     render(<ShortcutReminderPage />);
 
     fireEvent.mouseEnter(await screen.findByTestId("shortcut-reminder-root"));
-    const brand = await screen.findByTitle("screenpipe — right-click for options");
+    const brand = await screen.findByTitle("Screenpipe — right-click for options");
     expect(brand).toBeVisible();
     expect(brand.parentElement?.lastElementChild).toBe(brand);
     fireEvent.contextMenu(brand);
@@ -342,7 +380,7 @@ describe("recording health hover detail", () => {
     );
 
     fireEvent.mouseEnter(screen.getByTestId("shortcut-reminder-root"));
-    fireEvent.contextMenu(screen.getByTitle("screenpipe — right-click for options"));
+    fireEvent.contextMenu(screen.getByTitle("Screenpipe — right-click for options"));
     fireEvent.click(screen.getByTitle("Open overlay settings"));
     expect(mocks.showWindow).toHaveBeenCalledWith({ Home: { page: "display" } });
     expect(screen.queryByRole("menu", { name: "Shortcut reminder options" })).toBeNull();
@@ -382,7 +420,7 @@ describe("recording health hover detail", () => {
       screen.getByTestId("shortcut-reminder-meeting-preview"),
     ).toBeVisible();
     // The transcript is what the pin is for — it has to survive the exit too.
-    expect(screen.getByText("meeting live · zoom")).toBeVisible();
+    expect(screen.getByText("Meeting live · zoom")).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Unpin transcript" }));
     expect(screen.queryByTestId("shortcut-reminder-meeting-preview")).toBeNull();
@@ -435,10 +473,42 @@ describe("recording health hover detail", () => {
     fireEvent.mouseEnter(screen.getByTitle("Open timeline"));
 
     expect(
-      await screen.findByText(formatShortcut("Super+Ctrl+S", true), {
+      await screen.findByText(formatShortcut("Super+Ctrl+S", "macos"), {
         exact: false,
       }),
     ).toBeVisible();
+  });
+
+  it.each([
+    [undefined, "Control+Super+B"],
+    [{}, "Control+Super+B"],
+    [{ starSessionShortcut: "" }, "Control+Super+B"],
+    [{ starSessionShortcut: "Alt+Shift+J" }, "Alt+Shift+J"],
+  ])("shows the star shortcut from settings %j on hover and focus", async (settings, shortcut) => {
+    mocks.getRecordingHealthState.mockResolvedValue("normal");
+    mocks.storeGet.mockResolvedValue(settings);
+    render(<ShortcutReminderPage />);
+    fireEvent.mouseEnter(await screen.findByTestId("shortcut-reminder-root"));
+    const star = screen.getByRole("button", { name: "Starred work sessions" });
+    fireEvent.mouseEnter(star);
+    expect(await screen.findByText(formatShortcut(shortcut, "macos"), { exact: false })).toBeVisible();
+    fireEvent.mouseEnter(screen.getByTitle("Open timeline"));
+    fireEvent.focus(star);
+    expect(await screen.findByText(formatShortcut(shortcut, "macos"), { exact: false })).toBeVisible();
+  });
+
+  it("hides the disabled star shortcut while keeping its action label", async () => {
+    mocks.getRecordingHealthState.mockResolvedValue("normal");
+    mocks.storeGet.mockResolvedValue({
+      starSessionShortcut: "Alt+Shift+J",
+      disabledShortcuts: ["starSessionShortcut"],
+    });
+    render(<ShortcutReminderPage />);
+    fireEvent.mouseEnter(await screen.findByTestId("shortcut-reminder-root"));
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Starred work sessions" }));
+    expect(await screen.findByText("Star work session")).toBeVisible();
+    expect(screen.queryByText(formatShortcut("Alt+Shift+J", "macos"), { exact: false })).toBeNull();
+    expect(screen.queryByText(formatShortcut("Control+Super+B", "macos"), { exact: false })).toBeNull();
   });
 
   it("leaves no black bar under the dock when no control is hovered", async () => {
@@ -477,12 +547,15 @@ describe("recording health hover detail", () => {
 });
 
 describe("shortcut display ordering", () => {
-  it("renders modifiers in a stable platform order", () => {
-    expect(formatShortcut("Control+Super+s", true)).toBe("⌘⌃S");
-    expect(formatShortcut("Control+Super+s", false)).toBe("Win+Ctrl+S");
-    expect(formatShortcut("Shift+Alt+Control+Super+k", false)).toBe(
-      "Win+Ctrl+Alt+Shift+K",
+  it("renders familiar modifier notation in a stable platform order", () => {
+    expect(formatShortcut("Control+Super+s", "macos")).toBe("⌘⌃S");
+    expect(formatShortcut("Control+Super+s", "windows")).toBe("⊞+Ctrl+S");
+    expect(formatShortcut("Control+Super+s", "linux")).toBe("Super+Ctrl+S");
+    expect(formatShortcut("Shift+Alt+Control+Super+k", "windows")).toBe(
+      "⊞+Ctrl+Alt+Shift+K",
     );
+    expect(formatShortcut("⊞+Ctrl+S", "windows")).toBe("⊞+Ctrl+S");
+    expect(formatShortcut("Super+Ctrl+S", "linux")).toBe("Super+Ctrl+S");
   });
 });
 
@@ -810,5 +883,57 @@ describe("drag to pin", () => {
     expect(mocks.setPosition).toHaveBeenCalledWith(
       expect.objectContaining({ x: 949, y: 12 }),
     );
+  });
+});
+
+
+describe("starred sessions during a live meeting", () => {
+  it("opens session controls while keeping the meeting running", async () => {
+    mocks.getRecordingHealthState.mockResolvedValue("normal");
+    mocks.storeGet.mockResolvedValue(undefined);
+    Object.assign(mocks.meetingOverlayState, {active:true,activeMeetingId:42,stoppableMeetingId:42});
+    render(<ShortcutReminderPage />);
+    fireEvent.mouseEnter(await screen.findByTestId("shortcut-reminder-root"));
+    fireEvent.click(await screen.findByRole("button",{name:"Starred work sessions"}));
+    await waitFor(() => expect(mocks.toggleStarredSessions).toHaveBeenCalled());
+    expect(mocks.stopMeeting).not.toHaveBeenCalled();
+    cleanup();
+    Object.assign(mocks.meetingOverlayState, {active:false,activeMeetingId:null,stoppableMeetingId:null});
+  });
+});
+
+
+describe("cross-platform star controls", () => {
+  it.each(["windows", "linux"])("opens the shared dialog on %s without growing the toolbar", async (platform) => {
+    mocks.platform.isMac = false;
+    mocks.platform.isWindows = platform === "windows";
+    mocks.getRecordingHealthState.mockResolvedValue("normal");
+    mocks.storeGet.mockResolvedValue(undefined);
+    mocks.toggleStarredSessions.mockClear();
+    mocks.showWindow.mockClear();
+    render(<ShortcutReminderPage />);
+    fireEvent.mouseEnter(await screen.findByTestId("shortcut-reminder-root"));
+    const star = await screen.findByRole("button", { name: "Starred work sessions" });
+    fireEvent.mouseEnter(star);
+    const binding = platform === "windows" ? "Alt+Shift+B" : "Control+Super+B";
+    expect(await screen.findByText(formatShortcut(binding, platform as "windows" | "linux"), { exact: false })).toBeVisible();
+    fireEvent.click(star);
+    await waitFor(() => expect(mocks.toggleStarredSessions).toHaveBeenCalledTimes(1));
+    expect(mocks.showWindow).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "15 min" })).toBeNull();
+    expect(star).toHaveAttribute("aria-haspopup", "dialog");
+    cleanup();
+    mocks.platform.isMac = true;
+    mocks.platform.isWindows = false;
+  });
+
+  it("shows an actionable error when the window cannot open", async () => {
+    mocks.getRecordingHealthState.mockResolvedValue("normal");
+    mocks.toggleStarredSessions.mockResolvedValueOnce({ status: "error", error: "unavailable" });
+    render(<ShortcutReminderPage />);
+    fireEvent.mouseEnter(await screen.findByTestId("shortcut-reminder-root"));
+    fireEvent.click(await screen.findByRole("button", { name: "Starred work sessions" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not open session controls");
+    cleanup();
   });
 });

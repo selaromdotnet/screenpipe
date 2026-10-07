@@ -7,7 +7,6 @@ use image::DynamicImage;
 use libsqlite3_sys::sqlite3_auto_extension;
 use screenpipe_config::DbConfig;
 use sqlite_vec::sqlite3_vec_init;
-use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use sqlx::Column;
@@ -67,6 +66,12 @@ pub const MEETING_END_REASON_EXPLICIT_STOP: &str = "explicit_stop";
 pub const MEETING_END_REASON_AUTO_END: &str = "auto_end";
 /// App shutdown closed an active meeting row. Eligible for auto-merge on next launch.
 pub const MEETING_END_REASON_SHUTDOWN: &str = "shutdown";
+/// The detector saw the same app move to a different conference room (or the
+/// calendar roll into the next scheduled event while the mic was re-acquired)
+/// and closed this row so the next call gets its own. Auto-merge MUST NOT
+/// reopen these: the boundary was chosen deliberately, and reopening would
+/// glue two back-to-back meetings into one again.
+pub const MEETING_END_REASON_ROOM_CHANGED: &str = "room_changed";
 
 fn normalize_timestamp_for_range_query(timestamp: &str) -> String {
     DateTime::parse_from_rfc3339(timestamp)
@@ -153,7 +158,7 @@ impl HardFaultReporter {
         self.close_token.cancel();
         if first_for_manager {
             if let Some(hook) = self.persistent_failure_hook.take_hard_fault_hook() {
-                hook();
+                hook(crate::write_queue::DatabaseRestartReason::SqliteHardFault);
             }
         }
         true
@@ -164,6 +169,7 @@ pub struct ImmediateTx {
     conn: Option<PoolConnection<Sqlite>>,
     committed: bool,
     _write_permit: Option<OwnedSemaphorePermit>,
+    _admission: Option<tokio::sync::OwnedMutexGuard<()>>,
     hard_fault_reporter: HardFaultReporter,
 }
 
@@ -179,6 +185,7 @@ impl ImmediateTx {
             conn: Some(conn),
             committed: false,
             _write_permit: Some(write_permit),
+            _admission: None,
             hard_fault_reporter: HardFaultReporter {
                 health,
                 persistent_failure_hook,
@@ -247,6 +254,7 @@ impl Drop for ImmediateTx {
                 // slot than poison the pool with a stuck transaction).
                 warn!("ImmediateTx dropped without commit — rolling back");
                 let permit = self._write_permit.take(); // Hold permit until rollback completes
+                let admission = self._admission.take();
                 let reporter = self.hard_fault_reporter.clone();
                 tokio::spawn(async move {
                     // The statement that made the caller abandon this transaction
@@ -284,6 +292,7 @@ impl Drop for ImmediateTx {
                         }
                     }
                     drop(permit); // Release the write permit so other writers can proceed
+                    drop(admission);
                 });
             }
         }
@@ -291,6 +300,8 @@ impl Drop for ImmediateTx {
 }
 
 pub struct DatabaseManager {
+    pub(crate) storage: Option<Arc<crate::storage::HybridStorage>>,
+    upload_source_id: tokio::sync::OnceCell<String>,
     /// Read-only pool. Used for all SELECT queries.
     /// Separated from writes so read bursts (search, timeline, API) can never
     /// starve the write pipeline. Size depends on DbConfig tier.
@@ -319,6 +330,9 @@ pub struct DatabaseManager {
     /// Slot for the persistent-failure hook, wired by the app after construction.
     /// Shared with the drain loop so a late `set_persistent_failure_hook` takes effect.
     persistent_failure_hook: crate::write_queue::PersistentFailureSlot,
+    /// Prevents a second independently managed pool generation from opening
+    /// this physical path and invalidating macOS unix-excl's process lock.
+    manager_lease: Option<screenpipe_sqlite_coordinator::SqliteManagerLease>,
     /// Cancelled by [`DatabaseManager::close`]. Stops the WAL-maintenance task and
     /// the write-queue drain loop so no background task keeps a SQLite connection
     /// (and the shared `-shm` WAL-index mapping) alive after teardown — a leaked
@@ -454,10 +468,14 @@ mod frames;
 mod maintenance;
 mod meetings;
 mod memories;
+mod starred;
+pub use starred::StarredSession;
 mod outputs;
 mod search;
 mod semantic;
 mod setup;
+pub(crate) use setup::register_sqlite_extensions;
+mod source_identity;
 mod speakers;
 mod tags;
 mod text_positions;

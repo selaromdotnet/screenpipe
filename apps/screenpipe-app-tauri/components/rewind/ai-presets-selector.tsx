@@ -16,15 +16,29 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { useModelUpsellGating } from "@/lib/hooks/use-model-upsell-gating";
 import { usePiModels } from "@/lib/hooks/use-pi-models";
 import { modelAllowanceNotice } from "@/lib/chat/model-allowance-cost";
-import { useMemo, useState, useEffect, useCallback, useRef } from "react";
+import {
+  useMemo,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from "react";
 import {
   acpAdapterInfo,
   generatePresetName,
+  primaryAcpAdapterChoices,
   presetImageClass,
   presetImageSrc,
 } from "@/lib/utils/preset-appearance";
-import { AcpAgentPicker } from "@/components/settings/acp-agent-picker";
-import { useAcpRolloutEnabled } from "@/lib/acp-rollout";
+import {
+  AcpAgentPicker,
+  acpAgentForSelection,
+} from "@/components/settings/acp-agent-picker";
+import {
+  useAcpRolloutEnabled,
+  useSelectableAcpAdapters,
+} from "@/lib/acp-rollout";
 import {
   Command,
   CommandEmpty,
@@ -60,7 +74,7 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { toast } from "sonner";
+import { toast } from "@/components/ui/use-toast";
 import {
   Tooltip,
   TooltipContent,
@@ -93,6 +107,10 @@ import {
   ollamaContextWindowFromShow,
   resolveModelLimits,
 } from "@/lib/model-metadata";
+import { compactModelLabel } from "@/lib/utils/model-label";
+import { CHATGPT_FALLBACK_MODELS } from "@/lib/utils/chatgpt-preset";
+import { useGT } from "gt-react";
+
 
 // Helper to detect UUID-like strings and format preset names nicely
 const formatPresetName = (name: string): string => {
@@ -138,11 +156,18 @@ type RecommendedPreset = BaseRecommendedPreset &
       }
   );
 
+/** Whether the preset dialog creates, edits, or copies a preset. */
+type PresetDialogMode = "create" | "edit" | "copy";
+
 interface AIProviderConfigProps {
+  allowAgentPresets?: boolean;
   onSubmit: (data: AIPreset) => void;
   defaultPreset?: AIPreset;
   showLoginCta?: boolean;
+  /** Defaults to "edit" when `defaultPreset` is set, otherwise "create". */
+  mode?: PresetDialogMode;
 }
+
 interface OpenAIModel {
   id: string;
   created?: number;
@@ -160,7 +185,13 @@ export const DEFAULT_PROMPT = `Rules:
 - Always answer my question/intent, do not make up things
 `;
 
-function ChatGptSignInButton() {
+function ChatGptSignInButton({
+  onAuthChange,
+}: {
+  onAuthChange: () => void;
+}) {
+
+  const ui = useGT();
   const [loggedIn, setLoggedIn] = useState(false);
   const [loading, setLoading] = useState(false);
   useEffect(() => {
@@ -180,6 +211,7 @@ function ChatGptSignInButton() {
           setLoading(true);
           await commands.chatgptOauthLogout();
           setLoggedIn(false);
+          onAuthChange();
           setLoading(false);
         } else {
           setLoading(true);
@@ -187,6 +219,7 @@ function ChatGptSignInButton() {
             const res = await commands.chatgptOauthLogin();
             if (res.status === "ok" && res.data) {
               setLoggedIn(true);
+              onAuthChange();
             }
           } catch (e) {
             console.error("chatgpt oauth failed:", e);
@@ -202,22 +235,27 @@ function ChatGptSignInButton() {
       ) : (
         <LogIn className="h-3 w-3 mr-1" />
       )}
-      {loggedIn ? "signed in — sign out" : "sign in with chatgpt"}
+      {loggedIn ? ui("Signed in — sign out") : ui("Sign in with chatgpt")}
     </Button>
   );
 }
 
 export function AIProviderConfig({
+  allowAgentPresets = true,
   onSubmit,
   defaultPreset,
   showLoginCta = true,
+  mode = defaultPreset?.id ? "edit" : "create",
 }: AIProviderConfigProps) {
+
+  const ui = useGT();
   const [selectedProvider, setSelectedProvider] = useState<
-    AIPreset["provider"]
-  >(defaultPreset?.provider || "openai");
+    AIPreset["provider"] | null
+  >(defaultPreset?.provider ?? null);
   const { settings } = useSettings();
   const [isLoading, setIsLoading] = useState(false);
   const [openaiModels, setOpenAIModels] = useState<OpenAIModel[]>([]);
+  const [chatgptAuthRevision, setChatgptAuthRevision] = useState(0);
   const [modelDiscoveryStatus, setModelDiscoveryStatus] =
     useState<ModelDiscoveryStatus>("idle");
   const [modelDiscoveryError, setModelDiscoveryError] = useState<string | null>(
@@ -227,33 +265,11 @@ export function AIProviderConfig({
   const [showApiKey, setShowApiKey] = useState(false);
   const { isManagedDeployment, policy: enterprisePolicy } = useManagedPolicy();
   const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
-  const [piAvailable, setPiAvailable] = useState(false);
+  const showScreenpipeCloud =
+    !isManagedDeployment || aiPresetPolicy.allow_screenpipe_cloud;
   const { piModels, isLoading: loadingPiModels, upgradeEligible } = usePiModels();
   const showUpsell = useModelUpsellGating(upgradeEligible);
 
-  // Check Pi availability (installed at app startup by Rust background thread)
-  useEffect(() => {
-    const checkPi = async () => {
-      try {
-        const result = await commands.piCheck();
-        if (result.status === "ok" && result.data.available) {
-          setPiAvailable(true);
-        }
-      } catch (e) {
-        console.error("Failed to check pi:", e);
-      }
-    };
-    if (isManagedDeployment) {
-      setPiAvailable(aiPresetPolicy.allow_screenpipe_cloud);
-      return;
-    }
-    if (!isManagedDeployment) {
-      checkPi();
-    }
-    // Re-check periodically in case background install finishes
-    const interval = isManagedDeployment ? null : setInterval(checkPi, 5000);
-    return () => { if (interval) clearInterval(interval); };
-  }, [isManagedDeployment, aiPresetPolicy.allow_screenpipe_cloud]);
   const [formData, setFormData] = useState<AIPreset>({
     provider: defaultPreset?.provider || "openai",
     apiKey: defaultPreset?.apiKey || "",
@@ -321,7 +337,13 @@ export function AIProviderConfig({
   // Second ACP entry point (the first is Settings → AI presets). Same
   // fail-closed rollout gate, otherwise this selector would hand every user a
   // coding-agent provider the settings page deliberately hides.
-  const acpEnabled = useAcpRolloutEnabled();
+  const acpRolloutEnabled = useAcpRolloutEnabled();
+  const acpEnabled = allowAgentPresets && acpRolloutEnabled;
+  const acpAdapters = useSelectableAcpAdapters(formData.acpAgent?.id);
+  const primaryAcpAdapters = primaryAcpAdapterChoices(acpAdapters);
+  const customAcpAdapter = acpAdapters.find(
+    (adapter) => adapter.id === "custom",
+  );
 
   // A preset saved while the flag was on must not leave this editor stuck on a
   // provider whose picker is no longer rendered.
@@ -472,6 +494,7 @@ export function AIProviderConfig({
   };
 
   useEffect(() => {
+    let cancelled = false;
     setOpenAIModels([]);
     setModelDiscoveryStatus("idle");
     setModelDiscoveryError(null);
@@ -527,39 +550,29 @@ export function AIProviderConfig({
     ) {
       fetchOpenAIModels(formData.url, formData.apiKey);
     } else if (selectedProvider === "openai-chatgpt") {
-      // Try fetching from API, fall back to known models
+      const fallbackModels = CHATGPT_FALLBACK_MODELS.map((id) => ({ id }));
       (async () => {
         setModelDiscoveryStatus("loading");
         try {
-          const tokenResult = await commands.chatgptOauthGetToken();
-          if (tokenResult.status === "ok") {
-            const resp = await tauriFetchWithDeadline("https://api.openai.com/v1/models", {
-              headers: { Authorization: `Bearer ${tokenResult.data}` },
-            });
-            if (resp.ok) {
-              const data = await resp.json();
-              const uniqueModels = (data.data as { id: string }[]).filter((m, idx, arr) => arr.findIndex((x) => x.id === m.id) === idx);
-              setOpenAIModels(uniqueModels);
-              setModelDiscoveryStatus("ready");
-              return;
-            }
+          const result = await commands.chatgptOauthModels();
+          if (cancelled) return;
+          if (result.status === "ok" && result.data.length > 0) {
+            setOpenAIModels(result.data.map((id) => ({ id })));
+            setModelDiscoveryStatus("ready");
+            return;
           }
         } catch { /* ignore */ }
+        if (cancelled) return;
         // Fallback: known models for ChatGPT connections when model discovery fails.
-        setOpenAIModels([
-          { id: "gpt-5.6-terra" }, { id: "gpt-5.6" }, { id: "gpt-5.6-sol" }, { id: "gpt-5.6-luna" },
-          { id: "gpt-5.5" }, { id: "gpt-5.5-codex" },
-          { id: "gpt-5.4" }, { id: "gpt-5.3-codex" },
-          { id: "gpt-5.2-codex" }, { id: "gpt-5.2" }, { id: "gpt-5.1-codex-max" },
-          { id: "gpt-5.1" }, { id: "gpt-5.1-codex-mini" },
-        ]);
+        setOpenAIModels(fallbackModels);
         setModelDiscoveryStatus("error");
         setModelDiscoveryError(
           "couldn't load live ChatGPT models — showing known models",
         );
       })();
     }
-  }, [selectedProvider, formData.apiKey, formData.url, connectionFieldErrors.url]);
+    return () => { cancelled = true; };
+  }, [selectedProvider, formData.apiKey, formData.url, connectionFieldErrors.url, chatgptAuthRevision]);
 
   useEffect(() => {
     if (selectedProvider !== "native-ollama" || !formData.model) return;
@@ -609,19 +622,26 @@ export function AIProviderConfig({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    if (!selectedProvider) {
+      toast({ title: ui("Choose an AI before continuing"), variant: "destructive" });
+      return;
+    }
+
     if (!validateId(formData.id)) {
       return;
     }
 
     if (Object.keys(connectionFieldErrors).length > 0) {
-      toast.error("Fix the connection fields", {
+      toast({
+        title: ui("Fix the connection fields"),
         description: Object.values(connectionFieldErrors)[0],
+        variant: "destructive",
       });
       return;
     }
 
     if (connectionTestRequired && !connectionTestPassed) {
-      toast.error("Test the connection before saving");
+      toast({ title: ui("Test the connection before saving"), variant: "destructive" });
       return;
     }
 
@@ -647,51 +667,29 @@ export function AIProviderConfig({
   };
 
 
-
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(
+    selectedProvider === "custom" ||
+      selectedProvider === "openai-chatgpt" ||
+      selectedProvider === "anthropic" ||
+      selectedProvider === "native-ollama" ||
+      (selectedProvider === "acp" && formData.acpAgent?.id === "custom"),
+  );
 
   return (
     <div className="w-full space-y-3 rounded-lg bg-card p-4">
       <div>
         <h2 className="text-base font-semibold">
-          {defaultPreset?.id ? "edit ai provider" : "ai provider"}
+          {{
+            create: ui("Choose your AI"),
+            edit: ui("Edit AI"),
+            copy: ui("Duplicate AI"),
+          }[mode]}
         </h2>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-3">
-        <div className="space-y-1">
-          <Label htmlFor="name" className="flex items-center gap-2 text-xs">
-            name
-            {idError && (
-              <span className="text-xs text-destructive font-normal">
-                {idError}
-              </span>
-            )}
-          </Label>
-          <Input
-            id="name"
-            type="text"
-            placeholder="preset name"
-            value={formData.id ?? ""}
-            onChange={(e) => handleIdChange(e.target.value)}
-            onBlur={refillEmptyName}
-            className={cn(
-              "font-mono h-8 text-sm",
-              idError && "border-destructive focus-visible:ring-destructive",
-            )}
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-            disabled={
-              Boolean(defaultPreset?.id) &&
-              settings.aiPresets.some((p) => p.id === defaultPreset?.id)
-            }
-          />
-        </div>
-
         <div className="grid grid-cols-3 gap-2">
-          {piAvailable && (
+          {showScreenpipeCloud && (
             <Button
               type="button"
               disabled={!settings?.user?.token}
@@ -708,120 +706,61 @@ export function AIProviderConfig({
               }}
             >
               <Icons.terminal className="h-3.5 w-3.5" />
-              <span>screenpipe cloud</span>
+              <span>Screenpipe</span>
             </Button>
           )}
 
-          <Button
-            type="button"
-            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              setSelectedProvider("openai-chatgpt");
-              setFormData({
-                ...formData,
-                provider: "openai-chatgpt",
-                url: "https://api.openai.com/v1",
-                model: "gpt-5.6-terra",
-              });
-            }}
-          >
-            <Icons.openai className="h-3.5 w-3.5" />
-            <span>chatgpt</span>
-          </Button>
+          {acpEnabled && primaryAcpAdapters.map((adapter) => {
+            const isSelected =
+              selectedProvider === "acp" &&
+              (formData.acpAgent?.id || "pi-acp") === adapter.id;
+            return (
+              <Button
+                key={adapter.id}
+                type="button"
+                variant={isSelected ? "default" : "outline"}
+                className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+                onClick={() => {
+                  const nextAgent = acpAgentForSelection(
+                    formData.acpAgent,
+                    adapter.id,
+                  );
+                  setSelectedProvider("acp");
+                  setFormData({
+                    ...formData,
+                    provider: "acp",
+                    url: "",
+                    model: nextAgent.id,
+                    acpAgent: nextAgent,
+                  });
+                }}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={adapter.imageSrc}
+                  alt=""
+                  className={cn(
+                    "h-3.5 w-3.5 rounded-sm",
+                    adapter.invertInDark && "dark:invert",
+                  )}
+                />
+                <span>{adapter.name}</span>
+              </Button>
+            );
+          })}
 
-          <Button
-            type="button"
-            variant={
-              selectedProvider === "native-ollama" ? "default" : "outline"
-            }
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              setSelectedProvider("native-ollama");
-              setFormData({
-                ...formData,
-                provider: "native-ollama",
-                url: "http://localhost:11434/v1",
-              });
-            }}
-          >
-            <Icons.terminal className="h-3.5 w-3.5" />
-            <span>ollama</span>
-          </Button>
-
-          <Button
-            type="button"
-            variant={selectedProvider === "custom" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              setSelectedProvider("custom");
-              setFormData({
-                ...formData,
-                provider: "custom",
-                url: "http://localhost:11434/v1",
-              });
-            }}
-          >
-            <Icons.settings className="h-3.5 w-3.5" />
-            <span>custom</span>
-          </Button>
-
-          <Button
-            type="button"
-            variant={(selectedProvider as string) === "anthropic" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              if ((selectedProvider as string) !== "anthropic") {
-                setSelectedProvider("anthropic");
-                setFormData({
-                  ...formData,
-                  provider: "anthropic",
-                  url: "",
-                  model: "claude-sonnet-5",
-                });
-              }
-            }}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src="/images/claude-ai.svg" alt="Claude API" className="h-3.5 w-3.5 rounded-sm" />
-            <span>claude api</span>
-          </Button>
-
-          {acpEnabled && (
-          <Button
-            type="button"
-            variant={selectedProvider === "acp" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              if (selectedProvider === "acp") return;
-              setSelectedProvider("acp");
-              const agentId = formData.acpAgent?.id || "pi-acp";
-              setFormData({
-                ...formData,
-                provider: "acp",
-                url: "",
-                model: agentId,
-                acpAgent: formData.acpAgent || { id: "pi-acp" },
-              });
-            }}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="/images/acp.svg"
-              alt="Coding agent"
-              className={cn(
-                "h-3.5 w-3.5 rounded-sm dark:invert",
-                selectedProvider === "acp" && "invert dark:invert-0",
-              )}
-            />
-            <span>coding agent</span>
-          </Button>
-          )}
         </div>
+
+        {!selectedProvider && (
+          <p className="text-xs text-muted-foreground">
+            Choose one to continue
+          </p>
+        )}
 
         {acpEnabled && selectedProvider === "acp" && (
           <AcpAgentPicker
             compact
+            showAgentChoices={false}
             agent={formData.acpAgent}
             onChange={(next) =>
               setFormData({ ...formData, provider: "acp", model: next.id, acpAgent: next })
@@ -834,7 +773,7 @@ export function AIProviderConfig({
           <div className="space-y-1">
             <div className="space-y-1">
               <Label htmlFor="apiKey" className="text-xs">
-                api key{apiKeyRequired && <span className="text-destructive"> *</span>}
+                API key{apiKeyRequired && <span className="text-destructive"> *</span>}
               </Label>
               <div className="relative">
                 <Input
@@ -863,7 +802,7 @@ export function AIProviderConfig({
               </div>
             </div>
             <div className="space-y-1">
-              <Label htmlFor="model" className="text-xs">model</Label>
+              <Label htmlFor="model" className="text-xs">Model</Label>
               <ModelPicker
                 id="model"
                 value={formData.model}
@@ -872,7 +811,7 @@ export function AIProviderConfig({
                 status={modelDiscoveryStatus}
                 errorMessage={modelDiscoveryError}
                 idleMessage="enter an API key to discover models"
-                emptyMessage="no models available for this API key"
+                emptyMessage={ui("No models available for this API key")}
                 disabled={!formData.apiKey}
               />
             </div>
@@ -882,7 +821,7 @@ export function AIProviderConfig({
         {selectedProvider === "native-ollama" && (
           <div className="space-y-1">
             <div className="space-y-1">
-              <Label htmlFor="baseUrl" className="text-xs">base url</Label>
+              <Label htmlFor="baseUrl" className="text-xs">Base URL</Label>
               <Input
                 id="baseUrl"
                 type="text"
@@ -895,7 +834,7 @@ export function AIProviderConfig({
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="model" className="text-xs">model</Label>
+              <Label htmlFor="model" className="text-xs">Model</Label>
               <ModelPicker
                 id="model"
                 value={formData.model}
@@ -903,12 +842,12 @@ export function AIProviderConfig({
                 onValueChange={(model) => setFormData({ ...formData, model })}
                 status={modelDiscoveryStatus}
                 errorMessage={modelDiscoveryError}
-                placeholder="e.g. qwen3.5:9b"
-                emptyMessage="no Ollama models installed — type a model name manually"
+                placeholder={ui("E.g. qwen3.5:9b")}
+                emptyMessage={ui("No Ollama models installed — type a model name manually")}
                 allowManualEntry
               />
               <p className="text-[10px] text-muted-foreground">
-                recommended: qwen3.5:9b, glm-4.7:9b, qwen3.5:4b (tool calling). GPU required.
+                Recommended: qwen3.5:9b, glm-4.7:9b, qwen3.5:4b (tool calling). GPU required.
               </p>
             </div>
           </div>
@@ -917,7 +856,7 @@ export function AIProviderConfig({
         {selectedProvider === "custom" && (
           <div className="space-y-1">
             <div className="space-y-1">
-              <Label htmlFor="baseUrl" className="text-xs">base url</Label>
+              <Label htmlFor="baseUrl" className="text-xs">Base URL</Label>
               <Input
                 id="baseUrl"
                 type="text"
@@ -930,12 +869,12 @@ export function AIProviderConfig({
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="apiKey" className="text-xs">api key</Label>
+              <Label htmlFor="apiKey" className="text-xs">API key</Label>
               <div className="relative">
                 <Input
                   id="apiKey"
                   type={showApiKey ? "text" : "password"}
-                  placeholder="your-api-key"
+                  placeholder={ui("your-api-key")}
                   value={formData.apiKey || ""}
                   onChange={(e) =>
                     setFormData({ ...formData, apiKey: e.target.value })
@@ -958,7 +897,7 @@ export function AIProviderConfig({
               </div>
             </div>
             <div className="space-y-1">
-              <Label htmlFor="model" className="text-xs">model</Label>
+              <Label htmlFor="model" className="text-xs">Model</Label>
               <ModelPicker
                 id="model"
                 value={formData.model}
@@ -967,8 +906,8 @@ export function AIProviderConfig({
                 status={modelDiscoveryStatus}
                 errorMessage={modelDiscoveryError}
                 idleMessage="enter a valid base URL to discover models"
-                placeholder="type or select model"
-                emptyMessage="no models discovered — type a model name manually"
+                placeholder={ui("Type or select model")}
+                emptyMessage={ui("No models discovered — type a model name manually")}
                 allowManualEntry
               />
             </div>
@@ -978,11 +917,11 @@ export function AIProviderConfig({
         {selectedProvider === "openai-chatgpt" && (
           <div className="space-y-1">
             <div className="space-y-1">
-              <Label className="text-xs">chatgpt account</Label>
-              <ChatGptSignInButton />
+              <Label className="text-xs">Chatgpt account</Label>
+              <ChatGptSignInButton onAuthChange={() => setChatgptAuthRevision((revision) => revision + 1)} />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="model" className="text-xs">model</Label>
+              <Label htmlFor="model" className="text-xs">Model</Label>
               <ModelPicker
                 id="model"
                 value={formData.model}
@@ -991,7 +930,7 @@ export function AIProviderConfig({
                 status={modelDiscoveryStatus}
                 errorMessage={modelDiscoveryError}
                 placeholder="gpt-5.6-terra"
-                emptyMessage="no ChatGPT models discovered — type a model name manually"
+                emptyMessage={ui("No ChatGPT models discovered — type a model name manually")}
                 allowManualEntry
               />
             </div>
@@ -1002,7 +941,7 @@ export function AIProviderConfig({
           <div className="space-y-1">
             {selectedProvider === "anthropic" && (
               <div className="space-y-1 pt-1">
-                <Label htmlFor="anthropicApiKey" className="text-xs">api key</Label>
+                <Label htmlFor="anthropicApiKey" className="text-xs">API key</Label>
                 <div className="relative">
                   <Input
                     id="anthropicApiKey"
@@ -1026,19 +965,19 @@ export function AIProviderConfig({
             )}
 
             <div className="space-y-1">
-              <Label htmlFor="model" className="text-xs">model</Label>
+              <Label htmlFor="model" className="text-xs">Model</Label>
               <Select
                 value={formData.model}
                 onValueChange={(value) => setFormData({ ...formData, model: value })}
               >
                 <SelectTrigger className="h-8 text-sm">
-                  <SelectValue placeholder="select model" />
+                  <SelectValue placeholder={ui("Select model")} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="claude-opus-5">claude opus 5</SelectItem>
-                  <SelectItem value="claude-fable-5">claude fable 5</SelectItem>
-                  <SelectItem value="claude-opus-4-8">claude opus 4.8</SelectItem>
-                  <SelectItem value="claude-sonnet-5">claude sonnet 5</SelectItem>
+                  <SelectItem value="claude-opus-5">Claude opus 5</SelectItem>
+                  <SelectItem value="claude-fable-5">Claude fable 5</SelectItem>
+                  <SelectItem value="claude-opus-4-8">Claude opus 4.8</SelectItem>
+                  <SelectItem value="claude-sonnet-5">Claude sonnet 5</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -1047,7 +986,7 @@ export function AIProviderConfig({
 
         {selectedProvider === "screenpipe-cloud" && (
           <div className="space-y-1">
-            <Label htmlFor="model" className="text-xs">model</Label>
+            <Label htmlFor="model" className="text-xs">Model</Label>
             <Select
               value={formData.model}
               onValueChange={async (value) => {
@@ -1055,7 +994,7 @@ export function AIProviderConfig({
               }}
             >
               <SelectTrigger className="h-8 text-sm">
-                <SelectValue placeholder="select model" />
+                <SelectValue placeholder={ui("Select model")} />
               </SelectTrigger>
               <SelectContent>
                 {piModels.map((m) => {
@@ -1064,13 +1003,13 @@ export function AIProviderConfig({
                   return (
                   <SelectItem key={m.id} value={m.id} disabled={locked} className={locked ? "opacity-60" : undefined}>
                     <span className="flex items-center gap-1.5">
-                      {m.health?.status === 'down' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" title="overloaded" />}
-                      {m.health?.status === 'degraded' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500" title="degraded" />}
-                      {m.name}{m.free ? " (free)" : ""}
-                      {locked && <span className="text-[9px] font-medium text-muted-foreground border rounded px-1">business</span>}
+                      {m.health?.status === 'down' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" title={ui("Overloaded")} />}
+                      {m.health?.status === 'degraded' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500" title={ui("Degraded")} />}
+                      {m.name}{m.free ? ui(" (free)") : ""}
+                      {locked && <span className="text-[9px] font-medium text-muted-foreground border rounded px-1">Business</span>}
                       {!locked && costLabel && <span className="text-[9px] font-medium text-muted-foreground">{costLabel}</span>}
-                      {m.recommended_for?.includes('pipes') && <span className="text-[9px] text-muted-foreground bg-muted rounded px-1">tasks</span>}
-                      {m.health?.status === 'down' && <span className="text-[9px] text-red-400 ml-1">overloaded</span>}
+                      {m.recommended_for?.includes('pipes') && <span className="text-[9px] text-muted-foreground bg-muted rounded px-1">Tasks</span>}
+                      {m.health?.status === 'down' && <span className="text-[9px] text-red-400 ml-1">Overloaded</span>}
                     </span>
                   </SelectItem>
                   );
@@ -1091,11 +1030,11 @@ export function AIProviderConfig({
           </div>
         )}
 
-        {requiresAiPresetConnectionTest(selectedProvider) && (
+        {selectedProvider && requiresAiPresetConnectionTest(selectedProvider) && (
           <div className="space-y-2 border p-2.5">
             <div className="flex items-center justify-between gap-2">
               <div>
-                <p className="text-xs font-medium">connection test</p>
+                <p className="text-xs font-medium">Connection test</p>
                 <p className={cn(
                   "text-[10px]",
                   (connectionTestStatus === "fail" && connectionTestResultIsCurrent) ||
@@ -1111,8 +1050,8 @@ export function AIProviderConfig({
                       : connectionTestStatus === "fail" && connectionTestResultIsCurrent
                       ? connectionTestMessage
                       : connectionTestRequired
-                      ? "required before saving"
-                      : "optional for unchanged settings")}
+                      ? ui("Required before saving")
+                      : ui("Optional for unchanged settings"))}
                 </p>
               </div>
               <Button
@@ -1129,9 +1068,42 @@ export function AIProviderConfig({
                 {connectionTestStatus === "testing" && (
                   <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
                 )}
-                {connectionTestPassed ? "retest" : "test connection"}
+                {connectionTestPassed ? ui("retest") : ui("test connection")}
               </Button>
             </div>
+          </div>
+        )}
+
+        {selectedProvider && (
+          <div className="space-y-1">
+            <Label htmlFor="name" className="flex items-center gap-2 text-xs">
+              Name
+              {idError && (
+                <span className="text-xs text-destructive font-normal">
+                  {idError}
+                </span>
+              )}
+            </Label>
+            <Input
+              id="name"
+              type="text"
+              placeholder={ui("Generated automatically")}
+              value={formData.id ?? ""}
+              onChange={(e) => handleIdChange(e.target.value)}
+              onBlur={refillEmptyName}
+              className={cn(
+                "font-mono h-8 text-sm",
+                idError && "border-destructive focus-visible:ring-destructive",
+              )}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              disabled={
+                Boolean(defaultPreset?.id) &&
+                settings.aiPresets.some((p) => p.id === defaultPreset?.id)
+              }
+            />
           </div>
         )}
 
@@ -1141,21 +1113,139 @@ export function AIProviderConfig({
           onClick={() => setShowAdvanced(!showAdvanced)}
         >
           <span>{showAdvanced ? "▾" : "▸"}</span>
-          <span>advanced</span>
+          <span>Advanced</span>
         </button>
 
         {showAdvanced && (
           <div className="space-y-1.5">
+            <div className="space-y-1">
+              <p className="text-xs font-medium">Use a model directly</p>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  type="button"
+                  variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("openai-chatgpt");
+                    setFormData({
+                      ...formData,
+                      provider: "openai-chatgpt",
+                      url: "https://api.openai.com/v1",
+                      model: "gpt-5.6-terra",
+                    });
+                  }}
+                >
+                  <Icons.openai className="h-3.5 w-3.5" />
+                  <span>Chatgpt</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant={selectedProvider === "anthropic" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("anthropic");
+                    setFormData({
+                      ...formData,
+                      provider: "anthropic",
+                      url: "",
+                      model: "claude-sonnet-5",
+                    });
+                  }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src="/images/claude-ai.svg" alt="" className="h-3.5 w-3.5 rounded-sm" />
+                  <span>Claude API</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant={selectedProvider === "native-ollama" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("native-ollama");
+                    setFormData({
+                      ...formData,
+                      provider: "native-ollama",
+                      url: "http://localhost:11434/v1",
+                    });
+                  }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src="/images/ollama.png"
+                    alt=""
+                    className="h-3.5 w-3.5 object-contain dark:invert"
+                  />
+                  <span>Ollama</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant={selectedProvider === "custom" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("custom");
+                    setFormData({
+                      ...formData,
+                      provider: "custom",
+                      url: "",
+                    });
+                  }}
+                >
+                  <Icons.settings className="h-3.5 w-3.5" />
+                  <span>Use an API key</span>
+                </Button>
+              </div>
+            </div>
+            {acpEnabled && customAcpAdapter && (
+              <div className="space-y-1">
+                <p className="text-xs font-medium">Connect another agent</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    variant={
+                      selectedProvider === "acp" &&
+                      formData.acpAgent?.id === customAcpAdapter.id
+                        ? "default"
+                        : "outline"
+                    }
+                    className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                    onClick={() => {
+                      const nextAgent = acpAgentForSelection(
+                        formData.acpAgent,
+                        customAcpAdapter.id,
+                      );
+                      setSelectedProvider("acp");
+                      setFormData({
+                        ...formData,
+                        provider: "acp",
+                        url: "",
+                        model: nextAgent.id,
+                        acpAgent: nextAgent,
+                      });
+                    }}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={customAcpAdapter.imageSrc}
+                      alt=""
+                      className="h-3.5 w-3.5 rounded-sm"
+                    />
+                    <span>Use a command</span>
+                  </Button>
+                </div>
+              </div>
+            )}
+            {selectedProvider && (
+              <>
             {resolvedModelLimits && (
               <p className="text-[10px] text-muted-foreground">
-                known model limits are configured automatically
+                Known model limits are configured automatically
               </p>
             )}
             {selectedProvider !== "screenpipe-cloud" &&
               selectedProvider !== "acp" &&
               !resolvedModelLimits?.contextWindow && (
               <div className="space-y-1">
-                <Label htmlFor="maxContextTokens" className="text-xs">model context tokens</Label>
+                <Label htmlFor="maxContextTokens" className="text-xs">Model context tokens</Label>
                 <Input
                   id="maxContextTokens"
                   type="number"
@@ -1170,7 +1260,7 @@ export function AIProviderConfig({
                   className="h-6 text-[10px]"
                 />
                 <p className="text-[10px] text-muted-foreground">
-                  use this only when the endpoint does not publish a context window; Screenpipe agents need at least 32,768
+                  Use this only when the endpoint does not publish a context window; Screenpipe agents need at least 32,768
                 </p>
               </div>
             )}
@@ -1178,7 +1268,7 @@ export function AIProviderConfig({
               selectedProvider !== "acp" &&
               !resolvedModelLimits?.maxOutputTokens && (
               <div className="space-y-1">
-                <Label htmlFor="maxTokens" className="text-xs">max output tokens</Label>
+                <Label htmlFor="maxTokens" className="text-xs">Max output tokens</Label>
                 <Input
                   id="maxTokens"
                   type="number"
@@ -1194,17 +1284,19 @@ export function AIProviderConfig({
               </div>
             )}
             <div className="space-y-1">
-              <Label htmlFor="prompt" className="text-xs">prompt</Label>
+              <Label htmlFor="prompt" className="text-xs">Prompt</Label>
               <Textarea
                 id="prompt"
                 value={formData.prompt || DEFAULT_PROMPT}
                 onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
                   setFormData({ ...formData, prompt: e.target.value })
                 }
-                placeholder="enter your custom prompt here"
+                placeholder={ui("Enter your custom prompt here")}
                 className="min-h-[60px] max-h-[100px] text-xs resize-none"
               />
             </div>
+              </>
+            )}
           </div>
         )}
 
@@ -1213,6 +1305,7 @@ export function AIProviderConfig({
           className="w-full h-7 text-xs"
           disabled={
             isLoading ||
+            !selectedProvider ||
             Boolean(idError) ||
             !formData.id?.length ||
             !formData.model?.length ||
@@ -1227,7 +1320,11 @@ export function AIProviderConfig({
           {isLoading ? (
             <Icons.spinner className="mr-2 h-3 w-3 animate-spin" />
           ) : null}
-          {defaultPreset ? "save changes" : "continue"}
+          {{
+            create: ui("continue"),
+            edit: ui("save changes"),
+            copy: ui("create copy"),
+          }[mode]}
         </Button>
       </form>
     </div>
@@ -1235,14 +1332,30 @@ export function AIProviderConfig({
 }
 
 interface AIPresetDialogProps {
+  allowAgentPresets?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSave: (preset: Partial<AIPreset>) => void;
   preset?: AIPreset;
   showLoginCta?: boolean;
+  mode: PresetDialogMode;
 }
 
 interface AIPresetsSelectorProps {
+  allowAgentPresets?: boolean;
+  /** Host-owned choices rendered alongside saved presets without changing chat defaults. */
+  builtinOptions?: {
+    id: string;
+    label: string;
+    icon?: ReactNode;
+    badge?: string;
+    description?: string;
+    selected: boolean;
+    onSelect: () => void;
+  }[];
+  selectionLabel?: ReactNode;
+  presetFilter?: (preset: AIPreset) => boolean;
+  disabled?: boolean;
   recommendedPresets?: RecommendedPreset[];
   shortcutKey?: string;
   onPresetChange?: (preset: AIPreset) => void;
@@ -1263,21 +1376,29 @@ interface AIPresetsSelectorProps {
   containerClassName?: string;
   /** Class applied to the trigger button. */
   triggerClassName?: string;
+  /** Accessible label for surfaces where the visible model name needs context. */
+  triggerAriaLabel?: string;
   /** For tight composer UIs, show the active model instead of preset details. */
   showModelOnly?: boolean;
+  /** ACP composers expose the live model in a separate control, so the preset
+   *  switcher can collapse to the provider mark instead of repeating its name. */
+  providerIconOnly?: boolean;
   /** Notify parent surfaces when the preset popover opens or closes. */
   onOpenChange?: (open: boolean) => void;
-  /** Scheduled pipes still run through raw Pi and cannot execute ACP adapters. */
-  includeAgentPresets?: boolean;
+  /** Optional controls that belong with model selection in the same popover. */
+  popoverFooter?: ReactNode;
 }
 
 export const AIPresetDialog = ({
+  allowAgentPresets = true,
   open,
   onOpenChange,
   onSave,
   preset,
   showLoginCta = true,
+  mode,
 }: AIPresetDialogProps) => {
+  const ui = useGT();
   const handleProviderSubmit = (providerData: any) => {
     const newPreset: Partial<AIPreset> = {
       ...preset,
@@ -1332,18 +1453,26 @@ export const AIPresetDialog = ({
       <DialogContent className="w-full max-w-md sm:max-w-lg max-h-[80vh] overflow-y-auto p-0">
         <DialogHeader className="sr-only">
           <DialogTitle>
-            {preset ? "Edit Preset" : "Create New Preset"}
+            {{
+              create: ui("Create New Preset"),
+              edit: ui("Edit Preset"),
+              copy: ui("Duplicate Preset"),
+            }[mode]}
           </DialogTitle>
           <DialogDescription>
-            {preset
-              ? "Modify your AI preset settings here. Click save when you're done."
-              : "Configure your AI preset settings here. Click continue when you're done."}
+            {{
+              create: ui("Configure your AI preset settings here. Click continue when you're done."),
+              edit: ui("Modify your AI preset settings here. Click save when you're done."),
+              copy: ui("Create a new preset from these settings. The original stays unchanged."),
+            }[mode]}
           </DialogDescription>
         </DialogHeader>
         <AIProviderConfig
+          allowAgentPresets={allowAgentPresets}
           onSubmit={handleProviderSubmit}
           defaultPreset={defaultPreset}
           showLoginCta={showLoginCta}
+          mode={mode}
         />
       </DialogContent>
     </Dialog>
@@ -1351,6 +1480,8 @@ export const AIPresetDialog = ({
 };
 
 export const AIPresetsSelector = ({
+  allowAgentPresets = true,
+  builtinOptions, selectionLabel, presetFilter, disabled = false,
   recommendedPresets,
   shortcutKey = "/",
   onPresetChange,
@@ -1363,16 +1494,21 @@ export const AIPresetsSelector = ({
   compact = false,
   containerClassName,
   triggerClassName,
+  triggerAriaLabel,
   showModelOnly = false,
+  providerIconOnly = false,
   onOpenChange,
-  includeAgentPresets = true,
+  popoverFooter,
 }: AIPresetsSelectorProps) => {
+
+  const ui = useGT();
   const { settings, updateSettings } = useSettings();
   const [open, setOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [selectedPresetToEdit, setSelectedPresetToEdit] = useState<
     AIPreset | undefined
   >();
+  const [dialogMode, setDialogMode] = useState<PresetDialogMode>("create");
   const isControlled = onControlledSelect !== undefined;
   const { isManagedDeployment, policy: enterprisePolicy } = useManagedPolicy();
   const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
@@ -1390,14 +1526,11 @@ export const AIPresetsSelector = ({
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const aiPresets = useMemo(() => {
-    const presets = (settings?.aiPresets || []) as AIPreset[];
-    const policyPresets = isManagedDeployment
+    const presets = ((settings?.aiPresets || []) as AIPreset[]).filter(preset => !presetFilter || presetFilter(preset));
+    return isManagedDeployment
       ? filterPresetsForEnterprisePolicy(presets, aiPresetPolicy)
       : presets;
-    return includeAgentPresets
-      ? policyPresets
-      : policyPresets.filter((preset) => preset.provider !== "acp");
-  }, [settings?.aiPresets, isManagedDeployment, aiPresetPolicy, includeAgentPresets]);
+  }, [settings?.aiPresets, isManagedDeployment, aiPresetPolicy, presetFilter]);
 
   const selectedPreset = useMemo(() => {
     if (isControlled) {
@@ -1443,7 +1576,9 @@ export const AIPresetsSelector = ({
   }, [selectedPreset, onPresetChange]);
 
   useEffect(() => {
+
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (!shortcutKey || disabled) return;
       // Check for Cmd/Ctrl + /
       if ((e.metaKey || e.ctrlKey) && e.key === shortcutKey) {
         e.preventDefault();
@@ -1468,34 +1603,41 @@ export const AIPresetsSelector = ({
           onPresetSaved?.(nextPreset);
         }
 
-        toast.success("Preset changed", {
-          description: `Switched to ${nextPreset.id} (${nextPreset.model})`,
+        toast({
+          title: ui("Preset changed"),
+          description: ui("Switched to {value1} ({value2})", { value1: nextPreset.id, value2: nextPreset.model }),
         });
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [aiPresets, selectedPreset, updateSettings, shortcutKey, onPresetSaved, isControlled, onControlledSelect]);
+  }, [aiPresets, selectedPreset, updateSettings, shortcutKey, disabled, onPresetSaved, isControlled, onControlledSelect]);
 
   const handleSavePreset = (preset: Partial<AIPreset>) => {
     if (!canManageEmployeePresets) {
-      toast.error("Managed by your organization", {
-        description: "Your admin controls which AI presets are available",
+      toast({
+        title: ui("Managed by your organization"),
+        description: ui("Your admin controls which AI presets are available"),
+        variant: "destructive",
       });
       return;
     }
 
     if (!preset.id) {
-      toast.error("Please enter a name for this preset", {
-        description: "Name is required",
+      toast({
+        title: ui("Please enter a name for this preset"),
+        description: ui("Name is required"),
+        variant: "destructive",
       });
       return;
     }
 
     if (!settings?.aiPresets) {
-      toast.error("Error", {
-        description: "Settings not initialized",
+      toast({
+        title: ui("Error"),
+        description: ui("Settings not initialized"),
+        variant: "destructive",
       });
       return;
     }
@@ -1504,9 +1646,9 @@ export const AIPresetsSelector = ({
 
     // If we're editing an existing preset
     if (selectedPresetToEdit) {
-      // If this is a copy/duplicate operation, treat it as a new preset
+      // A copy (or a preset that no longer exists) is saved as a new preset
       if (
-        preset.id !== selectedPresetToEdit.id ||
+        dialogMode === "copy" ||
         !settings.aiPresets.some((p) => p.id === preset.id)
       ) {
         // Check for duplicate ID
@@ -1515,8 +1657,10 @@ export const AIPresetsSelector = ({
         );
 
         if (existingPreset) {
-          toast.error("Name already exists", {
-            description: "Please choose a different name",
+          toast({
+            title: ui("Name already exists"),
+            description: ui("Please choose a different name"),
+            variant: "destructive",
           });
           return;
         }
@@ -1532,8 +1676,9 @@ export const AIPresetsSelector = ({
           ],
         });
 
-        toast.success("Preset copied", {
-          description: "New preset has been created from copy",
+        toast({
+          title: ui("Preset copied"),
+          description: ui("New preset has been created from copy"),
         });
       } else {
         // Normal edit operation
@@ -1555,8 +1700,9 @@ export const AIPresetsSelector = ({
           });
         }
 
-        toast.success("Preset updated", {
-          description: "Your changes have been saved",
+        toast({
+          title: ui("Preset updated"),
+          description: ui("Your changes have been saved"),
         });
       }
     } else {
@@ -1566,8 +1712,10 @@ export const AIPresetsSelector = ({
       );
 
       if (existingPreset) {
-        toast.error("Name already exists", {
-          description: "Please choose a different name",
+        toast({
+          title: ui("Name already exists"),
+          description: ui("Please choose a different name"),
+          variant: "destructive",
         });
         return;
       }
@@ -1581,7 +1729,7 @@ export const AIPresetsSelector = ({
 
         updateSettings({
           aiPresets: [createdPreset],
-         
+
         });
       } else {
         // Adding a new preset
@@ -1597,19 +1745,16 @@ export const AIPresetsSelector = ({
         });
       }
 
-      toast.success("Preset created", {
-        description: "New preset has been added",
+      toast({
+        title: ui("Preset created"),
+        description: ui("New preset has been added"),
       });
     }
 
     // A newly created preset belongs to the controlled surface that created
     // it. Pass the full value so the host can activate it immediately without
     // waiting for the settings store to publish the updated preset list.
-    if (
-      isControlled &&
-      createdPreset &&
-      (includeAgentPresets || createdPreset.provider !== "acp")
-    ) {
+    if (isControlled && createdPreset) {
       onControlledSelect(createdPreset);
     }
 
@@ -1633,8 +1778,10 @@ export const AIPresetsSelector = ({
 
   const handleDuplicatePreset = (preset: AIPreset) => {
     if (!canManageEmployeePresets || isEnterpriseManagedPreset(preset)) {
-      toast.error("Managed by your organization", {
-        description: "Your admin controls which AI presets are available",
+      toast({
+        title: ui("Managed by your organization"),
+        description: ui("Your admin controls which AI presets are available"),
+        variant: "destructive",
       });
       return;
     }
@@ -1651,18 +1798,22 @@ export const AIPresetsSelector = ({
       id: newName,
       defaultPreset: false,
     });
+    setDialogMode("copy");
     setDialogOpen(true);
   };
 
   const handleEditPreset = (preset: AIPreset) => {
     if (!canManageEmployeePresets || isEnterpriseManagedPreset(preset)) {
-      toast.error("Managed by your organization", {
-        description: "Your admin controls which AI presets are available",
+      toast({
+        title: ui("Managed by your organization"),
+        description: ui("Your admin controls which AI presets are available"),
+        variant: "destructive",
       });
       return;
     }
 
     setSelectedPresetToEdit(preset);
+    setDialogMode("edit");
     setDialogOpen(true);
   };
 
@@ -1670,8 +1821,10 @@ export const AIPresetsSelector = ({
     if (!settings?.aiPresets) return;
     if (preset.defaultPreset) return;
     if (isManagedDeployment && aiPresetPolicy.lock_default_preset) {
-      toast.error("Default preset is locked", {
-        description: "Your admin controls the default AI preset",
+      toast({
+        title: ui("Default preset is locked"),
+        description: ui("Your admin controls the default AI preset"),
+        variant: "destructive",
       });
       return;
     }
@@ -1690,26 +1843,30 @@ export const AIPresetsSelector = ({
       onPresetSaved(preset);
     }
 
-    toast.success("Default preset updated", {
-      description: `${preset.id} is now the default preset`,
+    toast({
+      title: ui("Default preset updated"),
+      description: ui("{value1} is now the default preset", { value1: preset.id }),
     });
   };
 
-  const handleRemovePreset = (preset: AIPreset) => {
+  const handleRemovePreset = async (preset: AIPreset) => {
     if (!settings?.aiPresets) return;
     if (!canManageEmployeePresets || isEnterpriseManagedPreset(preset)) {
-      toast.error("Managed by your organization", {
-        description: "Your admin controls which AI presets are available",
+      toast({
+        title: ui("Managed by your organization"),
+        description: ui("Your admin controls which AI presets are available"),
+        variant: "destructive",
       });
       return;
     }
 
-    // Safety net: prevent deletion of the last screenpipe-cloud preset for subscribers
-    if (preset.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
-      const cloudPresets = settings.aiPresets.filter((p) => p.provider === "screenpipe-cloud");
-      if (cloudPresets.length <= 1) {
-        return;
-      }
+    if (settings.aiPresets.length <= 1) {
+      toast({
+        title: ui("Cannot delete preset"),
+        description: ui("At least one AI preset is required"),
+        variant: "destructive",
+      });
+      return;
     }
 
     let updatedPresets = settings.aiPresets.filter((p) => p.id !== preset.id);
@@ -1718,22 +1875,26 @@ export const AIPresetsSelector = ({
     if (preset.defaultPreset && updatedPresets.length > 0 && !updatedPresets.some((p) => p.defaultPreset)) {
       updatedPresets = updatedPresets.map((p, index) => ({ ...p, defaultPreset: index === 0 }));
     }
-    updateSettings({
-      aiPresets: updatedPresets,
-    });
-
-    toast.success("Preset removed", {
-      description: `${preset.id} has been removed`,
-    });
+    try {
+      await updateSettings({ aiPresets: updatedPresets });
+      toast({
+        title: ui("Preset removed"),
+        description: ui("{value1} has been removed", { value1: preset.id }),
+      });
+    } catch (error) {
+      toast({
+        title: ui("Cannot delete preset"),
+        description: error instanceof Error ? error.message : ui("Preset changes could not be saved"),
+        variant: "destructive",
+      });
+    }
   };
 
-  // Hide delete button on the last remaining screenpipe-cloud preset for subscribers
-  const cloudPresetCount = useMemo(
-    () => (settings?.aiPresets || []).filter((p) => p.provider === "screenpipe-cloud").length,
-    [settings?.aiPresets]
-  );
-  const isLastCloudPreset = (preset: AIPreset) =>
-    preset.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed && cloudPresetCount <= 1;
+  const isOnlyPreset = (settings?.aiPresets || []).length <= 1;
+  const selectedProviderName =
+    selectedPresetData?.provider === "acp"
+      ? acpAdapterInfo(selectedPresetData.acpAgent?.id).name
+      : selectedPresetData?.provider || "AI";
 
   return (
     <>
@@ -1768,6 +1929,13 @@ export const AIPresetsSelector = ({
                   type="button"
                   variant="outline"
                   role="combobox"
+                  disabled={disabled}
+                  aria-label={
+                    triggerAriaLabel ??
+                    (providerIconOnly
+                      ? ui("AI provider: {value1}. Change provider", { value1: selectedProviderName })
+                      : undefined)
+                  }
                   aria-expanded={open}
                   className={cn(
                     "w-full justify-between hover:bg-accent hover:text-accent-foreground",
@@ -1776,9 +1944,12 @@ export const AIPresetsSelector = ({
                     triggerClassName
                   )}
                 >
-                  {selectedPreset ? (
+                  {selectionLabel ? <span>{selectionLabel}</span> : selectedPreset ? (
                     showModelOnly ? (
-                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+                      <div className={cn(
+                        "flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden",
+                        providerIconOnly && "justify-center",
+                      )}>
                         {selectedPresetRequiresLogin && (
                           <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
                         )}
@@ -1806,24 +1977,26 @@ export const AIPresetsSelector = ({
                             ),
                           )}
                         />
-                        <span
-                          className="truncate text-left font-medium"
-                          title={
-                            selectedPresetData
-                              ? `${selectedPresetData.id} (${selectedPresetData.model})`
-                              : undefined
-                          }
-                        >
-                          {/* ACP presets store the adapter id in `model`, so the
-                              raw slug ("claude-acp") is what showed here. Name
-                              the agent instead; the config control beside it
-                              names the model the agent is running. */}
-                          {selectedPresetData?.provider === "acp"
-                            ? acpAdapterInfo(selectedPresetData.acpAgent?.id).name
-                            : selectedPresetData?.model ||
-                              formatPresetName(selectedPreset)}
-                        </span>
-                        {selectedModelAllowanceNotice && (
+                        {!providerIconOnly && (
+                          <span
+                            className="truncate text-left font-medium"
+                            title={
+                              selectedPresetData
+                                ? `${selectedPresetData.id} (${selectedPresetData.model})`
+                                : undefined
+                            }
+                          >
+                            {/* ACP presets store the adapter id in `model`, so the
+                                raw slug ("claude-acp") is what showed here. Name
+                                the agent instead; the config control beside it
+                                names the model the agent is running. */}
+                            {selectedPresetData?.provider === "acp"
+                              ? acpAdapterInfo(selectedPresetData.acpAgent?.id).name
+                              : compactModelLabel(selectedPresetData?.model || "") ||
+                                formatPresetName(selectedPreset)}
+                          </span>
+                        )}
+                        {!providerIconOnly && selectedModelAllowanceNotice && (
                           <TooltipProvider>
                             <Tooltip>
                               <TooltipTrigger asChild>
@@ -1872,13 +2045,17 @@ export const AIPresetsSelector = ({
                   ) : allowNone && isControlled ? (
                     <span className="text-muted-foreground">{noneLabel}</span>
                   ) : (
-                    "select ai preset..."
+                    ui("Select AI preset...")
                   )}
-                  <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  {!providerIconOnly && (
+                    <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  )}
                 </Button>
               </PopoverTrigger>
               <TooltipContent>
-                {selectedPresetRequiresLogin ? (
+                {providerIconOnly ? (
+                  <p>{selectedProviderName} · switch provider</p>
+                ) : selectedPresetRequiresLogin ? (
                   <p className="text-muted-foreground">
                     Login required to use this preset
                   </p>
@@ -1888,7 +2065,7 @@ export const AIPresetsSelector = ({
                     <kbd className="px-1.5 py-0.5 text-xs font-semibold bg-muted rounded">
                       ⌘/
                     </kbd>
-                    <span>to cycle presets</span>
+                    <span>To cycle presets</span>
                   </p>
                 )}
               </TooltipContent>
@@ -1902,9 +2079,9 @@ export const AIPresetsSelector = ({
             className="min-w-[500px] w-[--radix-popover-trigger-width] p-0"
           >
             <Command>
-              <CommandInput placeholder="search presets..." />
+              <CommandInput placeholder={ui("Search presets...")} />
               <CommandList>
-                <CommandEmpty>no presets found.</CommandEmpty>
+                <CommandEmpty>No presets found.</CommandEmpty>
                 {allowNone && (
                   <CommandGroup>
                     <CommandItem
@@ -1948,7 +2125,7 @@ export const AIPresetsSelector = ({
                               {preset.id}
                             </span>
                             <span className="rounded bg-primary/10 text-primary px-1.5 py-0.5 text-xs font-medium shrink-0">
-                              recommended
+                              Recommended
                             </span>
                           </div>
                           <div className="flex items-center justify-end gap-2 text-xs text-muted-foreground shrink-0">
@@ -1980,6 +2157,7 @@ export const AIPresetsSelector = ({
                                     defaultPreset: false,
                                   } as AIPreset;
                                   setSelectedPresetToEdit(fullPreset);
+                                  setDialogMode("copy");
                                   setDialogOpen(true);
                                 }}
                               >
@@ -1993,7 +2171,27 @@ export const AIPresetsSelector = ({
                   </CommandGroup>
                 )}
                 <CommandGroup>
+                  {builtinOptions?.map(option => (
+                    <CommandItem
+                      key={option.id}
+                      value={option.id}
+                      aria-label={option.badge ? `${option.label} (${option.badge})` : option.label}
+                      onSelect={() => { option.onSelect(); handleOpenChange(false); }}
+                      className="flex min-h-10 py-2"
+                    >
+                      <div className="flex w-full items-center justify-between gap-2 overflow-hidden">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <Check className={cn("h-4 w-4 shrink-0", option.selected ? "opacity-100" : "opacity-0")} />
+                          {option.icon && <span className="h-4 w-4 shrink-0 opacity-80">{option.icon}</span>}
+                          <span className="truncate font-medium">{option.label}</span>
+                          {option.badge && <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs font-medium">{option.badge}</span>}
+                        </div>
+                        {option.description && <span className="truncate text-xs text-muted-foreground">{option.description}</span>}
+                      </div>
+                    </CommandItem>
+                  ))}
                   {aiPresets.map((preset) => {
+
                     const isCloud = preset.provider === "screenpipe-cloud";
                     const piModel = isCloud ? piModels.find(m => m.id === preset.model) : null;
                     const isGated = showUpsell && piModel?.locked;
@@ -2021,13 +2219,15 @@ export const AIPresetsSelector = ({
 
                           onPresetSaved?.(preset);
 
-                          toast.success("Preset selected", {
-                            description: `${preset.id} is now active`,
+                          toast({
+                            title: ui("Preset selected"),
+                            description: ui("{value1} is now active", { value1: preset.id }),
                           });
                         }
                         handleOpenChange(false);
                       }}
                       className="flex py-2"
+                      data-testid={`ai-preset-option-${preset.id}`}
                     >
                       <div className="flex w-full items-center justify-between gap-2 overflow-hidden">
                         <div className="flex items-center gap-2 min-w-0">
@@ -2063,12 +2263,12 @@ export const AIPresetsSelector = ({
                           </span>
                           {isGated && (
                             <span className="rounded bg-muted text-muted-foreground px-1.5 py-0.5 text-[10px] font-medium shrink-0 ml-1 border border-border/50">
-                              business plan only
+                              Business plan only
                             </span>
                           )}
                           {preset.defaultPreset && (
                             <span className="rounded bg-muted px-1.5 py-0.5 text-xs font-medium shrink-0">
-                              default
+                              Default
                             </span>
                           )}
                         </div>
@@ -2090,6 +2290,7 @@ export const AIPresetsSelector = ({
                                   variant="ghost"
                                   size="icon"
                                   className="h-6 w-6 shrink-0"
+                                  aria-label={ui("Edit {value1}", { value1: preset.id })}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleEditPreset(preset);
@@ -2101,6 +2302,7 @@ export const AIPresetsSelector = ({
                                   variant="ghost"
                                   size="icon"
                                   className="h-6 w-6 shrink-0"
+                                  aria-label={ui("Duplicate {value1}", { value1: preset.id })}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleDuplicatePreset(preset);
@@ -2123,10 +2325,11 @@ export const AIPresetsSelector = ({
                                 <Star className="h-3.5 w-3.5" />
                               </Button>
                             )}
-                            {canManageEmployeePresets && !isEnterpriseManagedPreset(preset) && !isLastCloudPreset(preset) && (
+                            {canManageEmployeePresets && !isEnterpriseManagedPreset(preset) && !isOnlyPreset && (
                               <Button
                                 variant="ghost"
                                 size="icon"
+                                aria-label={ui("Delete {value1}", { value1: preset.id })}
                                 className="h-6 w-6 shrink-0"
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -2149,26 +2352,37 @@ export const AIPresetsSelector = ({
                       onSelect={() => {
                         handleOpenChange(false);
                         setSelectedPresetToEdit(undefined);
+                        setDialogMode("create");
                         setDialogOpen(true);
                       }}
                     >
                       <Plus className="mr-2 h-4 w-4" />
-                      create new preset
+                      Create new preset
                     </CommandItem>
                   </CommandGroup>
                 )}
               </CommandList>
             </Command>
+            {popoverFooter && (
+              <div
+                className="border-t border-border p-3"
+                data-testid="ai-preset-popover-footer"
+              >
+                {popoverFooter}
+              </div>
+            )}
           </PopoverContent>
         </Popover>
         </div>
       </div>
       <AIPresetDialog
+        allowAgentPresets={allowAgentPresets}
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         onSave={handleSavePreset}
         preset={selectedPresetToEdit}
         showLoginCta={showLoginCta}
+        mode={dialogMode}
       />
     </>
   );

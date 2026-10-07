@@ -417,6 +417,22 @@ struct MeetingsOnlyAudioIdleState {
     detector_unavailable: bool,
 }
 
+fn effective_audio_capture_mode(
+    audio_disabled: bool,
+    configured_mode: Option<&AudioCaptureMode>,
+    meetings_only_supported: bool,
+) -> &'static str {
+    if audio_disabled {
+        "disabled"
+    } else if meetings_only_supported
+        && matches!(configured_mode, Some(AudioCaptureMode::MeetingsOnly))
+    {
+        "meetings-only"
+    } else {
+        "always"
+    }
+}
+
 fn meetings_only_audio_idle_state(
     configured: bool,
     meeting_detected: Option<bool>,
@@ -430,6 +446,25 @@ fn meetings_only_audio_idle_state(
             && meeting_detected.is_none()
             && streams_released,
     }
+}
+
+/// macOS continues to enumerate the built-in MacBook microphone after the lid
+/// closes even though it can only deliver zero-filled buffers. For health
+/// purposes that device is unavailable in clamshell mode. External microphones
+/// remain real inputs and must still surface capture failures normally.
+fn input_device_is_available(device_name: &str, clamshell_mode: bool) -> bool {
+    if !device_name.contains("(input)") {
+        return false;
+    }
+    if !clamshell_mode {
+        return true;
+    }
+
+    let lower = device_name.to_ascii_lowercase();
+    let built_in_laptop_mic = (lower.contains("macbook") && lower.contains("microphone"))
+        || lower.contains("built-in microphone")
+        || lower.contains("internal microphone");
+    !built_in_laptop_mic
 }
 
 /// Classify the raw audio capture status from health signals. Pure so it can be
@@ -462,11 +497,12 @@ fn classify_audio_status(
         "meeting_detector_unavailable"
     } else if audio_waiting_for_meeting {
         "waiting_for_meeting"
-    } else if audio_never_captured && !has_input_device {
+    } else if !has_input_device {
         // Audio is on but there is no microphone to capture from — expected
         // idle, not a failure. Distinct from "not_started" so /health stays 200
-        // and the desktop stall notification (which keys off "not_started")
-        // does not false-fire on machines without a mic.
+        // and the desktop stall notification does not false-fire on machines
+        // without a mic. This also covers a previously-used built-in MacBook
+        // mic becoming unavailable when the lid closes in clamshell mode.
         "no_input_device"
     } else if audio_never_captured {
         "not_started"
@@ -609,6 +645,16 @@ pub struct MonitorInfo {
 pub struct HealthCheckResponse {
     pub status: String,
     pub status_code: u16,
+    /// Cached observations. Health polling never installs or probes dependencies.
+    #[serde(default)]
+    pub dependencies: serde_json::Value,
+    #[serde(default)]
+    pub runtime: serde_json::Value,
+    #[serde(default)]
+    pub startup: serde_json::Value,
+    /// Stable causes and remedies; legacy message text is retained unchanged.
+    #[serde(default)]
+    pub unhealthy_reasons: Vec<serde_json::Value>,
     pub last_frame_timestamp: Option<chrono::DateTime<Utc>>,
     pub last_audio_timestamp: Option<chrono::DateTime<Utc>>,
     pub frame_status: String,
@@ -631,6 +677,10 @@ pub struct HealthCheckResponse {
     /// are what turn "stale" into a locatable freeze point.
     pub loop_stage: String,
     pub loop_stage_age_secs: Option<u64>,
+    /// Effective runtime audio capture mode: `always`, `meetings-only`, or
+    /// `disabled`. This can differ from the saved preference when policy or
+    /// platform support changes the mode used by the recorder.
+    pub audio_capture_mode: String,
     pub audio_status: String,
     pub message: String,
     pub verbose_instructions: Option<String>,
@@ -944,12 +994,19 @@ fn degraded_response() -> HealthCheckResponse {
     HealthCheckResponse {
         status: "degraded".to_string(),
         status_code: 503,
+        dependencies: json!({"status": "unknown"}),
+        runtime: json!({"status": "unknown"}),
+        startup: json!({"phase": "unknown"}),
+        unhealthy_reasons: vec![
+            json!({"subsystem": "startup", "code": "health_snapshot_timeout", "severity": "warning", "detail": "health snapshot timed out", "remedy": "Retry the health request and inspect the engine log if it persists.", "since": null}),
+        ],
         last_frame_timestamp: None,
         last_audio_timestamp: None,
         frame_status: "unknown".to_string(),
         vision_reason: "unknown".to_string(),
         loop_stage: "unknown".to_string(),
         loop_stage_age_secs: None,
+        audio_capture_mode: "unknown".to_string(),
         audio_status: "unknown".to_string(),
         message: "health check timed out before producing a snapshot".to_string(),
         verbose_instructions: None,
@@ -1207,11 +1264,13 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     // Report intentional meetings-only idleness only after every configured
     // stream has actually been released. During teardown, health continues to
     // describe the observed active streams instead of claiming an early pause.
-    let meetings_only_configured = cfg!(any(target_os = "macos", target_os = "windows"))
-        && matches!(
-            state.audio_manager.configured_audio_capture_mode(),
-            Some(AudioCaptureMode::MeetingsOnly)
-        );
+    let configured_audio_capture_mode = state.audio_manager.configured_audio_capture_mode();
+    let audio_capture_mode = effective_audio_capture_mode(
+        state.audio_disabled,
+        configured_audio_capture_mode.as_ref(),
+        cfg!(any(target_os = "macos", target_os = "windows")),
+    );
+    let meetings_only_configured = audio_capture_mode == "meetings-only";
     // Detector absence is not ordinary idle: the device gate fails closed, and
     // health must make the missing prerequisite visible. A timed-out health
     // probe is kept as unknown so lock contention cannot manufacture an error.
@@ -1470,9 +1529,10 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     // 503 degraded, nor trip the desktop "mic not capturing" stall notification.
     // Input devices are tagged "(input)" in the device list (output-only devices
     // like "Remote Audio (output)" are not microphones).
+    let clamshell_mode = screenpipe_core::display_topology::is_clamshell_mode();
     let has_input_device = audio_devices
         .iter()
-        .any(|device| device.to_string().contains("(input)"));
+        .any(|device| input_device_is_available(&device.to_string(), clamshell_mode));
 
     // Detect "active_no_data": the device appears active (selected and in the
     // device list) but the zero-fill watchdog has fired *recently*, indicating
@@ -1802,7 +1862,16 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     // so remote monitoring can see degradation and engine-restart requests.
     let wqh = state.db.write_queue_health();
 
-    HealthCheckResponse {
+    let diagnostics = screenpipe_core::health_diagnostics::snapshot(state.audio_disabled);
+    let mut response = HealthCheckResponse {
+        dependencies: diagnostics.dependencies,
+        runtime: diagnostics.runtime,
+        startup: serde_json::to_value(diagnostics.startup).unwrap_or_default(),
+        unhealthy_reasons: diagnostics
+            .unhealthy_reasons
+            .into_iter()
+            .map(|f| serde_json::to_value(f).unwrap_or_default())
+            .collect(),
         status: overall_status.to_string(),
         status_code,
         last_frame_timestamp: last_frame,
@@ -1819,6 +1888,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         loop_stage: vision_loop_stage.as_str().to_string(),
         loop_stage_age_secs: vision_loop_stage_entered_ts
             .and_then(|ts| (ts > 0).then(|| now_ts.saturating_sub(ts))),
+        audio_capture_mode: audio_capture_mode.to_string(),
         audio_status,
         message,
         verbose_instructions,
@@ -1944,6 +2014,118 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         schedule_paused: crate::schedule_monitor::schedule_paused(),
         hostname: hostname::get().ok().and_then(|h| h.into_string().ok()),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    };
+    add_health_reasons(&mut response);
+    response
+}
+
+/// Derive faults from the same typed state as the legacy response, never by
+/// parsing its human-readable message. This also covers timeout fallback above.
+fn add_health_reasons(response: &mut HealthCheckResponse) {
+    let mut add = |subsystem: &str, code: &str, detail: &str, remedy: &str| {
+        response
+            .unhealthy_reasons
+            .push(json!({"subsystem": subsystem, "code": code,
+            "severity": "warning", "detail": detail, "remedy": remedy, "since": null}));
+    };
+    if !matches!(response.frame_status.as_str(), "ok" | "disabled") {
+        add("vision", &format!("vision_{}", response.vision_reason), &response.frame_status,
+            "Inspect vision_reason and capture permissions; check selected displays and the capture loop.");
+    } else if matches!(
+        response.vision_reason.as_str(),
+        "permission_denied" | "capture_stalled" | "not_started" | "ocr_unavailable"
+    ) {
+        add(
+            "vision",
+            &format!("vision_{}", response.vision_reason),
+            &response.vision_reason,
+            "Inspect capture permissions and the local OCR installation.",
+        );
+    }
+    if !matches!(
+        response.audio_status.as_str(),
+        "ok" | "disabled" | "no_input_device" | "waiting_for_meeting"
+    ) {
+        add(
+            "audio",
+            &format!("audio_{}", response.audio_status),
+            &response.audio_status,
+            "Check selected audio devices, permissions, and the transcription engine.",
+        );
+    }
+    if response.write_queue_degraded {
+        add(
+            "database",
+            "write_queue_degraded",
+            "database writer reported repeated failures",
+            "Check free disk space and the database write error in the engine log.",
+        );
+    }
+    if response.vision_db_write_stalled {
+        add(
+            "vision",
+            "vision_write_stalled",
+            "vision persistence is stalled",
+            "Inspect capture loop and database pipeline counters.",
+        );
+    }
+    if response.audio_db_write_stalled {
+        add(
+            "audio",
+            "transcription_write_stalled",
+            "audio transcription persistence is stalled",
+            "Inspect the transcription engine and pending segment backlog.",
+        );
+    }
+    if let Some(p) = &response.pipeline {
+        if response.status == "degraded" && p.frame_drop_rate > 0.5 && p.uptime_secs > 120.0 {
+            add(
+                "vision",
+                "frame_drop_rate_high",
+                "capture frames are being dropped",
+                "Inspect capture pipeline errors and database latency.",
+            );
+        }
+        if response.status == "degraded" && p.avg_db_latency_ms > 10_000.0 && p.uptime_secs > 120.0
+        {
+            add(
+                "database",
+                "write_latency_high",
+                "vision database writes are slow",
+                "Inspect disk latency and database lock contention.",
+            );
+        }
+    }
+    if let Some(p) = &response.audio_pipeline {
+        if response.status == "degraded" && p.chunks_channel_full > 0 && p.uptime_secs > 120.0 {
+            add(
+                "audio",
+                "transcription_queue_full",
+                "transcription queue dropped audio chunks",
+                "Inspect transcription throughput and engine errors.",
+            );
+        }
+    }
+    if response
+        .ui_recorder
+        .as_ref()
+        .is_some_and(|ui| ui.configured && !ui.running)
+    {
+        add(
+            "ui_recorder",
+            "ui_recorder_not_running",
+            "UI capture is configured but not running",
+            "Check accessibility/input monitoring permissions and UI recorder startup errors.",
+        );
+    }
+    // Preserve the contract even if a future degradation condition has not yet
+    // received its own code; tests require every degraded response to explain it.
+    if response.status == "degraded" && response.unhealthy_reasons.is_empty() {
+        response.unhealthy_reasons.push(json!({"subsystem":"startup", "code":"pipeline_degraded", "severity":"warning", "detail":"a recording pipeline is degraded", "remedy":"Inspect the detailed pipeline counters and engine log.", "since":null}));
+    }
+    if !response.unhealthy_reasons.is_empty() {
+        response.status = "degraded".into();
+        response.status_code = 503;
     }
 }
 
@@ -2458,9 +2640,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn health_diagnostics_preserve_legacy_messages_and_explain_faults() {
+        let mut response = dummy_response("healthy");
+        let old_message = response.message.clone();
+        add_health_reasons(&mut response);
+        assert!(response.unhealthy_reasons.is_empty());
+        assert_eq!(response.status, "healthy");
+        response.write_queue_degraded = true;
+        add_health_reasons(&mut response);
+        assert_eq!(response.status, "degraded");
+        assert_eq!(response.status_code, 503);
+        assert_eq!(response.message, old_message);
+        assert_eq!(
+            response.unhealthy_reasons[0]["code"],
+            "write_queue_degraded"
+        );
+    }
+
+    #[test]
+    fn health_diagnostics_intentional_idle_states_remain_healthy() {
+        for audio in ["ok", "disabled", "no_input_device", "waiting_for_meeting"] {
+            for vision in ["ok", "disabled"] {
+                let mut response = dummy_response("healthy");
+                response.audio_status = audio.into();
+                response.frame_status = vision.into();
+                add_health_reasons(&mut response);
+                assert_eq!(response.status, "healthy", "{audio}/{vision}");
+                assert_eq!(response.status_code, 200);
+                assert!(response.unhealthy_reasons.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn health_diagnostics_observed_dependency_fault_changes_status_only() {
+        let mut response = dummy_response("healthy");
+        let original = response.clone();
+        response.unhealthy_reasons.push(json!({
+            "subsystem": "dependencies", "code": "ffmpeg_spawn_failing",
+            "severity": "warning", "detail": "encode failed", "remedy": "repair ffmpeg", "since": 42
+        }));
+        add_health_reasons(&mut response);
+        assert_eq!(response.status, "degraded");
+        assert_eq!(response.status_code, 503);
+        assert_eq!(response.message, original.message);
+        assert_eq!(response.verbose_instructions, original.verbose_instructions);
+        assert_eq!(response.audio_status, original.audio_status);
+        assert_eq!(response.frame_status, original.frame_status);
+        assert_eq!(response.unhealthy_reasons.len(), 1);
+        assert_eq!(response.unhealthy_reasons[0]["since"], 42);
+    }
+
+    #[test]
+    fn health_diagnostics_legacy_responses_deserialize() {
+        let mut value = serde_json::to_value(dummy_response("healthy")).unwrap();
+        for key in ["dependencies", "runtime", "startup", "unhealthy_reasons"] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let response: HealthCheckResponse = serde_json::from_value(value).unwrap();
+        assert!(response.unhealthy_reasons.is_empty());
+    }
+
+    #[test]
+    fn health_diagnostics_timeout_and_unknown_degradation_have_reasons() {
+        assert_eq!(
+            degraded_response().unhealthy_reasons[0]["code"],
+            "health_snapshot_timeout"
+        );
+        let mut response = dummy_response("degraded");
+        add_health_reasons(&mut response);
+        assert!(!response.unhealthy_reasons.is_empty());
+    }
+
     fn dummy_response(status: &str) -> HealthCheckResponse {
         HealthCheckResponse {
             status: status.to_string(),
+            dependencies: json!({}),
+            runtime: json!({}),
+            startup: json!({}),
+            unhealthy_reasons: vec![],
             status_code: 200,
             last_frame_timestamp: None,
             last_audio_timestamp: None,
@@ -2468,6 +2727,7 @@ mod tests {
             vision_reason: "ok".to_string(),
             loop_stage: "unknown".to_string(),
             loop_stage_age_secs: None,
+            audio_capture_mode: "always".to_string(),
             audio_status: "ok".to_string(),
             message: "test".to_string(),
             verbose_instructions: None,
@@ -2571,6 +2831,24 @@ mod tests {
         assert_eq!(
             state.reason,
             "audio capture is paused while the screen is locked"
+        );
+    }
+
+    #[test]
+    fn effective_audio_capture_mode_reports_the_mode_the_recorder_can_run() {
+        assert_eq!(effective_audio_capture_mode(true, None, true), "disabled");
+        assert_eq!(effective_audio_capture_mode(false, None, true), "always");
+        assert_eq!(
+            effective_audio_capture_mode(false, Some(&AudioCaptureMode::Always), true),
+            "always"
+        );
+        assert_eq!(
+            effective_audio_capture_mode(false, Some(&AudioCaptureMode::MeetingsOnly), true),
+            "meetings-only"
+        );
+        assert_eq!(
+            effective_audio_capture_mode(false, Some(&AudioCaptureMode::MeetingsOnly), false),
+            "always"
         );
     }
 
@@ -3063,6 +3341,14 @@ mod tests {
             ),
             "no_input_device"
         );
+        // previously captured + mic later unavailable (for example clamshell)
+        // remains the same benign state instead of degrading to stale.
+        assert_eq!(
+            classify_audio_status(
+                false, false, false, false, false, false, true, false, 1000, 2000, 60
+            ),
+            "no_input_device"
+        );
         // never captured but a mic exists -> not_started
         assert_eq!(
             classify_audio_status(
@@ -3146,5 +3432,24 @@ mod tests {
             audio_is_degraded(status_broken),
             "a present-but-silent mic must still surface as degraded"
         );
+    }
+
+    #[test]
+    fn clamshell_ignores_only_the_builtin_laptop_microphone() {
+        assert!(input_device_is_available(
+            "MacBook Pro Microphone (input)",
+            false
+        ));
+        assert!(!input_device_is_available(
+            "MacBook Pro Microphone (input)",
+            true
+        ));
+        assert!(!input_device_is_available(
+            "Built-in Microphone (input)",
+            true
+        ));
+        assert!(input_device_is_available("USB Microphone (input)", true));
+        assert!(input_device_is_available("AirPods Pro (input)", true));
+        assert!(!input_device_is_available("System Audio (output)", true));
     }
 }

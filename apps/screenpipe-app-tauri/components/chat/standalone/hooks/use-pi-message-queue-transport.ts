@@ -21,7 +21,6 @@ export function createPiMessageQueueTransport(
     activePreset,
     consumePendingAttachments,
     input,
-    inputRef,
     messages,
     pastedImages,
     piInfo,
@@ -55,7 +54,6 @@ export function createPiMessageQueueTransport(
     const queuedAttachments = consumePendingAttachments();
 
     setInput("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
     if (hadPastedImages) setPastedImages([]);
 
     // Same recovery contract as normal sends. Rust strips the wrapper for a
@@ -86,7 +84,7 @@ export function createPiMessageQueueTransport(
       if (result.status !== "ok") {
         setInput(prevInput);
         if (hadPastedImages) setPastedImages(queuedImageDataUrls);
-        toast({ title: "failed to queue message", description: result.error, variant: "destructive" });
+        toast({ title: "Failed to queue message", description: result.error, variant: "destructive" });
         return;
       }
 

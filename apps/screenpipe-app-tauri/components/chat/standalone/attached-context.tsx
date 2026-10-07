@@ -9,6 +9,8 @@ import {
   parseAttachedContext,
   type AttachedContext,
 } from "@/lib/chat/attached-context";
+import { useGT } from "gt-react";
+
 
 export { parseAttachedContext } from "@/lib/chat/attached-context";
 
@@ -38,11 +40,13 @@ export { parseAttachedContext } from "@/lib/chat/attached-context";
  */
 
 export function AttachedContextCard({ context }: { context: AttachedContext }) {
+
+  const ui = useGT();
   const [expanded, setExpanded] = useState(false);
 
   return (
     <div className="space-y-2">
-      <div className="rounded-xl border border-border/50 bg-muted/40 shadow-sm">
+      <div className="rounded-lg border border-border/50 bg-muted/40 shadow-sm">
         <div className="flex items-center gap-2.5 px-3 py-2">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background/70">
             <FileText className="h-4 w-4 text-muted-foreground" />
@@ -65,8 +69,8 @@ export function AttachedContextCard({ context }: { context: AttachedContext }) {
             }}
             onMouseUp={(event) => event.stopPropagation()}
             aria-expanded={expanded}
-            aria-label={expanded ? "hide attached context" : "show attached context"}
-            title={expanded ? "hide attached context" : "show attached context"}
+            aria-label={expanded ? ui("Hide attached context") : ui("Show attached context")}
+            title={expanded ? ui("Hide attached context") : ui("Show attached context")}
             className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted-foreground/10 hover:text-foreground"
           >
             {expanded ? (

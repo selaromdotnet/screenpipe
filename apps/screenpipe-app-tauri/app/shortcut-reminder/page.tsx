@@ -19,15 +19,18 @@ import {
   PanelLeft,
   Pin,
   PinOff,
+  Power,
   RotateCw,
   Search,
   Square,
+  Star,
   X,
 } from "lucide-react";
+import { useStarredSessions } from "@/components/starred-sessions/use-starred-sessions";
 import { useOverlayData } from "./use-overlay-data";
 import { useMeetingOverlay } from "./use-meeting-overlay";
 import { AudioEqualizer } from "./audio-equalizer";
-import { formatShortcut } from "./format-shortcut";
+import { formatShortcut, type ShortcutPlatform } from "./format-shortcut";
 import { DragStage } from "./drag-stage";
 import { useOverlayDrag } from "./use-overlay-drag";
 import {
@@ -37,6 +40,8 @@ import {
   overlayAnchorFromStored,
   type OverlayAnchor,
 } from "./overlay-anchor";
+import { useGT } from "gt-react";
+
 
 type ReminderSettings = {
   disabledShortcuts?: string[];
@@ -45,6 +50,7 @@ type ReminderSettings = {
   showChatShortcut?: string;
   showScreenpipeShortcut?: string;
   searchShortcut?: string;
+  starSessionShortcut?: string;
 };
 
 type RecordingHealthState =
@@ -63,24 +69,36 @@ const DEFAULT_SHORTCUTS = {
   overlay: { mac: "Super+Ctrl+S", other: "Alt+S" },
   chat: { mac: "Control+Super+L", other: "Alt+L" },
   search: { mac: "Control+Super+K", other: "Alt+K" },
+  star: { mac: "Control+Super+B", other: "Alt+Shift+B" },
 } as const;
 
 const COLLAPSED_SIZE = { width: 22, height: 16 };
-const EXPANDED_SIZE = { width: 160, height: 62 };
+const EXPANDED_SIZE = { width: 192, height: 62 };
 const SETTINGS_MENU_SIZE = { width: 164, height: 96 };
 const INCIDENT_SIZE = { width: 160, height: 40 };
 const MEETING_SIZE = { width: 280, height: 80 };
 
 export default function ShortcutReminderPage() {
-  const { isMac, isLoading } = usePlatform();
+
+  const ui = useGT();
+  const { isMac, isWindows, isLoading } = usePlatform();
+  const shortcutPlatform: ShortcutPlatform = isMac
+    ? "macos"
+    : isWindows
+      ? "windows"
+      : "linux";
   const [healthState, setHealthState] = useState<RecordingHealthState>("normal");
   const [healthDetail, setHealthDetail] = useState("");
   // "audio" | "screen" | "" — empty when the cause spans subsystems or could
   // not be attributed, which keeps the pill on its generic wording (#6126).
   const [healthSubsystem, setHealthSubsystem] = useState("");
+  // Explicit wire behavior. Never infer whether a click is safe from the
+  // human-readable detail string.
+  const [healthAction, setHealthAction] = useState("");
   const [overlayShortcut, setOverlayShortcut] = useState<string | null>(null);
   const [chatShortcut, setChatShortcut] = useState<string | null>(null);
   const [searchShortcut, setSearchShortcut] = useState<string | null>(null);
+  const [starShortcut, setStarShortcut] = useState<string | null>(null);
   const overlayData = useOverlayData();
   const meetingOverlay = useMeetingOverlay();
   // Hover and pin are stored as the meeting they belong to, not as bare flags.
@@ -90,6 +108,8 @@ export default function ShortcutReminderPage() {
   const [hoverMeetingId, setHoverMeetingId] = useState<number | null>(null);
   const [pinnedMeetingId, setPinnedMeetingId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [starError, setStarError] = useState(false);
+  const starredSessions = useStarredSessions();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [hoveredControl, setHoveredControl] = useState<string | null>(null);
   const [overlayScale, setOverlayScale] = useState(1);
@@ -102,6 +122,8 @@ export default function ShortcutReminderPage() {
   const appliedSizeRef = useRef<{ width: number; height: number } | null>(null);
   const isMacRef = useRef(isMac);
   isMacRef.current = isMac;
+  const platformRef = useRef<ShortcutPlatform>(shortcutPlatform);
+  platformRef.current = shortcutPlatform;
   const anchorRef = useRef(anchor);
   anchorRef.current = anchor;
 
@@ -124,7 +146,7 @@ export default function ShortcutReminderPage() {
           : isMacRef.current
             ? fallback.mac
             : fallback.other;
-      return formatShortcut(raw, isMacRef.current);
+      return formatShortcut(raw, platformRef.current);
     };
 
     setOverlayShortcut(
@@ -146,6 +168,19 @@ export default function ShortcutReminderPage() {
         settings.searchShortcut,
         "searchShortcut",
         DEFAULT_SHORTCUTS.search,
+      ),
+    );
+
+    setStarShortcut(
+      formatForReminder(
+        settings.starSessionShortcut,
+        "starSessionShortcut",
+        {
+          mac: DEFAULT_SHORTCUTS.star.mac,
+          other: platformRef.current === "windows"
+            ? DEFAULT_SHORTCUTS.star.other
+            : DEFAULT_SHORTCUTS.star.mac,
+        },
       ),
     );
 
@@ -192,10 +227,14 @@ export default function ShortcutReminderPage() {
       // Reached when there is no settings object at all (fresh profile, or the
       // read threw); `applyReminderSettings` covers the partially-filled case.
       const fallback = (d: { mac: string; other: string }) =>
-        formatShortcut(isMac ? d.mac : d.other, isMac);
+        formatShortcut(isMac ? d.mac : d.other, shortcutPlatform);
       setOverlayShortcut(prev => prev ?? fallback(DEFAULT_SHORTCUTS.overlay));
       setChatShortcut(prev => prev ?? fallback(DEFAULT_SHORTCUTS.chat));
       setSearchShortcut(prev => prev ?? fallback(DEFAULT_SHORTCUTS.search));
+      setStarShortcut(prev => prev ?? formatShortcut(
+        shortcutPlatform === "windows" ? DEFAULT_SHORTCUTS.star.other : DEFAULT_SHORTCUTS.star.mac,
+        shortcutPlatform,
+      ));
     });
 
     // Also listen for store changes via plugin (for live updates when user changes shortcuts).
@@ -219,7 +258,7 @@ export default function ShortcutReminderPage() {
       if (reloadTimer) clearTimeout(reloadTimer);
       unlistenStore?.();
     };
-  }, [isLoading, isMac, loadShortcutsFromFile]);
+  }, [isLoading, isMac, loadShortcutsFromFile, shortcutPlatform]);
 
   useEffect(() => {
     // Listen for explicit shortcut-reminder-update event (from Rust side)
@@ -244,14 +283,14 @@ export default function ShortcutReminderPage() {
   // current via the event.
   useEffect(() => {
     let mounted = true;
-    // Payload is "state", "state|detail", or "state|detail|subsystem" —
-    // detail is a failure reason (or the boot phase label while fixing), and
-    // subsystem names what failed when the engine could attribute it to one.
+    // Payload is "state", "state|detail", "state|detail|subsystem", or the
+    // same with an explicit fourth action field.
     const apply = (payload: string) => {
-      const [state, detail = "", subsystem = ""] = payload.split("|");
+      const [state, detail = "", subsystem = "", action = ""] = payload.split("|");
       setHealthState(state as RecordingHealthState);
       setHealthDetail(detail);
       setHealthSubsystem(subsystem);
+      setHealthAction(action);
     };
     commands
       .getRecordingHealthState()
@@ -377,6 +416,17 @@ export default function ShortcutReminderPage() {
     settingsOpen,
   ]);
 
+  const openStarPanel = useCallback(async () => {
+    setSettingsOpen(false);
+    setStarError(false);
+    try {
+      const result = await commands.toggleStarredSessions();
+      if (result.status === "error") setStarError(true);
+    } catch {
+      setStarError(true);
+    }
+  }, []);
+
   const handleRestartRecording = useCallback(async (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -452,6 +502,7 @@ export default function ShortcutReminderPage() {
   const smIconPx = 10 * overlayScale;
   const dotPx = Math.max(5 * overlayScale, 5);
   const failureReason = healthDetail || "recording stopped unexpectedly";
+  const manualRecoveryRequired = healthAction === "manual-reopen";
   // Name the subsystem the engine identified. Anything else — both failed, a
   // persistence error, an unattributable stop — keeps the generic wording.
   // Must stay in sync with `healthHeadline` in
@@ -462,7 +513,7 @@ export default function ShortcutReminderPage() {
       : healthSubsystem === "screen"
         ? "screen capture needs help"
         : "recording needs help";
-  // The pill is lowercase by design; the accessible name is a sentence.
+  // Use sentence case for both the pill and its accessible name.
   const failureHeadlineSentence =
     failureHeadline.charAt(0).toUpperCase() + failureHeadline.slice(1);
   const latestTranscript = meetingOverlay.items.at(-1);
@@ -499,16 +550,20 @@ export default function ShortcutReminderPage() {
           className="select-none w-full h-full border border-red-500/40 flex flex-col"
           style={{ background: "rgba(0, 0, 0, 0.88)", cursor: "grab" }}
         >
-          {/* The message row itself restarts — users click the thing that
-              says "recording needs help" expecting the fix. */}
+          {/* The message row itself restarts recoverable failures. A terminal
+              native failure is advisory only: never turn a health signal into
+              an app-exit action. */}
           <button
             onClick={handleRestartRecording}
+            disabled={manualRecoveryRequired}
             onMouseDown={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
-            className="flex items-center justify-center flex-1 min-h-0 hover:bg-white/10 transition-colors cursor-pointer"
+            className={`flex items-center justify-center flex-1 min-h-0 transition-colors ${manualRecoveryRequired ? "cursor-default" : "hover:bg-white/10 cursor-pointer"}`}
             style={{ gap: `${gap * 2}px`, padding: `${padY}px ${padX}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
             title={failureReason}
-            aria-label={`${failureHeadlineSentence}: ${failureReason}. Restart recording`}
+            aria-label={manualRecoveryRequired
+              ? `${failureHeadlineSentence}: ${failureReason}`
+              : ui("{value1}: {value2}. Restart recording", { value1: failureHeadlineSentence, value2: failureReason })}
           >
             <div
               className="rounded-full bg-red-500 animate-pulse shrink-0"
@@ -523,19 +578,32 @@ export default function ShortcutReminderPage() {
           </button>
           <div className="bg-white/15" style={{ height: "1px" }} />
           <div className="flex items-stretch justify-center flex-1 min-h-0">
-            <button
-              onClick={handleRestartRecording}
-              onMouseDown={(e) => e.stopPropagation()}
-              onPointerDown={(e) => e.stopPropagation()}
-              className="flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer text-white/90 flex-1"
-              style={{ gap: `${gap}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-              title={`Restart recording — ${failureReason}`}
-            >
-              <RotateCw style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} className="shrink-0" />
-              <span className="font-mono font-bold" style={{ fontSize: `${fontPx}px` }}>
-                restart
-              </span>
-            </button>
+            {manualRecoveryRequired ? (
+              <div
+                className="flex items-center justify-center text-white/90 flex-1"
+                style={{ gap: `${gap}px` }}
+                title={failureReason}
+              >
+                <Power style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} className="shrink-0" />
+                <span className="font-mono font-bold" style={{ fontSize: `${fontPx}px` }}>
+                  Quit &amp; reopen
+                </span>
+              </div>
+            ) : (
+              <button
+                onClick={handleRestartRecording}
+                onMouseDown={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+                className="flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer text-white/90 flex-1"
+                style={{ gap: `${gap}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                title={ui("Restart recording — {value1}", { value1: failureReason })}
+              >
+                <RotateCw style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} className="shrink-0" />
+                <span className="font-mono font-bold" style={{ fontSize: `${fontPx}px` }}>
+                  Restart
+                </span>
+              </button>
+            )}
             <div className="bg-white/15" style={{ width: "1px" }} />
             <button
               onClick={handleDismissIncident}
@@ -543,7 +611,7 @@ export default function ShortcutReminderPage() {
               onPointerDown={(e) => e.stopPropagation()}
               className="flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer text-white/60 hover:text-white"
               style={{ padding: `${padY}px ${padX * 2}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-              title="Dismiss"
+              title={ui("Dismiss")}
             >
               <X style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} />
             </button>
@@ -577,10 +645,10 @@ export default function ShortcutReminderPage() {
             style={{ fontSize: `${fontPx}px` }}
           >
             {healthState === "recovering"
-              ? "checking recovery..."
+              ? ui("Checking recovery...")
               : healthDetail
-                ? `fixing — ${healthDetail}...`
-                : "fixing recording..."}
+                ? ui("Fixing — {value1}...", { value1: healthDetail })
+                : ui("Fixing recording...")}
           </span>
         </div>
       </div>
@@ -610,7 +678,7 @@ export default function ShortcutReminderPage() {
             className="font-mono text-white/90 whitespace-nowrap"
             style={{ fontSize: `${fontPx}px` }}
           >
-            recording again
+            Recording again
           </span>
         </div>
       </div>
@@ -641,8 +709,18 @@ export default function ShortcutReminderPage() {
               style={{ width: `${dotPx}px`, height: `${dotPx}px` }}
             />
             <span className="font-mono text-white/85 truncate" style={{ fontSize: `${fontPx}px` }}>
-              meeting live{meetingOverlay.meetingApp ? ` · ${meetingOverlay.meetingApp}` : ""}
+              Meeting live{meetingOverlay.meetingApp ? ` · ${meetingOverlay.meetingApp}` : ""}
             </span>
+            <button
+              aria-label={ui("Starred work sessions")}
+              title={ui("Starred work sessions")}
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={() => void openStarPanel()}
+              className="ml-auto flex items-center justify-center px-1.5 h-full text-white/70 hover:text-white hover:bg-white/10"
+              style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+            >
+              <Star className={starredSessions.active ? "fill-white" : ""} style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} />
+            </button>
             <button
               onClick={(event) => {
                 event.stopPropagation();
@@ -652,8 +730,8 @@ export default function ShortcutReminderPage() {
               aria-pressed={meetingPinned}
               className="ml-auto flex items-center justify-center px-1.5 h-full text-white/70 hover:text-white hover:bg-white/10"
               style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
-              title={meetingPinned ? "Unpin transcript" : "Pin transcript"}
-              aria-label={meetingPinned ? "Unpin transcript" : "Pin transcript"}
+              title={meetingPinned ? ui("Unpin transcript") : ui("Pin transcript")}
+              aria-label={meetingPinned ? ui("Unpin transcript") : ui("Pin transcript")}
             >
               {meetingPinned ? (
                 <PinOff style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} />
@@ -671,23 +749,23 @@ export default function ShortcutReminderPage() {
               disabled={meetingOverlay.stopping}
               className="flex items-center gap-1 px-1.5 h-full font-mono text-white/70 hover:text-white hover:bg-white/10 disabled:opacity-50"
               style={{ fontSize: `${fontPx}px`, WebkitAppRegion: "no-drag" } as React.CSSProperties}
-              title="Stop meeting"
+              title={ui("Stop meeting")}
             >
               {meetingOverlay.stopping ? (
                 <Loader2 className="animate-spin" style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} />
               ) : (
                 <Square fill="currentColor" style={{ width: `${smIconPx * 0.75}px`, height: `${smIconPx * 0.75}px` }} />
               )}
-              stop
+              Stop
             </button>
           </div>
           <div className="bg-white/15" />
           <div className="flex items-center min-w-0" style={{ padding: `0 ${padX}px`, gap: `${gap * 2}px` }}>
             <span className="font-mono text-white/40 shrink-0" style={{ fontSize: `${fontPx}px` }}>
-              {meetingOverlay.stopError ? "stop failed" : latestSpeaker || "live transcript"}
+              {meetingOverlay.stopError ? ui("Stop failed") : latestSpeaker || ui("Live transcript")}
             </span>
             <span className="font-mono text-white/80 truncate" style={{ fontSize: `${fontPx}px` }}>
-              {meetingOverlay.stopError || latestTranscript?.text || "listening for speech…"}
+              {meetingOverlay.stopError || latestTranscript?.text || ui("Listening for speech…")}
             </span>
           </div>
         </div>
@@ -695,7 +773,9 @@ export default function ShortcutReminderPage() {
     );
   }
 
-  const disclosure = hoveredControl === "search"
+  const disclosure = hoveredControl === "star"
+    ? [starredSessions.active ? "Starred session in progress" : "Star work session", starShortcut]
+    : hoveredControl === "search"
     ? ["search", searchShortcut]
     : hoveredControl === "brand"
       ? ["screenpipe", "right-click"]
@@ -737,12 +817,12 @@ export default function ShortcutReminderPage() {
           className="relative w-full h-full flex items-center justify-center border border-white/25 hover:opacity-100 transition-opacity"
           style={{
             background: "rgba(0, 0, 0, 0.88)",
-            borderRadius: `${4 * overlayScale}px`,
+            borderRadius: `${8 * overlayScale}px`,
             opacity: 0.5,
             cursor: "grab",
             WebkitAppRegion: "no-drag",
           } as React.CSSProperties}
-          title="Open timeline"
+          title={ui("Open timeline")}
         >
           <span
             aria-hidden="true"
@@ -753,11 +833,12 @@ export default function ShortcutReminderPage() {
               backgroundImage: "url('/32x32.png')",
             }}
           />
+          {starredSessions.active && <Star aria-label="Work session starred" className="absolute -top-1 -left-1 h-2 w-2 fill-white text-white" />}
           {meetingOverlay.active && (
             <span
               role="status"
-              aria-label="Meeting live"
-              title="Meeting live — hover for transcript"
+              aria-label={ui("Meeting live")}
+              title={ui("Meeting live — hover for transcript")}
               className="absolute rounded-full bg-red-500 pointer-events-none"
               style={{
                 top: `${-1 * overlayScale}px`,
@@ -805,12 +886,12 @@ export default function ShortcutReminderPage() {
         style={{
           height: `${30 * overlayScale}px`,
           background: "rgba(0, 0, 0, 0.94)",
-          borderRadius: `${4 * overlayScale}px`,
+          borderRadius: `${8 * overlayScale}px`,
           cursor: "grab",
         }}
       >
         <button
-          title="Open search"
+          title={ui("Open search")}
           className={dockButtonClass}
           style={dockButtonStyle}
           onMouseEnter={() => setHoveredControl("search")}
@@ -825,7 +906,7 @@ export default function ShortcutReminderPage() {
           <Search style={{ width: `${12 * overlayScale}px`, height: `${12 * overlayScale}px` }} />
         </button>
         <button
-          title="Open chat"
+          title={ui("Open chat")}
           className={dockButtonClass}
           style={dockButtonStyle}
           onMouseEnter={() => setHoveredControl("chat")}
@@ -840,7 +921,20 @@ export default function ShortcutReminderPage() {
           <MessageCircle style={{ width: `${12 * overlayScale}px`, height: `${12 * overlayScale}px` }} />
         </button>
         <button
-          title="Open timeline"
+          title={ui("Starred work sessions")}
+          aria-label={ui("Starred work sessions")}
+          aria-haspopup="dialog"
+          className={dockButtonClass}
+          style={dockButtonStyle}
+          onMouseEnter={() => setHoveredControl("star")}
+          onFocus={() => setHoveredControl("star")}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => void openStarPanel()}
+        >
+          <Star className={starredSessions.active ? "fill-white" : ""} style={{ width: `${12 * overlayScale}px`, height: `${12 * overlayScale}px` }} />
+        </button>
+        <button
+          title={ui("Open timeline")}
           className={dockButtonClass}
           style={dockButtonStyle}
           onMouseEnter={() => setHoveredControl("timeline")}
@@ -852,7 +946,7 @@ export default function ShortcutReminderPage() {
         </button>
         <div className="my-1 bg-white/25" style={{ width: "1px" }} />
         <div
-          title="Microphone capture status"
+          title={ui("Microphone capture status")}
           className={`${dockButtonClass} min-w-0 overflow-hidden`}
           onMouseEnter={() => setHoveredControl("audio")}
         >
@@ -863,8 +957,8 @@ export default function ShortcutReminderPage() {
         </div>
         <div className="my-1 bg-white/25" style={{ width: "1px" }} />
         <button
-          title="screenpipe — right-click for options"
-          aria-label="screenpipe — open timeline; right-click for options"
+          title={ui("Screenpipe — right-click for options")}
+          aria-label={ui("Screenpipe — open timeline; right-click for options")}
           className={dockButtonClass}
           style={dockButtonStyle}
           onMouseEnter={() => setHoveredControl("brand")}
@@ -889,35 +983,36 @@ export default function ShortcutReminderPage() {
         </button>
       </div>
 
+      {starError && <p role="alert" className="bg-black px-2 text-xs text-white">Could not open session controls. Try again.</p>}
       {settingsOpen ? (
         <div
           role="menu"
-          aria-label="Shortcut reminder options"
+          aria-label={ui("Shortcut reminder options")}
           className="flex w-full min-h-0 flex-1 flex-col overflow-hidden border border-white/40 font-mono text-white/85"
           style={{
             marginTop: dockAbove ? `${4 * overlayScale}px` : 0,
             marginBottom: dockAbove ? 0 : `${4 * overlayScale}px`,
             background: "rgba(0, 0, 0, 0.96)",
-            borderRadius: `${4 * overlayScale}px`,
+            borderRadius: `${8 * overlayScale}px`,
             fontSize: `${fontPx}px`,
           }}
         >
           <button
             role="menuitem"
             className="flex-1 px-2 text-left hover:bg-white/15"
-            title="Hide for 1 hour"
+            title={ui("Hide for 1 hour")}
             onClick={(e) => void handleHourSnooze(e)}
           >
-            hide for 1 hour
+            Hide for 1 hour
           </button>
           <div className="mx-2 bg-white/20" style={{ height: "1px" }} />
           <button
             role="menuitem"
             className="flex-1 px-2 text-left hover:bg-white/15"
-            title="Open overlay settings"
+            title={ui("Open overlay settings")}
             onClick={handleOpenSettings}
           >
-            settings…
+            Settings…
           </button>
         </div>
       ) : (
@@ -938,7 +1033,7 @@ export default function ShortcutReminderPage() {
           marginBottom: dockAbove ? 0 : `${4 * overlayScale}px`,
           background: disclosure ? "rgba(0, 0, 0, 0.9)" : "transparent",
           border: `1px solid ${disclosure ? "rgba(255, 255, 255, 0.25)" : "transparent"}`,
-          borderRadius: `${4 * overlayScale}px`,
+          borderRadius: `${8 * overlayScale}px`,
           fontSize: `${fontPx}px`,
           }}
         >

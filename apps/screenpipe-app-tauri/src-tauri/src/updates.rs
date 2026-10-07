@@ -8,9 +8,12 @@ use crate::store::{get_store, SettingsStore};
 use crate::RecordingState;
 use anyhow::Error;
 use dark_light::Mode;
+use futures::StreamExt;
 use log::{debug, error, info, warn};
 use semver::Version;
 use serde_json;
+#[cfg(any(target_os = "macos", test))]
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +28,126 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 
+fn consumer_update_channel(settings: Option<&SettingsStore>) -> &'static str {
+    match settings.map(|settings| settings.update_channel.as_str()) {
+        Some("pre-release") => "pre-release",
+        _ => "stable",
+    }
+}
+
+fn consumer_update_endpoint(channel: &str) -> String {
+    format!(
+        "https://screenpipe.com/api/app-update/{channel}/{{{{target}}}}-{{{{arch}}}}/{{{{current_version}}}}"
+    )
+}
+
+fn configured_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, Error> {
+    let mut builder = app.updater_builder();
+    let settings = SettingsStore::get(app).ok().flatten();
+    let is_beta_build = app.config().identifier.contains("beta");
+    if !is_enterprise_build(app) && !is_beta_build {
+        let channel = consumer_update_channel(settings.as_ref());
+        builder = builder.endpoints(vec![consumer_update_endpoint(channel).parse()?])?;
+    }
+    if is_enterprise_build(app) {
+        if let Some(license_key) = crate::commands::get_enterprise_license_key() {
+            builder = builder.header("X-License-Key", license_key)?;
+        }
+        if let Some(token) = crate::commands::get_cloud_token() {
+            builder = builder.header("Authorization", format!("Bearer {token}"))?;
+        }
+    } else if let Some(settings) = settings {
+        if let Some(token) = settings
+            .user
+            .token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(crate::auth_token::cached_cloud_token)
+        {
+            builder = builder.header("Authorization", format!("Bearer {token}"))?;
+        }
+    }
+    Ok(builder.build()?)
+}
+
+async fn stop_before_update(app: &tauri::AppHandle) -> Result<(), String> {
+    let search_only = crate::search_only::is_active();
+    crate::search_only::prepare_restart().map_err(|error| {
+        UPDATE_RESTART_STARTED.store(false, Ordering::SeqCst);
+        error
+    })?;
+    match bounded_teardown(
+        PRE_EXIT_TEARDOWN_TIMEOUT,
+        stop_screenpipe(app.state::<RecordingState>(), app.clone()),
+    )
+    .await
+    {
+        TeardownOutcome::Completed => {}
+        outcome if search_only => {
+            let error = format!("search-only shutdown did not complete: {outcome:?}");
+            UPDATE_RESTART_STARTED.store(false, Ordering::SeqCst);
+            crate::search_only::cancel_restart();
+            crate::search_only::recover_after_failed_update(app.clone());
+            crate::update_diagnostics::record(
+                "search_shutdown_failed",
+                &format!("cause={error}; outcome=update_deferred"),
+            );
+            return Err(error);
+        }
+        TeardownOutcome::Failed(error) => warn!("update teardown failed (continuing): {error}"),
+        TeardownOutcome::TimedOut => warn!(
+            "update teardown exceeded {}s — continuing with the update",
+            PRE_EXIT_TEARDOWN_TIMEOUT.as_secs()
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn install_windows_update(
+    app: &tauri::AppHandle,
+    update: &tauri_plugin_updater::Update,
+    bytes: Vec<u8>,
+    timeout: Duration,
+) -> Result<(), tauri_plugin_updater::Error> {
+    let restart = crate::update_restart::RESTART_SAFETY
+        .prepare_restart(timeout)
+        .await
+        .ok_or_else(|| std::io::Error::other("audio is still initializing; try updating again"))?;
+    crate::store::persist_store_before_restart(app).map_err(std::io::Error::other)?;
+    let recording = app.state::<RecordingState>();
+    let wants_recording = recording.capture_intended();
+    stop_before_update(app)
+        .await
+        .map_err(std::io::Error::other)?;
+    save_pre_update_version(app, update.body.clone());
+    record_update_attempt(app, &update.version);
+    // The NSIS handoff exits this process. Keep native startup excluded until
+    // that exit; an install error drops the guard so startup can continue.
+    UPDATE_RESTART_STARTED.store(true, Ordering::SeqCst);
+    if let Err(error) = update.install(bytes) {
+        crate::search_only::cancel_restart();
+        crate::search_only::recover_after_failed_update(app.clone());
+        UPDATE_RESTART_STARTED.store(false, Ordering::SeqCst);
+        recording.set_capture_intent(wants_recording);
+        crate::update_diagnostics::record(
+            "installer_handoff_failed",
+            &format!(
+                "from={} target={} error={error} capture_intent_restored={wants_recording}",
+                update.current_version, update.version,
+            ),
+        );
+        return Err(error);
+    }
+    std::mem::forget(restart);
+    crate::process_exit::request_prepared_app_relaunch(
+        app.clone(),
+        "windows update restart",
+        Duration::from_millis(250),
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Rollback: download a specific older version from R2 via the website API
 // ---------------------------------------------------------------------------
@@ -33,6 +156,11 @@ use tokio::time::interval;
 /// The website's /rollback endpoint returns a manifest with a fake high version
 /// so the updater accepts it as an "update".
 pub async fn install_specific_version(app: &tauri::AppHandle, version: &str) -> Result<(), String> {
+    if crate::enterprise_persistence::installed() {
+        return Err(
+            "rollback is unavailable for persistence-managed enterprise installations".to_string(),
+        );
+    }
     let target_arch = get_target_arch();
     let rollback_url = format!(
         "https://screenpipe.com/api/app-update/rollback/{}/{}",
@@ -122,7 +250,7 @@ pub fn is_source_build(_app: &tauri::AppHandle) -> bool {
     !cfg!(feature = "official-build") && !cfg!(feature = "enterprise-build")
 }
 
-/// Enterprise build: updates are managed by IT (Intune/RoboPack), not in-app.
+/// Enterprise build: update transport is selected by the administrator policy.
 pub fn is_enterprise_build(_app: &tauri::AppHandle) -> bool {
     cfg!(feature = "enterprise-build")
 }
@@ -145,17 +273,40 @@ fn enterprise_update_mode(app: &tauri::AppHandle) -> Option<String> {
         .map(|mode| mode.to_lowercase())
 }
 
-fn enterprise_updates_managed_locally(app: &tauri::AppHandle) -> bool {
-    let metadata = crate::enterprise_install_metadata::get_enterprise_install_metadata();
-    match enterprise_update_mode(app).as_deref() {
-        Some("screenpipe") => false,
-        Some("auto_detect") => metadata.managed,
-        Some("mdm") | Some("manual") => true,
-        // Missing/unknown policy → behave like a new org with the consumer
-        // banner flow. Existing orgs are explicitly pinned to "manual" via
-        // the website migration so they hit the arm above, not this one.
-        _ => false,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnterpriseUpdateRoute {
+    Tauri,
+    PersistentPackage,
+    ExternalManager,
+}
+
+fn enterprise_update_route_for(
+    mode: Option<&str>,
+    metadata_managed: bool,
+    persistence_installed: bool,
+) -> EnterpriseUpdateRoute {
+    let external = matches!(mode, Some("mdm") | Some("manual"))
+        || mode == Some("auto_detect") && metadata_managed;
+    if external {
+        EnterpriseUpdateRoute::ExternalManager
+    } else if persistence_installed {
+        // The privileged supervisor owns the whole persistence-capable package.
+        // Never replace only the app bundle: the package route establishes a
+        // trusted maintenance window and reconciles the privileged components.
+        EnterpriseUpdateRoute::PersistentPackage
+    } else {
+        EnterpriseUpdateRoute::Tauri
     }
+}
+
+fn enterprise_update_route(app: &tauri::AppHandle) -> EnterpriseUpdateRoute {
+    let metadata = crate::enterprise_install_metadata::get_enterprise_install_metadata();
+    let mode = enterprise_update_mode(app);
+    enterprise_update_route_for(
+        mode.as_deref(),
+        metadata.managed,
+        crate::enterprise_persistence::installed(),
+    )
 }
 
 /// Snapshot of a pending update, exposed to the frontend via
@@ -169,22 +320,18 @@ pub struct PendingUpdateSnapshot {
     pub downloaded: bool,
     /// True when download failed with 401/403 — user must sign in.
     pub auth_required: bool,
+    /// True when the privileged persistence supervisor must apply the complete
+    /// system package rather than the ordinary Tauri app-only artifact.
+    pub persistent: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Restart gate (#3622)
+// Legacy boot-readiness IPC (#3622)
 //
-// Every code path that culminates in `process::exit` — the auto-update
-// restart, banner-triggered relaunch, rollback restart — must wait for
-// `ServerCore::start` to reach the "ready" phase first. Otherwise the OS
-// runs onnxruntime's C++ static destructors while `AudioManager::new` is
-// still mid-`create_session` on the server worker thread, and the global
-// DataTypeRegistry gets torn down under the still-running PlannerImpl,
-// segfaulting at 0x2c8. Stack: #3557. Sentry can't see this crash because
-// the Rust SDK dies before the event ships.
-//
-// `await_restart_gate` is the single internal entry point; the
-// `await_safe_restart` Tauri command exposes it to the frontend banner.
+// Retain await_safe_restart for older callers that only query readiness.
+// Actual update installs/restarts now hold update_restart::RESTART_SAFETY:
+// waiting for all of ServerCore::start stranded interrupted migrations, and
+// a readiness snapshot alone cannot prevent a later native initialization.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Outcome of `await_restart_gate`. Callers branch on this rather than a
@@ -225,10 +372,8 @@ impl RestartGate {
     }
 }
 
-/// Cap for the auto-update restart wait. Production boot is well under a
-/// minute even on cold installs; a 5-minute cap covers slow first-time
-/// model downloads and large DB migrations without holding the CheckGuard
-/// forever on a stuck startup.
+/// Cap while native initialization holds the restart barrier. Database
+/// migration/recovery does not hold it and must not defer an update.
 const AUTO_UPDATE_GATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Frontend (banner) cap. Shorter than the internal one because the user
@@ -236,16 +381,48 @@ const AUTO_UPDATE_GATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// try again" than to block the click indefinitely.
 const BANNER_GATE_TIMEOUT_SECS: u64 = 60;
 
-/// Cooldown after an update *download/install* fails for a non-auth reason.
-/// The periodic check runs every 5 min; without this, a machine that can
-/// download the bundle but can't apply it (signature/Gatekeeper/permission
-/// issue) re-downloads the same version every cycle forever — one stuck
-/// machine produced ~1,400 re-downloads of a single version in 4 days and
-/// inflated the `app_downloaded` metric ~12x. While a version is in cooldown
+/// Cooldown after a permanent download/install failure. The periodic check
+/// runs every 5 min; without this, signature/Gatekeeper/permission failures
+/// re-download the same broken bundle every cycle. While a version is in cooldown
 /// we still hit the cheap CHECK endpoint but skip the binary download until
 /// the window elapses, a newer version ships, or the user retries manually
-/// (which passes `force=true`). In-memory only — a restart re-attempts once.
+/// (which passes `force=true`). A durable failed-install marker carries the
+/// cooldown across the relaunch that discovered the failure.
 const UPDATE_FAILURE_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
+
+// After the existing bounded retry burst, allow network recovery on a later
+// periodic check without reviving the broken-install download loop.
+const UPDATE_TRANSPORT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+fn update_failure_cooldown(error: &tauri_plugin_updater::Error) -> Duration {
+    use tauri_plugin_updater::Error;
+    let retryable_status = |status: u16| matches!(status, 408 | 429 | 500..=599);
+    let transient = match error {
+        Error::Reqwest(error) => {
+            error.is_connect()
+                || error.is_timeout()
+                || error.is_body()
+                || error.is_decode()
+                || error
+                    .status()
+                    .is_some_and(|status| retryable_status(status.as_u16()))
+        }
+        // tauri-plugin-updater 2.11 wraps download HTTP statuses in Network
+        // rather than preserving reqwest::Error. Parse only its known prefix;
+        // unknown errors conservatively retain the install cooldown.
+        Error::Network(message) => message
+            .strip_prefix("Download request failed with status: ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|status| status.parse::<u16>().ok())
+            .is_some_and(retryable_status),
+        _ => false,
+    };
+    if transient {
+        UPDATE_TRANSPORT_COOLDOWN
+    } else {
+        UPDATE_FAILURE_COOLDOWN
+    }
+}
 
 /// Wait for boot to reach a settled state, with timeout. Logs the
 /// outcome with `label` so deferrals are searchable in support logs.
@@ -310,6 +487,55 @@ pub async fn await_safe_restart(timeout_secs: Option<u64>) -> String {
 /// second trigger from starting a parallel teardown+relaunch.
 static UPDATE_RESTART_STARTED: AtomicBool = AtomicBool::new(false);
 
+fn request_persistent_update_for_restart() -> Result<(), String> {
+    let result = crate::enterprise_persistence::request_staged_update().and_then(|version| {
+        version.ok_or_else(|| {
+            "persistent update is no longer staged; check for updates again".to_string()
+        })
+    });
+    if result.is_err() {
+        // No privileged handoff occurred. A deleted/failed staging write must
+        // remain retryable, rather than permanently latching "restarting".
+        UPDATE_RESTART_STARTED.store(false, Ordering::SeqCst);
+    }
+    result.map(|_| ())
+}
+
+async fn meeting_active(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<RecordingState>();
+    let server = state.server.lock().await;
+    let Some(server) = server.as_ref() else {
+        return false;
+    };
+    screenpipe_engine::routes::meetings::resolve_meeting_status_from(
+        server.db.as_ref(),
+        server.manual_meeting.as_ref(),
+    )
+    .await
+    .map(|status| status.active)
+    .unwrap_or_else(|error| {
+        warn!("auto-update: could not verify meeting status: {}", error);
+        true
+    })
+}
+
+/// Require 30 meeting-free seconds before an automatic restart.
+async fn wait_for_meeting_restart_window(app: &tauri::AppHandle) {
+    let mut started = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+    let mut ended = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+
+    if meeting_active(app).await {
+        ended.next().await;
+    }
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(30)) => return,
+            _ = started.next() => { ended.next().await; }
+        }
+    }
+}
+
 /// Banner-click restart. Mirror the auto-update path: gate, stop server, then
 /// spawn the replacement app and `_exit` the old process so C/C++ atexit
 /// handlers cannot abort during restart. See 2026-06-10 and 2026-07-02 reports.
@@ -320,10 +546,32 @@ pub async fn restart_for_update(
     timeout_secs: Option<u64>,
 ) -> Result<String, String> {
     let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
-    let gate = await_restart_gate(cap, "banner-triggered restart").await;
-    if !gate.should_restart() {
-        return Ok(gate.as_str().to_string());
+    #[cfg(target_os = "windows")]
+    if !is_enterprise_build(&app) || enterprise_update_route(&app) == EnterpriseUpdateRoute::Tauri {
+        // Keep recovery running during the download. Reserve native startup
+        // only for the bounded teardown and installer handoff.
+        let update = configured_updater(&app)
+            .map_err(|error| error.to_string())?
+            .check()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no update is available; check for updates again".to_string())?;
+        let bytes = update
+            .download(|_, _| {}, || {})
+            .await
+            .map_err(|error| error.to_string())?;
+        install_windows_update(&app, &update, bytes, cap)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok("proceed".into());
     }
+
+    let Some(restart) = crate::update_restart::RESTART_SAFETY
+        .prepare_restart(cap)
+        .await
+    else {
+        return Ok("pending".into());
+    };
 
     // The native tray calls this function directly, without passing through
     // UpdateBanner's webview-local settings queue. Flush the shared store here
@@ -335,6 +583,18 @@ pub async fn restart_for_update(
         format!("failed to persist settings before update restart: {err}")
     })?;
 
+    let persistent_version = if is_enterprise_build(&app)
+        && enterprise_update_route(&app) == EnterpriseUpdateRoute::PersistentPackage
+    {
+        Some(
+            crate::enterprise_persistence::staged_version().ok_or_else(|| {
+                "persistent update is no longer staged; check for updates again".to_string()
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Only the first trigger applies; later ones ride the in-flight restart.
     if UPDATE_RESTART_STARTED.swap(true, Ordering::SeqCst) {
         info!("banner restart: update-restart already in progress, ignoring");
@@ -344,42 +604,45 @@ pub async fn restart_for_update(
     // Durable "we are about to apply vX" marker: the next boot compares it
     // with the running version, so a swap that silently failed to apply is
     // detected instead of the app just quietly staying old.
-    #[cfg(target_os = "macos")]
-    if let Some(to_version) = crate::staged_update::staged_version() {
+    if let Some(to_version) = persistent_version.clone().or_else(|| {
+        #[cfg(target_os = "macos")]
+        {
+            crate::staged_update::staged_version()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }) {
         record_update_attempt(&app, &to_version);
     }
 
     info!("banner restart: gate passed, shutting down for update");
 
-    // Non-fatal AND time-bounded: a wedged capture/audio teardown must not
-    // stall the relaunch (2026-06-26 MacBook Air: VisionManager hung 10s →
-    // ~57s frozen before the update applied). server_core.rs retries the
-    // port bind if the next boot races teardown.
-    match bounded_teardown(
-        PRE_EXIT_TEARDOWN_TIMEOUT,
-        stop_screenpipe(app.state::<RecordingState>(), app.clone()),
-    )
-    .await
-    {
-        TeardownOutcome::Completed => {}
-        TeardownOutcome::Failed(err) => {
-            warn!(
-                "banner restart: stop_screenpipe failed (continuing): {}",
-                err
-            )
+    // Recording-mode recovery still permits a bounded teardown timeout.
+    // Search-only mode defers the update if the database owner cannot drain.
+    stop_before_update(&app).await?;
+    if persistent_version.is_some() {
+        if let Err(error) = request_persistent_update_for_restart() {
+            UPDATE_RESTART_STARTED.store(false, Ordering::SeqCst);
+            crate::search_only::cancel_restart();
+            crate::search_only::recover_after_failed_update(app.clone());
+            return Err(error);
         }
-        TeardownOutcome::TimedOut => warn!(
-            "banner restart: teardown exceeded {}s (capture shutdown wedged) — relaunching anyway",
-            PRE_EXIT_TEARDOWN_TIMEOUT.as_secs()
-        ),
     }
 
     // Off-thread so the IPC reply flushes before runtime teardown.
-    crate::process_exit::request_app_relaunch(
-        app.clone(),
-        "banner update restart",
-        Duration::from_millis(250),
-    );
+    // Keep the reservation until process exit, including that IPC delay.
+    std::mem::forget(restart);
+    if persistent_version.is_some() {
+        crate::process_exit::request_full_app_quit(app.clone());
+    } else {
+        crate::process_exit::request_prepared_app_relaunch(
+            app.clone(),
+            "banner update restart",
+            Duration::from_millis(250),
+        );
+    }
 
     Ok("proceed".to_string())
 }
@@ -407,6 +670,9 @@ pub struct UpdateAttempt {
     pub from_version: String,
     pub to_version: String,
     pub ts_epoch_secs: u64,
+    /// None for markers written by older builds or if visibility was unavailable.
+    #[serde(default)]
+    pub home_visible: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -452,7 +718,19 @@ fn record_update_attempt(app: &tauri::AppHandle, to_version: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        home_visible: crate::process_exit::home_window_visible(app),
     };
+    crate::update_diagnostics::record(
+        "restart_committed",
+        &format!(
+            "from={} target={} attempt_ts={} home_visible={:?} executable={:?}",
+            attempt.from_version,
+            attempt.to_version,
+            attempt.ts_epoch_secs,
+            attempt.home_visible,
+            std::env::current_exe()
+        ),
+    );
     match serde_json::to_vec(&attempt).map(|bytes| std::fs::write(&path, bytes)) {
         Ok(Ok(())) => info!(
             "update attempt recorded: {} → {}",
@@ -463,12 +741,33 @@ fn record_update_attempt(app: &tauri::AppHandle, to_version: &str) {
     }
 }
 
+/// Read before showing startup windows. The updater consumes this same marker
+/// later in setup, preserving failed-install detection and one-launch lifetime.
+pub(crate) fn update_startup_home_visibility(app: &tauri::AppHandle) -> Option<bool> {
+    update_startup_home_visibility_at(
+        &update_attempt_marker_path(app)?,
+        &app.package_info().version.to_string(),
+    )
+}
+
+fn update_startup_home_visibility_at(path: &std::path::Path, current: &str) -> Option<bool> {
+    let attempt: UpdateAttempt = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if classify_update_attempt(&attempt, current) == UpdateAttemptOutcome::Unrelated {
+        return None;
+    }
+    attempt.home_visible
+}
+
 /// Read + delete the marker left by the previous process. Returns the failed
 /// attempt when the install demonstrably did not apply; logs the applied /
 /// unrelated cases.
 fn consume_update_attempt_marker(app: &tauri::AppHandle) -> Option<UpdateAttempt> {
     let path = update_attempt_marker_path(app)?;
-    let raw = std::fs::read(&path).ok()?;
+    consume_update_attempt_at(&path, &app.package_info().version.to_string())
+}
+
+fn consume_update_attempt_at(path: &std::path::Path, current: &str) -> Option<UpdateAttempt> {
+    let raw = std::fs::read(path).ok()?;
     if let Err(e) = std::fs::remove_file(&path) {
         warn!("failed to remove update-attempt marker: {}", e);
     }
@@ -479,7 +778,20 @@ fn consume_update_attempt_marker(app: &tauri::AppHandle) -> Option<UpdateAttempt
             return None;
         }
     };
-    let current = app.package_info().version.to_string();
+    crate::update_diagnostics::append(
+        path.parent()?,
+        "relaunch_observed",
+        &format!(
+            "from={} target={} attempt_ts={} running={} home_visible={:?} executable={:?} outcome={:?}",
+            attempt.from_version,
+            attempt.to_version,
+            attempt.ts_epoch_secs,
+            current,
+            attempt.home_visible,
+            std::env::current_exe(),
+            classify_update_attempt(&attempt, &current)
+        ),
+    );
     match classify_update_attempt(&attempt, &current) {
         UpdateAttemptOutcome::Applied => {
             info!(
@@ -512,10 +824,10 @@ fn consume_update_attempt_marker(app: &tauri::AppHandle) -> Option<UpdateAttempt
 
 /// Fire-and-forget native notification; used where no webview toast can exist
 /// (tray-only interactions, possibly with zero windows open).
-fn notify_update_state(app: &tauri::AppHandle, title: &str, body: &str) {
+fn notify_update_state(app: &tauri::AppHandle, title: impl Into<String>, body: impl Into<String>) {
     let app = app.clone();
-    let title = title.to_string();
-    let body = body.to_string();
+    let title = title.into();
+    let body = body.into();
     std::thread::spawn(move || {
         if let Err(e) = app.notification().builder().title(title).body(body).show() {
             warn!("failed to show update notification: {}", e);
@@ -537,7 +849,7 @@ pub async fn trigger_update_now(app: tauri::AppHandle) {
     let manager = app.state::<Arc<UpdatesManager>>().inner().clone();
     if manager.has_update_installed().await {
         // Immediate feedback in the menu itself: the install + relaunch can
-        // take a few seconds even on the rename fast path.
+        // take several seconds while the verified installer extracts the update.
         manager.set_menu_installing();
         match restart_for_update(app.clone(), None).await {
             Ok(outcome) if outcome == "proceed" => {
@@ -547,29 +859,17 @@ pub async fn trigger_update_now(app: tauri::AppHandle) {
             Ok(outcome) => {
                 warn!("tray update flow: restart deferred (outcome={})", outcome);
                 manager.set_menu_restart_ready();
-                notify_update_state(
-                    &app,
-                    "screenpipe is still starting up",
-                    "the update will install once startup finishes — try again in a moment.",
-                );
+                notify_update_state(&app, crate::localization::ui_text("screenpipe is still starting up"), crate::localization::ui_text("the update will install once startup finishes — try again in a moment."));
             }
             Err(e) => {
                 error!("tray update flow: restart for update failed: {}", e);
                 manager.set_menu_restart_ready();
-                notify_update_state(
-                    &app,
-                    "update couldn't restart",
-                    "screenpipe couldn't save settings before restarting. try again, or quit and reopen the app.",
-                );
+                notify_update_state(&app, crate::localization::ui_text("update couldn't restart"), crate::localization::ui_text("screenpipe couldn't save settings before restarting. try again, or quit and reopen the app."));
             }
         }
     } else if let Err(e) = manager.check_for_updates(true, true).await {
         error!("tray menu: check for updates failed: {}", e);
-        notify_update_state(
-            &app,
-            "update check failed",
-            "couldn't reach the update server. check your connection and try again.",
-        );
+        notify_update_state(&app, crate::localization::ui_text("update check failed"), crate::localization::ui_text("couldn't reach the update server. check your connection and try again."));
     }
 }
 
@@ -584,6 +884,33 @@ fn failed_version_in_cooldown(
     cooldown: Duration,
 ) -> bool {
     matches!(last_failed, Some((v, elapsed)) if v == version && elapsed < cooldown)
+}
+
+/// Carry a failed exit-path install into the existing per-version cooldown.
+/// Without this bridge, the durable marker added in #6147 reports the failure
+/// but the boot check immediately downloads, restarts, and fails again.
+fn cooldown_from_failed_attempt(
+    failed_attempt: Option<&UpdateAttempt>,
+) -> Option<(String, std::time::Instant, Duration)> {
+    failed_attempt.map(|attempt| {
+        (
+            attempt.to_version.clone(),
+            std::time::Instant::now(),
+            UPDATE_FAILURE_COOLDOWN,
+        )
+    })
+}
+
+/// The Tauri updater replaces the bundle containing its configured executable.
+/// Gatekeeper App Translocation and mounted disk images are read-only launch
+/// locations, so attempting an in-place update there can only relaunch the old
+/// version. macOS requires the user to move the app to an install location.
+#[cfg(any(target_os = "macos", test))]
+fn macos_update_location_is_protected(executable: &Path) -> bool {
+    executable
+        .components()
+        .any(|component| component.as_os_str() == "AppTranslocation")
+        || executable.starts_with("/Volumes")
 }
 
 /// Whether `candidate` is a strictly higher semantic version than `current`.
@@ -692,8 +1019,8 @@ fn load_auto_update_enabled(app: &tauri::AppHandle) -> bool {
     let app_ui_hidden = crate::enterprise_policy::is_app_ui_hidden();
     // mdm/manual (and auto_detect-with-MDM) => updates are managed outside the
     // app; don't override that even when hidden.
-    let updates_managed_externally =
-        is_enterprise_build(app) && enterprise_updates_managed_locally(app);
+    let updates_managed_externally = is_enterprise_build(app)
+        && enterprise_update_route(app) == EnterpriseUpdateRoute::ExternalManager;
     if app_ui_hidden && !settings_enabled && !updates_managed_externally {
         info!(
             "enterprise: forcing auto-update ON in hidden UI mode \
@@ -717,10 +1044,10 @@ pub struct UpdatesManager {
     pending_update: Arc<Mutex<Option<PendingUpdateSnapshot>>>,
     /// Prevents concurrent check_for_updates calls (boot check + periodic race)
     is_checking: AtomicBool,
-    /// (version, when-it-failed) for the last update whose download/install
+    /// (version, when-it-failed, cooldown) for the last update whose download/install
     /// failed for a non-auth reason. Gates the periodic loop from re-downloading
     /// the same broken version every 5 min — see `UPDATE_FAILURE_COOLDOWN`.
-    last_failed_update: Arc<Mutex<Option<(String, std::time::Instant)>>>,
+    last_failed_update: Arc<Mutex<Option<(String, std::time::Instant, Duration)>>>,
 }
 
 /// Remove `<binary>.sp-old*` leftovers next to the app executable.
@@ -791,24 +1118,25 @@ impl UpdatesManager {
 
         // Did the previous process quit to apply an update that never landed?
         let failed_attempt = consume_update_attempt_marker(app);
+        let last_failed_update = cooldown_from_failed_attempt(failed_attempt.as_ref());
 
         let update_menu_item = if is_enterprise_build(app) {
             None
         } else {
             let (menu_text, enabled) = if is_source_build(app) {
-                ("Auto-updates unavailable (source build)", true) // Enable to show info dialog
+                (crate::localization::source_text("Auto-updates unavailable (source build)"), true) // Enable to show info dialog
             } else if failed_attempt.is_some() {
                 // Enabled: with nothing staged in this fresh process, a click
                 // routes to check_for_updates(force) and re-attempts.
-                ("Update didn't apply — click to retry", true)
+                (crate::localization::source_text("Update didn't apply — click to retry"), true)
             } else {
-                ("Screenpipe is up to date", false)
+                (crate::localization::source_text("Screenpipe is up to date"), false)
             };
-            Some(
-                MenuItemBuilder::with_id("update_now", menu_text)
-                    .enabled(enabled)
-                    .build(app)?,
-            )
+            let item = MenuItemBuilder::with_id("update_now", menu_text)
+                .enabled(enabled)
+                .build(app)?;
+            crate::localization::ui_menu(menu_text, &[], &item)?;
+            Some(item)
         };
 
         Ok(Self {
@@ -819,7 +1147,7 @@ impl UpdatesManager {
             app: app.clone(),
             update_menu_item,
             is_checking: AtomicBool::new(false),
-            last_failed_update: Arc::new(Mutex::new(None)),
+            last_failed_update: Arc::new(Mutex::new(last_failed_update)),
         })
     }
 
@@ -848,9 +1176,14 @@ impl UpdatesManager {
         }
         let _guard = CheckGuard(&self.is_checking);
 
-        // Enterprise: default to IT-managed updates unless the dashboard policy
-        // explicitly allows the Screenpipe updater for this install context.
-        if is_enterprise_build(&self.app) && enterprise_updates_managed_locally(&self.app) {
+        // Enterprise: honor the dashboard-selected external, ordinary in-app,
+        // or privileged persistent-package transport for this install context.
+        let enterprise_route = if is_enterprise_build(&self.app) {
+            enterprise_update_route(&self.app)
+        } else {
+            EnterpriseUpdateRoute::Tauri
+        };
+        if enterprise_route == EnterpriseUpdateRoute::ExternalManager {
             info!(
                 "enterprise build, updates managed outside app (mode={:?})",
                 enterprise_update_mode(&self.app)
@@ -873,9 +1206,34 @@ impl UpdatesManager {
                 return Result::Ok(false);
             }
         }
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) && !cfg!(feature = "e2e") {
             info!("dev mode is enabled, skipping update check");
             return Result::Ok(false);
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Ok(executable) = std::env::current_exe() {
+            if macos_update_location_is_protected(&executable) {
+                warn!(
+                    "updater disabled: app is running from protected macOS location {}",
+                    executable.display()
+                );
+                if let Some(ref item) = self.update_menu_item {
+                    item.set_enabled(true)?;
+                    crate::localization::ui_menu("Move screenpipe to Applications to update", &[], item)?;
+                }
+                if show_dialog {
+                    self.app
+                        .dialog()
+                        .message(
+                            crate::localization::ui_text("Quit screenpipe, move screenpipe.app to Applications, then reopen it. macOS prevents apps launched from Downloads or a disk image from updating themselves."),
+                        )
+                        .title(crate::localization::ui_text("Move screenpipe to Applications"))
+                        .buttons(MessageDialogButtons::Ok)
+                        .show(|_| {});
+                }
+                return Result::Ok(false);
+            }
         }
 
         if let Err(err) = self.app.emit("update-all-pipes", ()) {
@@ -890,27 +1248,7 @@ impl UpdatesManager {
             current_version,
             self.app.config().identifier
         );
-        // Build updater with auth header so paid users can download from R2
-        let mut builder = self.app.updater_builder();
-        if is_enterprise_build(&self.app) {
-            if let Some(license_key) = crate::commands::get_enterprise_license_key() {
-                builder = builder.header("X-License-Key", license_key)?;
-            }
-            if let Some(token) = crate::commands::get_cloud_token() {
-                builder = builder.header("Authorization", format!("Bearer {token}"))?;
-            }
-        } else if let Ok(Some(settings)) = SettingsStore::get(&self.app) {
-            if let Some(token) = settings
-                .user
-                .token
-                .clone()
-                .filter(|t| !t.is_empty())
-                .or_else(crate::auth_token::cached_cloud_token)
-            {
-                builder = builder.header("Authorization", format!("Bearer {}", token))?;
-            }
-        }
-        let check_result = builder.build()?.check().await;
+        let check_result = configured_updater(&self.app)?.check().await;
         match &check_result {
             Ok(Some(ref u)) => {
                 info!("update found: v{}", u.version);
@@ -945,7 +1283,7 @@ impl UpdatesManager {
                     .lock()
                     .await
                     .as_ref()
-                    .map(|(v, _)| v.clone());
+                    .map(|(v, _, _)| v.clone());
                 match classify_update(
                     pending.as_ref().map(|p| p.version.as_str()),
                     last_failed.as_deref(),
@@ -974,21 +1312,21 @@ impl UpdatesManager {
                 let in_cooldown = {
                     let guard = self.last_failed_update.lock().await;
                     failed_version_in_cooldown(
-                        guard.as_ref().map(|(v, at)| (v.as_str(), at.elapsed())),
+                        guard.as_ref().map(|(v, at, _)| (v.as_str(), at.elapsed())),
                         &update.version,
-                        UPDATE_FAILURE_COOLDOWN,
+                        guard
+                            .as_ref()
+                            .map_or(UPDATE_FAILURE_COOLDOWN, |(_, _, cooldown)| *cooldown),
                     )
                 };
                 if in_cooldown {
                     info!(
-                        "update v{} recently failed to install; skipping auto-download \
-                         (cooldown {}h) — click 'check for updates' to retry",
-                        update.version,
-                        UPDATE_FAILURE_COOLDOWN.as_secs() / 3600
+                        "update v{} is in its failure cooldown; skipping auto-download — click 'check for updates' to retry",
+                        update.version
                     );
                     if let Some(ref item) = self.update_menu_item {
                         item.set_enabled(true)?;
-                        item.set_text("Update failed — click to retry")?;
+                        crate::localization::ui_menu("Update failed — click to retry", &[], item)?;
                     }
                     return Result::Ok(false);
                 }
@@ -1000,13 +1338,14 @@ impl UpdatesManager {
                 body: update.body.clone().unwrap_or_default(),
                 downloaded: false,
                 auth_required: false,
+                persistent: enterprise_route == EnterpriseUpdateRoute::PersistentPackage,
             });
 
             let auto_update = load_auto_update_enabled(&self.app);
 
             if let Some(ref item) = self.update_menu_item {
                 item.set_enabled(true)?;
-                item.set_text(&format!("Update available: v{}", update.version))?;
+                crate::localization::ui_menu("Update available: v{value1}", &[("value1", (update.version).to_string())], item)?;
             }
 
             {
@@ -1048,7 +1387,7 @@ impl UpdatesManager {
             // the user's banner click; the frontend handler in
             // update-banner.tsx re-checks and runs downloadAndInstall itself.
             #[cfg(target_os = "windows")]
-            if !auto_update {
+            if !auto_update && enterprise_route != EnterpriseUpdateRoute::PersistentPackage {
                 info!(
                     "auto-update disabled on windows; deferring installer to user banner click (v{})",
                     update.version
@@ -1060,14 +1399,15 @@ impl UpdatesManager {
                 }
                 if let Some(ref item) = self.update_menu_item {
                     item.set_enabled(true)?;
-                    item.set_text("Restart to update")?;
+                    crate::localization::ui_menu("Restart to update", &[], item)?;
                 }
 
                 save_pre_update_version(&self.app, update.body.clone());
 
                 let update_info = serde_json::json!({
                     "version": update.version,
-                    "body": update.body.clone().unwrap_or_default()
+                    "body": update.body.clone().unwrap_or_default(),
+                    "persistent": false
                 });
                 if let Err(e) = self.app.emit("update-available", update_info) {
                     error!("Failed to emit update-available event: {}", e);
@@ -1079,8 +1419,8 @@ impl UpdatesManager {
                     let _ = app_notif
                         .notification()
                         .builder()
-                        .title("screenpipe update ready")
-                        .body(format!("v{} ready — restart to update", version_str))
+                        .title(crate::localization::ui_text("screenpipe update ready"))
+                        .body(crate::localization::ui_format("v{value1} ready — restart to update", &[("value1", (version_str).to_string())]))
                         .show();
                 });
 
@@ -1099,17 +1439,7 @@ impl UpdatesManager {
 
             if let Some(ref item) = self.update_menu_item {
                 item.set_enabled(false)?;
-                item.set_text("Downloading latest version of screenpipe")?;
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // Windows: stop screenpipe before replacing the binary
-                if let Err(err) =
-                    stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone()).await
-                {
-                    error!("Failed to stop recording before update: {}", err);
-                }
+                crate::localization::ui_menu("Downloading latest version of screenpipe", &[], item)?;
             }
 
             // Retry transient download failures with exponential backoff.
@@ -1145,40 +1475,99 @@ impl UpdatesManager {
                             info!("update download: {}%", pct);
                         }
                         if let Some(ref m) = menu_item {
-                            let _ = m.set_text(&format!("Downloading update... {}%", pct));
+                            let _ = crate::localization::ui_menu("Downloading update... {value1}%", &[("value1", (pct).to_string())], m);
                         }
                     };
                     // macOS: never install in the background. install() renames
                     // the running bundle into a temp dir, which breaks TCC
                     // attribution for the live process (ScreenCaptureKit -3801)
                     // until relaunch. Download + stage only; the install runs
-                    // on the exit path (see staged_update.rs). stage() now also
-                    // pre-extracts the ~160 MB archive (seconds of gunzip), so
+                    // on the exit path (see staged_update.rs). Persisting the
+                    // ~160 MB archive includes blocking file I/O and fsync, so
                     // it runs on the blocking pool, not an async worker.
+                    let persistent_package =
+                        enterprise_route == EnterpriseUpdateRoute::PersistentPackage;
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    let persistent_result = if persistent_package {
+                        Some(
+                            crate::enterprise_persistence::stage_update(&self.app, &update)
+                                .await
+                                .map_err(|error| {
+                                    tauri_plugin_updater::Error::Io(std::io::Error::other(error))
+                                }),
+                        )
+                    } else {
+                        None
+                    };
                     #[cfg(target_os = "macos")]
-                    let result = match update.download(on_chunk, || {}).await {
-                        Ok(bytes) => {
-                            let app = self.app.clone();
-                            let staged_update = update.clone();
-                            match tauri::async_runtime::spawn_blocking(move || {
-                                crate::staged_update::stage(&app, staged_update, &bytes)
-                            })
-                            .await
-                            {
-                                Ok(stage_result) => {
-                                    stage_result.map_err(tauri_plugin_updater::Error::Io)
-                                }
-                                Err(join_err) => {
-                                    Err(tauri_plugin_updater::Error::Io(std::io::Error::other(
-                                        format!("stage task panicked: {join_err}"),
-                                    )))
+                    let result = if let Some(result) = persistent_result {
+                        result
+                    } else {
+                        match update.download(on_chunk, || {}).await {
+                            Ok(bytes) => {
+                                let app = self.app.clone();
+                                let staged_update = update.clone();
+                                match tauri::async_runtime::spawn_blocking(move || {
+                                    crate::staged_update::stage(&app, staged_update, &bytes)
+                                })
+                                .await
+                                {
+                                    Ok(stage_result) => {
+                                        stage_result.map_err(tauri_plugin_updater::Error::Io)
+                                    }
+                                    Err(join_err) => {
+                                        Err(tauri_plugin_updater::Error::Io(std::io::Error::other(
+                                            format!("stage task panicked: {join_err}"),
+                                        )))
+                                    }
                                 }
                             }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     };
-                    #[cfg(not(target_os = "macos"))]
-                    let result = update.download_and_install(on_chunk, || {}).await;
+                    #[cfg(target_os = "windows")]
+                    let result = if let Some(result) = persistent_result {
+                        result
+                    } else {
+                        match update.download(on_chunk, || {}).await {
+                            Ok(bytes) => {
+                                if auto_update {
+                                    wait_for_meeting_restart_window(&self.app).await;
+                                }
+                                install_windows_update(
+                                    &self.app,
+                                    &update,
+                                    bytes,
+                                    AUTO_UPDATE_GATE_TIMEOUT,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                    let result = match update.download(on_chunk, || {}).await {
+                        Ok(bytes) => {
+                            // Verify the download before stopping the one server.
+                            // Preserve recording-mode update recovery behavior.
+                            let stopped = if crate::search_only::is_active() {
+                                stop_before_update(&self.app).await.map_err(std::io::Error::other)
+                            } else { Ok(()) };
+                            match stopped {
+                                Ok(()) => {
+                                    let installed = update.install(bytes);
+                                    // Linux replaces the executable in place;
+                                    // the current process continues serving until
+                                    // the later automatic or user-driven restart.
+                                    crate::search_only::cancel_restart();
+                                    crate::search_only::recover_after_failed_update(self.app.clone());
+                                    installed
+                                }
+                                Err(error) => Err(error.into()),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
 
                     match &result {
                         Ok(_) => break result,
@@ -1212,10 +1601,7 @@ impl UpdatesManager {
                                 delay.as_secs()
                             );
                             if let Some(ref item) = self.update_menu_item {
-                                let _ = item.set_text(&format!(
-                                    "Update download failed — retrying in {}s",
-                                    delay.as_secs()
-                                ));
+                                let _ = crate::localization::ui_menu("Update download failed — retrying in {value1}s", &[("value1", (delay.as_secs()).to_string())], item);
                             }
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -1234,7 +1620,7 @@ impl UpdatesManager {
                     }
                     if let Some(ref item) = self.update_menu_item {
                         item.set_enabled(true)?;
-                        item.set_text("Restart to update")?;
+                        crate::localization::ui_menu("Restart to update", &[], item)?;
                     }
                 }
                 Err(e) => {
@@ -1261,30 +1647,33 @@ impl UpdatesManager {
                             let _ = app_notif
                                 .notification()
                                 .builder()
-                                .title("screenpipe update available")
-                                .body(format!("v{} is ready — sign in to download", version_str))
+                                .title(crate::localization::ui_text("screenpipe update available"))
+                                .body(crate::localization::ui_format("v{value1} is ready — sign in to download", &[("value1", (version_str).to_string())]))
                                 .show();
                         });
                         if let Some(ref item) = self.update_menu_item {
                             item.set_enabled(true)?;
-                            item.set_text("Sign in to update")?;
+                            crate::localization::ui_menu("Sign in to update", &[], item)?;
                         }
                         return Ok(false);
                     }
                     // Generic failure (network/disk/server/signature). Clear
                     // latched state so the periodic loop and tray can retry
                     // without an app restart, and tell the user what happened.
-                    // Record the failed version so the cooldown gate above stops
-                    // us from re-downloading this same broken bundle every 5 min
-                    // (the auto-update download-loop fix).
+                    // Keep permanent failures in the long cooldown, but allow
+                    // exhausted network/server retries to recover on a later
+                    // periodic check without requiring a manual restart.
                     warn!("update download failed after retries: {}", err_str);
-                    *self.last_failed_update.lock().await =
-                        Some((update.version.clone(), std::time::Instant::now()));
+                    *self.last_failed_update.lock().await = Some((
+                        update.version.clone(),
+                        std::time::Instant::now(),
+                        update_failure_cooldown(&e),
+                    ));
                     *self.update_available.lock().await = false;
                     *self.pending_update.lock().await = None;
                     if let Some(ref item) = self.update_menu_item {
                         item.set_enabled(true)?;
-                        item.set_text("Update failed — click to retry")?;
+                        crate::localization::ui_menu("Update failed — click to retry", &[], item)?;
                     }
                     let _ = self.app.emit(
                         "update-failed",
@@ -1299,11 +1688,8 @@ impl UpdatesManager {
                         let _ = app_notif
                             .notification()
                             .builder()
-                            .title("screenpipe update failed")
-                            .body(format!(
-                                "v{} couldn't download — open screenpipe to retry",
-                                version_str
-                            ))
+                            .title(crate::localization::ui_text("screenpipe update failed"))
+                            .body(crate::localization::ui_format("v{value1} couldn't download — open screenpipe to retry", &[("value1", (version_str).to_string())]))
                             .show();
                     });
                     return Err(e.into());
@@ -1318,7 +1704,8 @@ impl UpdatesManager {
             // Emit event to frontend for in-app banner (visible if window is open)
             let update_info = serde_json::json!({
                 "version": update.version,
-                "body": update.body.clone().unwrap_or_default()
+                "body": update.body.clone().unwrap_or_default(),
+                "persistent": enterprise_route == EnterpriseUpdateRoute::PersistentPackage
             });
             if let Err(e) = self.app.emit("update-available", update_info) {
                 error!("Failed to emit update-available event: {}", e);
@@ -1330,13 +1717,13 @@ impl UpdatesManager {
                 let notification = app_notif.notification().builder();
                 let result = if auto_update {
                     notification
-                        .title("screenpipe updating")
-                        .body(format!("v{} downloaded — restarting now", version_str))
+                        .title(crate::localization::ui_text("screenpipe updating"))
+                        .body(crate::localization::ui_format("v{value1} downloaded — restarting now", &[("value1", (version_str).to_string())]))
                         .show()
                 } else {
                     notification
-                        .title("screenpipe update ready")
-                        .body(format!("v{} downloaded — restart to update", version_str))
+                        .title(crate::localization::ui_text("screenpipe update ready"))
+                        .body(crate::localization::ui_format("v{value1} downloaded — restart to update", &[("value1", (version_str).to_string())]))
                         .show()
                 };
                 if let Err(e) = result {
@@ -1350,24 +1737,17 @@ impl UpdatesManager {
                     update.version
                 );
 
-                // #3622: gate process::exit on boot-ready to avoid the ORT teardown
-                // race. In the common case boot is already ready and this returns
-                // immediately. See `await_restart_gate` for the full rationale.
-                let label = format!("auto-update v{}", update.version);
-                if !await_restart_gate(AUTO_UPDATE_GATE_TIMEOUT, &label)
+                let _ = self.app.emit(
+                    "update-restarting",
+                    serde_json::json!({ "version": update.version, "delay_secs": 30 }),
+                );
+                wait_for_meeting_restart_window(&self.app).await;
+                let Some(restart) = crate::update_restart::RESTART_SAFETY
+                    .prepare_restart(AUTO_UPDATE_GATE_TIMEOUT)
                     .await
-                    .should_restart()
-                {
+                else {
                     return Result::Ok(true);
-                }
-
-                // Only the first trigger applies; defer to an in-flight restart.
-                if UPDATE_RESTART_STARTED.swap(true, Ordering::SeqCst) {
-                    info!("auto-update: update-restart already in progress, deferring");
-                    return Result::Ok(true);
-                }
-
-                record_update_attempt(&self.app, &update.version);
+                };
 
                 let _ = self.app.emit(
                     "update-restarting",
@@ -1376,29 +1756,42 @@ impl UpdatesManager {
                         "delay_secs": 30,
                     }),
                 );
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                // Time-bounded: never let a wedged capture/audio teardown stall
-                // the relaunch (see PRE_EXIT_TEARDOWN_TIMEOUT / 2026-06-26 report).
-                match bounded_teardown(
-                    PRE_EXIT_TEARDOWN_TIMEOUT,
-                    stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone()),
-                )
-                .await
-                {
-                    TeardownOutcome::Completed => {}
-                    TeardownOutcome::Failed(err) => {
-                        error!("Failed to stop recording before auto-update: {}", err)
-                    }
-                    TeardownOutcome::TimedOut => warn!(
-                        "auto-update: teardown exceeded {}s (capture shutdown wedged) — relaunching anyway",
-                        PRE_EXIT_TEARDOWN_TIMEOUT.as_secs()
-                    ),
+                wait_for_meeting_restart_window(&self.app).await;
+
+                // Claim the restart only after the meeting wait so a manual
+                // banner/tray click can proceed while auto-update is deferred.
+                // If it already did, avoid a second teardown and relaunch.
+                if UPDATE_RESTART_STARTED.swap(true, Ordering::SeqCst) {
+                    info!("auto-update: update-restart already in progress, deferring");
+                    return Result::Ok(true);
                 }
-                crate::process_exit::request_app_relaunch(
-                    self.app.clone(),
-                    "auto-update restart",
-                    Duration::from_millis(0),
-                );
+
+                record_update_attempt(&self.app, &update.version);
+
+                let persistent_update =
+                    enterprise_route == EnterpriseUpdateRoute::PersistentPackage;
+
+                stop_before_update(&self.app)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                if persistent_update {
+                    if let Err(error) = request_persistent_update_for_restart() {
+                        UPDATE_RESTART_STARTED.store(false, Ordering::SeqCst);
+                        crate::search_only::cancel_restart();
+                        crate::search_only::recover_after_failed_update(self.app.clone());
+                        return Err(std::io::Error::other(error).into());
+                    }
+                }
+                std::mem::forget(restart);
+                if persistent_update {
+                    crate::process_exit::request_full_app_quit(self.app.clone());
+                } else {
+                    crate::process_exit::request_prepared_app_relaunch(
+                        self.app.clone(),
+                        "auto-update restart",
+                        Duration::from_millis(0),
+                    );
+                }
             }
 
             return Result::Ok(true);
@@ -1408,11 +1801,8 @@ impl UpdatesManager {
         if show_dialog {
             self.app
                 .dialog()
-                .message(format!(
-                    "you're running the latest version (v{})",
-                    self.app.package_info().version
-                ))
-                .title("screenpipe is up to date")
+                .message(crate::localization::ui_format("you're running the latest version (v{value1})", &[("value1", (self.app.package_info().version).to_string())]))
+                .title(crate::localization::ui_text("screenpipe is up to date"))
                 .buttons(MessageDialogButtons::Ok)
                 .show(|_| {});
         }
@@ -1428,7 +1818,7 @@ impl UpdatesManager {
     /// visibly acknowledged even though the whole UI is about to go away.
     pub fn set_menu_installing(&self) {
         if let Some(item) = &self.update_menu_item {
-            let _ = item.set_text("Installing update…");
+            let _ = crate::localization::ui_menu("Installing update…", &[], item);
             let _ = item.set_enabled(false);
         }
     }
@@ -1437,7 +1827,7 @@ impl UpdatesManager {
     /// user can click again.
     pub fn set_menu_restart_ready(&self) {
         if let Some(item) = &self.update_menu_item {
-            let _ = item.set_text("Restart to update");
+            let _ = crate::localization::ui_menu("Restart to update", &[], item);
             let _ = item.set_enabled(true);
         }
     }
@@ -1468,14 +1858,11 @@ impl UpdatesManager {
         let dialog = self
             .app
             .dialog()
-            .message(
-                "auto-updates are only available in the pre-built version.\n\n\
-                source builds require manual updates from github.",
-            )
-            .title("source build detected")
+            .message(crate::localization::ui_text("auto-updates are only available in the pre-built version.\n\nsource builds require manual updates from github."))
+            .title(crate::localization::ui_text("source build detected"))
             .buttons(MessageDialogButtons::OkCancelCustom(
-                "download pre-built".to_string(),
-                "view on github".to_string(),
+                crate::localization::ui_text("download pre-built"),
+                crate::localization::ui_text("view on github"),
             ));
 
         dialog.show(move |answer| {
@@ -1693,10 +2080,69 @@ pub fn start_update_check(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn consume_failed_update_fixture(root: &std::path::Path) {
+        let path = root.join(super::UPDATE_ATTEMPT_MARKER_FILE);
+        std::fs::write(
+            &path,
+            r#"{"from_version":"1.0.0","to_version":"99.0.0","ts_epoch_secs":1,"home_visible":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::update_startup_home_visibility_at(&path, "1.0.0"),
+            Some(false)
+        );
+        assert!(super::consume_update_attempt_at(&path, "1.0.0").is_some());
+        assert!(!path.exists());
+        assert!(super::consume_update_attempt_at(&path, "1.0.0").is_none());
+    }
+
     use super::*;
 
     const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn update_home_visibility_survives_restart_and_is_consumed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(UPDATE_ATTEMPT_MARKER_FILE);
+        for visible in [false, true] {
+            for running in ["2.6.6", "2.6.7"] {
+                let attempt = UpdateAttempt {
+                    from_version: "2.6.6".into(),
+                    to_version: "2.6.7".into(),
+                    ts_epoch_secs: 1,
+                    home_visible: Some(visible),
+                };
+                std::fs::write(&path, serde_json::to_vec(&attempt).unwrap()).unwrap();
+                assert_eq!(
+                    update_startup_home_visibility_at(&path, running),
+                    Some(visible)
+                );
+                assert_eq!(
+                    consume_update_attempt_at(&path, running).is_some(),
+                    running == "2.6.6",
+                    "window restoration must preserve failed-install detection"
+                );
+                assert_eq!(update_startup_home_visibility_at(&path, running), None);
+            }
+        }
+    }
+
+    #[test]
+    fn update_home_visibility_keeps_normal_startup_for_old_invalid_or_unrelated_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(UPDATE_ATTEMPT_MARKER_FILE);
+        assert_eq!(update_startup_home_visibility_at(&path, "2.6.7"), None);
+        for raw in [
+            r#"{"from_version":"2.6.6","to_version":"2.6.7","ts_epoch_secs":1}"#,
+            r#"{"from_version":"2.6.5","to_version":"2.6.6","ts_epoch_secs":1,"home_visible":false}"#,
+            "{truncated",
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            assert_eq!(update_startup_home_visibility_at(&path, "2.6.7"), None);
+        }
+    }
 
     #[test]
     fn sweep_removes_installer_leftovers_only() {
@@ -1751,6 +2197,74 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn interrupted_download_recovers_on_a_later_automatic_check() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\npartial",
+                )
+                .await
+                .unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/update.tar.gz"))
+            .await
+            .unwrap();
+        let error = tauri_plugin_updater::Error::Reqwest(response.bytes().await.unwrap_err());
+        server.await.unwrap();
+        let cooldown = update_failure_cooldown(&error);
+        assert!(failed_version_in_cooldown(
+            Some(("2.7.63", Duration::from_secs(5 * 60))),
+            "2.7.63",
+            cooldown
+        ));
+        assert!(
+            !failed_version_in_cooldown(
+                Some(("2.7.63", Duration::from_secs(15 * 60))),
+                "2.7.63",
+                cooldown
+            ),
+            "a broken archive stream must not suppress automatic recovery for six hours"
+        );
+    }
+
+    #[test]
+    fn download_server_failures_have_a_short_bounded_cooldown() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            let error = tauri_plugin_updater::Error::Network(format!(
+                "Download request failed with status: {status} temporary"
+            ));
+            assert_eq!(
+                update_failure_cooldown(&error),
+                Duration::from_secs(15 * 60)
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_download_and_install_errors_keep_the_long_cooldown() {
+        use tauri_plugin_updater::Error;
+        for error in [
+            Error::Network("Download request failed with status: 401 Unauthorized".into()),
+            Error::Network("Download request failed with status: 403 Forbidden".into()),
+            Error::Network("Download request failed with status: 404 Not Found".into()),
+            Error::Network("unrecognized failure".into()),
+            Error::SignatureUtf8("invalid signature".into()),
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot stage archive",
+            )),
+        ] {
+            assert_eq!(update_failure_cooldown(&error), UPDATE_FAILURE_COOLDOWN);
+        }
+    }
+
     #[test]
     fn cooldown_ignores_a_newer_version() {
         // A newer version than the one that failed must download immediately.
@@ -1779,6 +2293,44 @@ mod tests {
             "2.5.57",
             UPDATE_FAILURE_COOLDOWN
         ));
+    }
+
+    #[test]
+    fn failed_install_marker_arms_the_existing_cooldown_on_boot() {
+        let attempt = UpdateAttempt {
+            from_version: "2.6.77".into(),
+            to_version: "2.6.81".into(),
+            ts_epoch_secs: 0,
+            home_visible: None,
+        };
+        let cooldown = cooldown_from_failed_attempt(Some(&attempt));
+        assert!(failed_version_in_cooldown(
+            cooldown
+                .as_ref()
+                .map(|(version, started, _)| (version.as_str(), started.elapsed())),
+            "2.6.81",
+            UPDATE_FAILURE_COOLDOWN,
+        ));
+    }
+
+    #[test]
+    fn protected_macos_launch_locations_cannot_self_update() {
+        assert!(macos_update_location_is_protected(Path::new(
+            "/private/var/folders/xx/T/AppTranslocation/UUID/d/screenpipe.app/Contents/MacOS/screenpipe-app"
+        )));
+        assert!(macos_update_location_is_protected(Path::new(
+            "/Volumes/screenpipe/screenpipe.app/Contents/MacOS/screenpipe-app"
+        )));
+    }
+
+    #[test]
+    fn installed_macos_launch_locations_remain_updateable() {
+        assert!(!macos_update_location_is_protected(Path::new(
+            "/Applications/screenpipe.app/Contents/MacOS/screenpipe-app"
+        )));
+        assert!(!macos_update_location_is_protected(Path::new(
+            "/Users/ezra/Applications/screenpipe.app/Contents/MacOS/screenpipe-app"
+        )));
     }
 
     #[test]
@@ -1863,6 +2415,26 @@ mod tests {
     }
 
     #[test]
+    fn old_settings_use_stable_update_channel() {
+        assert_eq!(consumer_update_channel(None), "stable");
+        assert!(
+            consumer_update_endpoint(consumer_update_channel(None)).contains("/app-update/stable/")
+        );
+    }
+
+    #[test]
+    fn selected_pre_release_changes_only_the_channel_path() {
+        let mut settings = SettingsStore::default();
+        settings.update_channel = "pre-release".to_string();
+
+        assert_eq!(consumer_update_channel(Some(&settings)), "pre-release");
+        assert_eq!(
+            consumer_update_endpoint("pre-release"),
+            "https://screenpipe.com/api/app-update/pre-release/{{target}}-{{arch}}/{{current_version}}"
+        );
+    }
+
+    #[test]
     fn auto_update_setting_respects_true() {
         let mut settings = SettingsStore::default();
         settings.auto_update = true;
@@ -1897,6 +2469,50 @@ mod tests {
         assert!(!resolve_auto_update_enabled(false, true, true));
         // and an explicitly-on setting is still honored
         assert!(resolve_auto_update_enabled(true, true, true));
+    }
+
+    #[test]
+    fn persistent_enterprise_package_uses_privileged_updates_when_self_managed() {
+        assert_eq!(
+            enterprise_update_route_for(None, false, true),
+            EnterpriseUpdateRoute::PersistentPackage
+        );
+        assert_eq!(
+            enterprise_update_route_for(Some("screenpipe"), false, true),
+            EnterpriseUpdateRoute::PersistentPackage
+        );
+        assert_eq!(
+            enterprise_update_route_for(Some("auto_detect"), false, true),
+            EnterpriseUpdateRoute::PersistentPackage
+        );
+        assert_eq!(
+            enterprise_update_route_for(Some("auto_detect"), true, true),
+            EnterpriseUpdateRoute::ExternalManager
+        );
+        assert_eq!(
+            enterprise_update_route_for(Some("manual"), false, true),
+            EnterpriseUpdateRoute::ExternalManager
+        );
+    }
+
+    #[test]
+    fn ordinary_enterprise_update_policy_is_unchanged() {
+        assert_eq!(
+            enterprise_update_route_for(None, false, false),
+            EnterpriseUpdateRoute::Tauri
+        );
+        assert_eq!(
+            enterprise_update_route_for(Some("screenpipe"), true, false),
+            EnterpriseUpdateRoute::Tauri
+        );
+        assert_eq!(
+            enterprise_update_route_for(Some("auto_detect"), true, false),
+            EnterpriseUpdateRoute::ExternalManager
+        );
+        assert_eq!(
+            enterprise_update_route_for(Some("manual"), false, false),
+            EnterpriseUpdateRoute::ExternalManager
+        );
     }
 
     #[test]
@@ -1984,6 +2600,7 @@ mod tests {
             from_version: "2.6.6".into(),
             to_version: "2.6.7".into(),
             ts_epoch_secs: 0,
+            home_visible: None,
         };
         // Still on the version we tried to leave → the install didn't apply.
         assert_eq!(

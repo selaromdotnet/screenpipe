@@ -19,7 +19,7 @@ use super::response_format::{
 /// Extracts an optional `Arc<PipePermissions>` from request extensions.
 /// Wrapper exists because `Option<Extension<T>>` falls back to oasgen's
 /// `impl<A: OaSchema> OaParameter for A` and `Extension<T>` is not OaSchema.
-pub(crate) struct OptionalPipePerms(Option<std::sync::Arc<PipePermissions>>);
+pub(crate) struct OptionalPipePerms(pub(crate) Option<std::sync::Arc<PipePermissions>>);
 
 impl<S: Send + Sync> FromRequestParts<S> for OptionalPipePerms {
     type Rejection = std::convert::Infallible;
@@ -68,6 +68,7 @@ use tokio::{
 use tracing::{debug, error, warn};
 
 use crate::analytics;
+use crate::history_access::HistoryAccessPolicy;
 use crate::server::AppState;
 use crate::video_utils::extract_frame;
 
@@ -121,6 +122,11 @@ impl SearchContentType {
 #[derive(OaSchema, Deserialize)]
 pub(crate) struct SearchQuery {
     q: Option<String>,
+    /// Restrict retrieval to a saved starred interval.
+    starred_session_id: Option<String>,
+    /// Restrict captures to the union of starred intervals before pagination.
+    #[serde(default)]
+    starred_only: bool,
     #[serde(flatten)]
     pagination: PaginationQuery,
     #[serde(default)]
@@ -391,8 +397,30 @@ fn parse_flexible_bool(s: &str) -> Result<bool, String> {
 }
 
 #[derive(OaSchema, Serialize, Deserialize, Clone)]
+pub struct StarredSearchHit {
+    #[serde(flatten)]
+    pub item: ContentItem,
+    /// User marked this capture's timestamp as important. Not an accuracy score.
+    /// Omitted when optional star metadata is unavailable, never guessed false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starred: Option<bool>,
+}
+
+fn captured_at(item: &ContentItem) -> String {
+    let timestamp = match item {
+        ContentItem::OCR(s) => Some(s.timestamp),
+        ContentItem::Audio(s) => Some(s.timestamp),
+        ContentItem::UI(s) => Some(s.timestamp),
+        ContentItem::Input(s) => Some(s.timestamp),
+        ContentItem::Parsed(s) => Some(s.timestamp),
+        ContentItem::Memory(_) => None,
+    };
+    timestamp.map(super::starred::stamp).unwrap_or_default()
+}
+
+#[derive(OaSchema, Serialize, Deserialize, Clone)]
 pub struct SearchResponse {
-    pub data: Vec<ContentItem>,
+    pub data: Vec<StarredSearchHit>,
     pub pagination: PaginationInfo,
     /// Metadata about cloud search availability (only present when cloud sync is available)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -552,6 +580,7 @@ fn capture_direct_api_search_value(client: &ExplicitApiClient, result_count: usi
             "qualified_value_event",
             crate::qualified_value::api_outcome_properties(
                 crate::qualified_value::ApiOutcomeKind::SearchResult,
+                client.agent_client(),
             ),
         );
     }
@@ -857,6 +886,8 @@ fn deduplicate_ocr_and_ui(content_items: &mut Vec<ContentItem>) {
 pub(crate) fn compute_search_cache_key(query: &SearchQuery) -> u64 {
     let mut hasher = DefaultHasher::new();
     query.q.hash(&mut hasher);
+    query.starred_session_id.hash(&mut hasher);
+    query.starred_only.hash(&mut hasher);
     query.pagination.limit.hash(&mut hasher);
     query.pagination.offset.hash(&mut hasher);
     format!("{:?}", query.content_type).hash(&mut hasher);
@@ -967,6 +998,60 @@ fn try_acquire_search_permit(semaphore: Arc<Semaphore>) -> Option<OwnedSemaphore
     semaphore.try_acquire_owned().ok()
 }
 
+/// Apply the live account history policy to a search range.
+///
+/// Returns `true` when the requested range ends wholly before the accessible
+/// boundary. Callers can then return an empty result without touching the DB.
+fn apply_search_history_access(
+    policy: &HistoryAccessPolicy,
+    start_time: &mut Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(cutoff) = policy.cutoff(now) else {
+        return false;
+    };
+
+    *start_time = Some(start_time.map_or(cutoff, |start| start.max(cutoff)));
+    end_time.is_some_and(|end| end < cutoff)
+}
+
+fn apply_search_query_history_access(
+    policy: &HistoryAccessPolicy,
+    query: &mut SearchQuery,
+    now: DateTime<Utc>,
+) -> bool {
+    let wholly_before_cutoff =
+        apply_search_history_access(policy, &mut query.start_time, query.end_time, now);
+    if policy.is_restricted() {
+        // `related_tags` currently aggregates across all retained data and has
+        // no time-bound form. Omit it rather than leak older tag associations.
+        query.include_related = false;
+    }
+    wholly_before_cutoff
+}
+
+fn empty_search_response(
+    query: &SearchQuery,
+    format: OutputFormat,
+    fields: &Option<Vec<String>>,
+) -> Response<Body> {
+    render_search(
+        format,
+        fields,
+        &SearchResponse {
+            data: Vec::new(),
+            pagination: PaginationInfo {
+                limit: query.pagination.limit,
+                offset: query.pagination.offset,
+                total: 0,
+            },
+            cloud: None,
+            related: None,
+        },
+    )
+}
+
 // Update the search function
 #[oasgen]
 pub(crate) async fn search(
@@ -987,6 +1072,7 @@ pub(crate) async fn search(
         .as_ref()
         .map(|permissions| permissions.has_data_restrictions())
         .unwrap_or(false);
+    let history_restricted = state.history_access.is_restricted();
 
     // Server-authoritative permission validation and privacy filter: if the request comes from a
     // pipe whose manifest declares `privacy_filter: true`, force PII
@@ -1004,6 +1090,76 @@ pub(crate) async fn search(
             query.filter_pii = true;
         }
     }
+
+    let parsed_search = query.content_type == SearchContentType::Parsed;
+    if !parsed_search && (query.frame_id.is_some() || query.actor_id.is_some()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({
+                "error": "frame_id and actor_id require content_type=parsed",
+            })),
+        ));
+    }
+    if parsed_search && query.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({
+                "error": "tags are not supported for content_type=parsed",
+            })),
+        ));
+    }
+
+    if let Some(id) = &query.starred_session_id {
+        let session = state
+            .db
+            .get_starred_session(id)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error":"could not load starred interval"})),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    JsonResponse(json!({"error":"starred session not found"})),
+                )
+            })?;
+        let start = DateTime::parse_from_rfc3339(&session.start)
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error":"invalid saved interval"})),
+                )
+            })?
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339(&session.end)
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error":"invalid saved interval"})),
+                )
+            })?
+            .with_timezone(&Utc);
+        query.start_time = Some(query.start_time.map_or(start, |s| s.max(start)));
+        // Existing search predicates are inclusive; starred intervals are [start,end).
+        let last_included = end - chrono::Duration::nanoseconds(1);
+        query.end_time = Some(
+            query
+                .end_time
+                .map_or(last_included, |e| e.min(last_included)),
+        );
+        if query.start_time > query.end_time {
+            return Ok(empty_search_response(&query, format, &fields));
+        }
+    }
+    let wholly_before_history_cutoff =
+        apply_search_query_history_access(&state.history_access, &mut query, Utc::now());
+    if wholly_before_history_cutoff {
+        return Ok(empty_search_response(&query, format, &fields));
+    }
+
     debug!(
         "received search request: query='{}', content_type={:?}, limit={}, offset={}, start_time={:?}, end_time={:?}, app_name={:?}, window_name={:?}, min_length={:?}, max_length={:?}, speaker_ids={:?}, frame_name={:?}, browser_url={:?}, focused={:?}",
         query.q.as_deref().unwrap_or(""),
@@ -1023,11 +1179,29 @@ pub(crate) async fn search(
     );
 
     // Check cache first (only for queries without frame extraction)
-    let cache_key = compute_search_cache_key(&query);
-    if !query.include_frames && cacheable_render && !pipe_data_restricted {
+    let storage_read = state.db.storage_read_token().await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            JsonResponse(json!({"error":e.to_string()})),
+        )
+    })?;
+    let cache_key = compute_search_cache_key(&query)
+        ^ (storage_read.revision as u64).rotate_left(17)
+        ^ state
+            .starred_revision
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .rotate_left(37);
+
+    if !history_restricted && !query.include_frames && cacheable_render && !pipe_data_restricted {
         if let Some(cached) = state.search_cache.get(&cache_key).await {
             debug!("search cache hit for key {}", cache_key);
             capture_direct_api_search_value(&api_client, cached.result_count);
+            let _admission = storage_read.admit(&state.db.pool).await.map_err(|e| {
+                (
+                    StatusCode::CONFLICT,
+                    JsonResponse(json!({"error":e.to_string()})),
+                )
+            })?;
             return Ok(render_cached_search(&cached));
         }
     }
@@ -1047,23 +1221,6 @@ pub(crate) async fn search(
     let query_str = query.q.as_deref().unwrap_or("");
 
     let tags = query.tags.as_deref().unwrap_or(&[]);
-    let parsed_search = query.content_type == SearchContentType::Parsed;
-    if !parsed_search && (query.frame_id.is_some() || query.actor_id.is_some()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            JsonResponse(json!({
-                "error": "frame_id and actor_id require content_type=parsed",
-            })),
-        ));
-    }
-    if parsed_search && !tags.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            JsonResponse(json!({
-                "error": "tags are not supported for content_type=parsed",
-            })),
-        ));
-    }
 
     enum SearchPage {
         Standard(Vec<SearchResult>),
@@ -1074,21 +1231,27 @@ pub(crate) async fn search(
     // unbounded scan beside the page query. Serial execution halves the number
     // of simultaneous SQLite statements per admitted request while the outer
     // deadline still covers the complete operation.
-    let search_and_count = async {
+    let query = &query;
+    let state = &state;
+    let search_range = |range_start, range_end, page_limit, page_offset| async move {
         if parsed_search {
             let parsed_query = SemanticContextQuery {
                 frame_id: query.frame_id,
                 q: query.q.clone(),
-                start_time: query.start_time,
-                end_time: query.end_time,
+                start_time: range_start,
+                end_time: range_end,
                 app_name: query.app_name.clone(),
                 window_name: query.window_name.clone(),
                 actor_id: query.actor_id,
-                limit: query.pagination.limit,
-                offset: query.pagination.offset,
+                limit: page_limit,
+                offset: page_offset,
                 order: query.order,
             };
-            let results = state.db.search_semantic_context(&parsed_query).await?;
+            let results = if page_limit == 0 {
+                Vec::new()
+            } else {
+                state.db.search_semantic_context(&parsed_query).await?
+            };
             let total = state.db.count_semantic_context(&parsed_query).await?;
             return Ok::<_, sqlx::Error>((SearchPage::Parsed(results), total));
         }
@@ -1097,39 +1260,43 @@ pub(crate) async fn search(
             .content_type
             .database_type()
             .expect("non-parsed search type must map to a database content type");
-        let results = state
-            .db
-            .search_with_tags_ordered_lightweight(
-                query_str,
-                content_type.clone(),
-                query.pagination.limit,
-                query.pagination.offset,
-                query.start_time,
-                query.end_time,
-                query.app_name.as_deref(),
-                query.window_name.as_deref(),
-                query.min_length,
-                query.max_length,
-                query.speaker_ids.clone(),
-                query.frame_name.as_deref(),
-                query.browser_url.as_deref(),
-                query.focused,
-                query.speaker_name.as_deref(),
-                query.device_name.as_deref(),
-                query.machine_id.as_deref(),
-                query.on_screen,
-                query.input_context_only,
-                tags,
-                query.order,
-            )
-            .await?;
+        let results = if page_limit == 0 {
+            Vec::new()
+        } else {
+            state
+                .db
+                .search_with_tags_ordered_lightweight(
+                    query_str,
+                    content_type.clone(),
+                    page_limit,
+                    page_offset,
+                    range_start,
+                    range_end,
+                    query.app_name.as_deref(),
+                    query.window_name.as_deref(),
+                    query.min_length,
+                    query.max_length,
+                    query.speaker_ids.clone(),
+                    query.frame_name.as_deref(),
+                    query.browser_url.as_deref(),
+                    query.focused,
+                    query.speaker_name.as_deref(),
+                    query.device_name.as_deref(),
+                    query.machine_id.as_deref(),
+                    query.on_screen,
+                    query.input_context_only,
+                    tags,
+                    query.order,
+                )
+                .await?
+        };
         let total = state
             .db
             .count_search_results_with_tags_filtered(
                 query_str,
                 content_type,
-                query.start_time,
-                query.end_time,
+                range_start,
+                range_end,
                 query.app_name.as_deref(),
                 query.window_name.as_deref(),
                 query.min_length,
@@ -1147,6 +1314,78 @@ pub(crate) async fn search(
         Ok::<_, sqlx::Error>((SearchPage::Standard(results), total))
     };
 
+    let search_and_count = async {
+        if !query.starred_only {
+            return search_range(
+                query.start_time,
+                query.end_time,
+                query.pagination.limit,
+                query.pagination.offset,
+            )
+            .await;
+        }
+        let mut page = if parsed_search {
+            SearchPage::Parsed(Vec::new())
+        } else {
+            SearchPage::Standard(Vec::new())
+        };
+        // Memories have no captured timestamp and never count as starred evidence.
+        if query.content_type == SearchContentType::Memory {
+            return Ok((page, 0));
+        }
+        let lower = query.start_time.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+        let upper = query.end_time.unwrap_or_else(Utc::now);
+        // Session stamps use millisecond precision. Bounds are intersected again
+        // below to preserve a caller's higher-precision start/end filters.
+        let mut ranges = state
+            .db
+            .starred_search_ranges(
+                &super::starred::stamp(lower),
+                &super::starred::stamp(
+                    upper
+                        .checked_add_signed(chrono::Duration::milliseconds(1))
+                        .unwrap_or(upper),
+                ),
+            )
+            .await?;
+        if ranges.len() > 100 {
+            return Err(sqlx::Error::InvalidArgument("starred search covers more than 100 disjoint intervals; narrow start_time/end_time".into()));
+        }
+        if matches!(query.order, Order::Descending) {
+            ranges.reverse();
+        }
+        let mut total = 0;
+        let mut offset = query.pagination.offset;
+        let mut limit = query.pagination.limit;
+        for (start, end) in ranges {
+            let parse = |s: &str| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|t| t.with_timezone(&Utc))
+                    .map_err(|e| sqlx::Error::Protocol(e.to_string()))
+            };
+            let start = parse(&start)?.max(lower);
+            let end = (parse(&end)? - chrono::Duration::nanoseconds(1)).min(upper);
+            if start > end {
+                continue;
+            }
+            let (found, count) = search_range(Some(start), Some(end), limit, offset).await?;
+            total += count;
+            offset = offset.saturating_sub(count.min(u32::MAX as usize) as u32);
+            match (&mut page, found) {
+                (SearchPage::Standard(rows), SearchPage::Standard(mut found)) => {
+                    limit = limit.saturating_sub(found.len() as u32);
+                    rows.append(&mut found);
+                }
+                (SearchPage::Parsed(rows), SearchPage::Parsed(mut found)) => {
+                    limit = limit.saturating_sub(found.len() as u32);
+                    rows.append(&mut found);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok((page, total))
+    };
+
     let database_result = match timeout(Duration::from_secs(30), search_and_count).await {
         Ok(result) => result,
         Err(_) => {
@@ -1157,6 +1396,12 @@ pub(crate) async fn search(
 
     let (results, mut total) = match database_result {
         Ok(result) => result,
+        Err(sqlx::Error::InvalidArgument(message)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": message})),
+            ));
+        }
         Err(error) => {
             if let Some(response) = classified_search_database_response(&error) {
                 warn!("search database operation was interrupted or resource-limited: {error}");
@@ -1395,30 +1640,39 @@ pub(crate) async fn search(
 
     debug!("search completed: found {} results", total);
 
+    // Only repetitive, unattributed API diagnostics are sampled. App/MCP and
+    // named-agent searches keep their existing events and occurrence timestamps.
+    // All requests still contribute to api_usage_5min; qualified outcomes are
+    // independent. Decide before building the diagnostic payload or spawning.
+    let sampled = api_client.sample_search_diagnostics();
     let response_non_empty = !content_items.is_empty();
-    let parsed_parser_profiles = if parsed_search {
-        parsed_parser_profiles(&content_items)
-    } else {
-        Vec::new()
-    };
+    if analytics::should_capture_search(sampled, parsed_search, response_non_empty) {
+        let parsed_parser_profiles = if parsed_search {
+            parsed_parser_profiles(&content_items)
+        } else {
+            Vec::new()
+        };
 
-    // Track search analytics
-    analytics::capture_event_nonblocking(
-        "search_performed",
-        serde_json::json!({
-            "query_length": query.q.as_ref().map(|q| q.len()).unwrap_or(0),
-            "content_type": format!("{:?}", query.content_type),
-            "request_source": api_client.source_label(),
-            "has_date_filter": query.start_time.is_some() || query.end_time.is_some(),
-            "has_app_filter": query.app_name.is_some(),
-            "result_count": total,
-            "non_empty": response_non_empty,
-            "parsed_non_empty": parsed_search && response_non_empty,
-            "parsed_parser_profiles": parsed_parser_profiles,
-            "limit": query.pagination.limit,
-            "offset": query.pagination.offset,
-        }),
-    );
+        analytics::capture_event_nonblocking(
+            "search_performed",
+            serde_json::json!({
+                "telemetry_sample_interval_seconds": if sampled { analytics::SEARCH_REPORT_INTERVAL.as_secs() } else { 0 },
+                "telemetry_sampling": if sampled { "first_per_interval_per_result_kind" } else { "none" },
+                "query_length": query.q.as_ref().map(|q| q.len()).unwrap_or(0),
+                "content_type": format!("{:?}", query.content_type),
+                "request_source": api_client.source_label(),
+                "agent_client": api_client.agent_client().as_str(),
+                "has_date_filter": query.start_time.is_some() || query.end_time.is_some(),
+                "has_app_filter": query.app_name.is_some(),
+                "result_count": total,
+                "non_empty": response_non_empty,
+                "parsed_non_empty": parsed_search && response_non_empty,
+                "parsed_parser_profiles": parsed_parser_profiles,
+                "limit": query.pagination.limit,
+                "offset": query.pagination.offset,
+            }),
+        );
+    }
 
     // Get cloud search metadata
     let time_range = match (query.start_time, query.end_time) {
@@ -1434,8 +1688,39 @@ pub(crate) async fn search(
         None
     };
 
+    let timestamps: Vec<_> = content_items.iter().map(captured_at).collect();
+    // Stars annotate these results; failure must not hide already-retrieved
+    // recordings from chat or workflow evidence research. Explicit star filters
+    // are resolved above and still fail rather than broadening the search.
+    let starred = match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        state.db.starred_timestamps(&timestamps),
+    )
+    .await
+    {
+        Ok(Ok(starred)) => Some(starred),
+        Ok(Err(error)) => {
+            warn!(%error, "search returned recordings without optional star metadata");
+            None
+        }
+        Err(_) => {
+            warn!("search star metadata timed out; returning recordings without annotations");
+            None
+        }
+    };
+    let starred_metadata_available = starred.is_some();
     let response = SearchResponse {
-        data: content_items,
+        data: content_items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| StarredSearchHit {
+                item,
+                starred: starred
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .copied(),
+            })
+            .collect(),
         pagination: PaginationInfo {
             limit: query.pagination.limit,
             offset: query.pagination.offset,
@@ -1447,28 +1732,47 @@ pub(crate) async fn search(
 
     capture_direct_api_search_value(&api_client, response.data.len());
 
-    // Cache the result (only for queries without frame extraction). Cache hits
-    // serve the pre-serialized JSON bytes directly for the common response
-    // shape, avoiding repeated deep clones of text-heavy search payloads.
-    if !query.include_frames && cacheable_render && !pipe_data_restricted {
-        if let Some(cache_entry) = build_search_cache_entry(&response) {
-            let rendered = render_cached_search(&cache_entry);
-            state
-                .search_cache
-                .insert(cache_key, Arc::new(cache_entry))
-                .await;
-            return Ok(rendered);
-        }
+    let cache_entry = if !history_restricted
+        && starred_metadata_available
+        && !query.include_frames
+        && cacheable_render
+        && !pipe_data_restricted
+    {
+        build_search_cache_entry(&response)
+    } else {
+        None
+    };
+    let rendered = if let Some(entry) = &cache_entry {
+        render_cached_search(entry)
+    } else {
+        render_search(format, &fields, &response)
+    };
+    let _admission = storage_read.admit(&state.db.pool).await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            JsonResponse(json!({"error":e.to_string()})),
+        )
+    })?;
+    if let Some(entry) = cache_entry {
+        state.search_cache.insert(cache_key, Arc::new(entry)).await;
     }
-
-    Ok(render_search(format, &fields, &response))
+    Ok(rendered)
 }
 
 #[oasgen]
 pub(crate) async fn keyword_search_handler(
-    Query(query): Query<KeywordSearchRequest>,
+    Query(mut query): Query<KeywordSearchRequest>,
     State(state): State<Arc<AppState>>,
 ) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    if apply_search_history_access(
+        &state.history_access,
+        &mut query.start_time,
+        query.end_time,
+        Utc::now(),
+    ) {
+        return Ok(JsonResponse(json!([])));
+    }
+
     if query.group {
         let groups = state
             .db
@@ -1638,6 +1942,8 @@ mod tests {
 
     fn search_query(content_type: SearchContentType, app_name: Option<&str>) -> SearchQuery {
         SearchQuery {
+            starred_session_id: None,
+            starred_only: false,
             q: None,
             pagination: PaginationQuery {
                 limit: 20,
@@ -1671,6 +1977,89 @@ mod tests {
             format: None,
             fields: None,
         }
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        "2026-08-24T20:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn restricted_search_clamps_missing_and_old_starts() {
+        let policy = HistoryAccessPolicy::last_24_hours();
+        let cutoff = fixed_now() - chrono::Duration::hours(24);
+
+        let mut missing = None;
+        assert!(!apply_search_history_access(
+            &policy,
+            &mut missing,
+            None,
+            fixed_now(),
+        ));
+        assert_eq!(missing, Some(cutoff));
+
+        let mut old = Some(fixed_now() - chrono::Duration::days(30));
+        assert!(!apply_search_history_access(
+            &policy,
+            &mut old,
+            None,
+            fixed_now(),
+        ));
+        assert_eq!(old, Some(cutoff));
+    }
+
+    #[test]
+    fn restricted_search_preserves_recent_start_and_marks_wholly_old_ranges_empty() {
+        let policy = HistoryAccessPolicy::last_24_hours();
+        let recent = fixed_now() - chrono::Duration::hours(2);
+        let mut start = Some(recent);
+        assert!(!apply_search_history_access(
+            &policy,
+            &mut start,
+            Some(fixed_now()),
+            fixed_now(),
+        ));
+        assert_eq!(start, Some(recent));
+
+        let mut old_start = Some(fixed_now() - chrono::Duration::days(7));
+        assert!(apply_search_history_access(
+            &policy,
+            &mut old_start,
+            Some(fixed_now() - chrono::Duration::days(2)),
+            fixed_now(),
+        ));
+    }
+
+    #[test]
+    fn unrestricted_search_preserves_range_and_related_tags() {
+        let policy = HistoryAccessPolicy::unrestricted();
+        let old = fixed_now() - chrono::Duration::days(30);
+        let mut query = search_query(SearchContentType::All, None);
+        query.start_time = Some(old);
+        query.end_time = Some(fixed_now() - chrono::Duration::days(29));
+        query.include_related = true;
+
+        assert!(!apply_search_query_history_access(
+            &policy,
+            &mut query,
+            fixed_now(),
+        ));
+        assert_eq!(query.start_time, Some(old));
+        assert!(query.include_related);
+    }
+
+    #[test]
+    fn restricted_search_suppresses_all_time_related_tag_expansion() {
+        let policy = HistoryAccessPolicy::last_24_hours();
+        let mut query = search_query(SearchContentType::All, None);
+        query.tags = Some(vec!["project:atlas".to_string()]);
+        query.include_related = true;
+
+        assert!(!apply_search_query_history_access(
+            &policy,
+            &mut query,
+            fixed_now(),
+        ));
+        assert!(!query.include_related);
     }
 
     #[derive(Debug)]
@@ -2108,6 +2497,8 @@ mod tests {
     fn test_search_cache_key_deterministic() {
         // Same query should produce same cache key
         let query1 = SearchQuery {
+            starred_session_id: None,
+            starred_only: false,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2143,6 +2534,8 @@ mod tests {
         };
 
         let query2 = SearchQuery {
+            starred_session_id: None,
+            starred_only: false,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2186,6 +2579,8 @@ mod tests {
     #[test]
     fn test_search_cache_key_differs_for_different_queries() {
         let query1 = SearchQuery {
+            starred_session_id: None,
+            starred_only: false,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2221,6 +2616,8 @@ mod tests {
         };
 
         let query2 = SearchQuery {
+            starred_session_id: None,
+            starred_only: false,
             q: Some("different".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2271,6 +2668,8 @@ mod tests {
     #[test]
     fn test_search_cache_key_distinguishes_on_screen() {
         let mk = |on_screen: Option<bool>| SearchQuery {
+            starred_session_id: None,
+            starred_only: false,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2317,6 +2716,8 @@ mod tests {
     #[test]
     fn test_search_cache_key_distinguishes_include_related() {
         let mk = |include_related: bool| SearchQuery {
+            starred_session_id: None,
+            starred_only: false,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2411,8 +2812,14 @@ mod tests {
                 updated_at: "2026-06-30T00:00:00Z".to_string(),
             })
         };
-        let response = |data| SearchResponse {
-            data,
+        let response = |data: Vec<ContentItem>| SearchResponse {
+            data: data
+                .into_iter()
+                .map(|item| StarredSearchHit {
+                    item,
+                    starred: Some(false),
+                })
+                .collect(),
             pagination: PaginationInfo {
                 limit: 20,
                 offset: 0,
@@ -2480,5 +2887,34 @@ mod tests {
         let result = truncate_middle(text, 10);
         assert!(result.chars().count() > 10); // marker adds chars, but original content is truncated
         assert!(result.contains("...(truncated"));
+    }
+}
+
+/// A response shares one snapshot across candidate selection, pagination counts,
+/// and payload hydration. WebSocket history reads own their scope in the DB.
+pub(crate) async fn storage_snapshot_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = request.uri().path();
+    let read = (request.method() == axum::http::Method::GET
+        && (matches!(path, "/search" | "/search/keyword" | "/elements")
+            || (path.starts_with("/frames/")
+                && ["/text", "/ocr", "/context", "/metadata", "/elements"]
+                    .iter()
+                    .any(|suffix| path.ends_with(suffix)))))
+        || (request.method() == axum::http::Method::POST && path == "/raw_sql");
+    if !read {
+        return next.run(request).await;
+    }
+    match state.db.read_snapshot(next.run(request)).await {
+        Ok(response) => response,
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
     }
 }

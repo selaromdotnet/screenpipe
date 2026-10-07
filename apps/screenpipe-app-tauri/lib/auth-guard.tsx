@@ -4,6 +4,7 @@
 
 "use client";
 
+import { T, useGT } from "gt-react";
 import React, { useEffect, useRef, useCallback } from "react";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { toast } from "@/components/ui/use-toast";
@@ -47,21 +48,22 @@ function openLogin() {
   });
 }
 
+function SignedOutToastAction() {
+  const ui = useGT();
+  return <ToastAction altText={ui("Sign in to screenpipe")} onClick={openLogin}>Sign in</ToastAction>;
+}
+
 function showSignedOutToast() {
   const now = Date.now();
   if (now - lastToastTime < TOAST_COOLDOWN_MS) return;
   lastToastTime = now;
 
   toast({
-    title: "session expired",
-    description: "sign in again before recording can continue.",
+    title: <T>Session expired</T>,
+    description: <T>Sign in again before recording can continue.</T>,
     variant: "destructive",
     duration: 30000,
-    action: (
-      <ToastAction altText="Sign in to screenpipe" onClick={openLogin}>
-        sign in
-      </ToastAction>
-    ),
+    action: <SignedOutToastAction />,
   });
 }
 
@@ -213,6 +215,11 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
       // must never clear the account. Anything else
       // (network blip, 5xx) is silent — retry on the next interval.
       if (msg.includes(" 401 ")) {
+        // The request may have started for account A and completed after a
+        // login/account switch installed account B. loadUser already refuses
+        // to clear a changed token; preserve that guarantee here instead of
+        // turning A's stale 401 into a logout of B.
+        if (tokenRef.current !== token) return;
         await handleSessionExpired({
           source: "verify_token",
           status: 401,
@@ -221,9 +228,16 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     }
   }, [loadUser, handleSessionExpired]);
 
+  // A successful loadUser updates settings and recreates these callbacks.
+  // Read the latest callback without restarting the session's timers, which
+  // would otherwise schedule another "initial" check after every success.
+  const verifyTokenRef = useRef(verifyToken);
+  verifyTokenRef.current = verifyToken;
+
   useEffect(() => {
-    const initial = setTimeout(verifyToken, 5000);
-    const interval = setInterval(verifyToken, CHECK_INTERVAL_MS);
+    const verify = () => void verifyTokenRef.current();
+    const initial = setTimeout(verify, 5000);
+    const interval = setInterval(verify, CHECK_INTERVAL_MS);
 
     // Eagerly re-verify entitlement when the user returns to the app — e.g.
     // right after completing checkout in the browser — so a freshly-subscribed
@@ -237,7 +251,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
           typeof document !== "undefined" ? document.visibilityState : undefined
         )
       ) {
-        void verifyToken();
+        verify();
       }
     };
     window.addEventListener("focus", onFocus);
@@ -248,7 +262,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [verifyToken]);
+  }, [settings.user?.token]);
 
   return <>{children}</>;
 }

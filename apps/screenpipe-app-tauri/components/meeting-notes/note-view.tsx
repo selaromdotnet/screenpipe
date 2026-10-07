@@ -24,6 +24,7 @@ import {
   Info,
   Languages,
   Loader2,
+  MessageSquareText,
   Mic2,
   Play,
   RefreshCw,
@@ -35,7 +36,7 @@ import {
   Volume2,
   X,
 } from "lucide-react";
-import { commands } from "@/lib/utils/tauri";
+import { commands, type AIPreset } from "@/lib/utils/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
@@ -44,6 +45,7 @@ import { readFile } from "@tauri-apps/plugin-fs";
 import posthog from "posthog-js";
 import { qualifiedValue } from "@/lib/analytics/qualified-value";
 import { Button } from "@/components/ui/button";
+import { LANGUAGE_OPTIONS } from "@/lib/language";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -87,7 +89,9 @@ import type {
 } from "@/lib/utils/live-capture-state";
 import { isLiveCaptureDegraded } from "@/lib/utils/live-capture-state";
 import {
+  fetchMeetingAudio,
   fetchMeetingContext,
+  renderMeetingTranscript,
   type MeetingContext,
 } from "@/lib/utils/meeting-context";
 import {
@@ -98,6 +102,7 @@ import {
 } from "@/lib/utils/calendar";
 import { cn } from "@/lib/utils";
 import { AttendeesPill } from "./attendees-pill";
+import { CalendarNudge } from "./calendar-nudge";
 import { Receipts } from "./receipts";
 import { ReplayStrip } from "./replay-strip";
 import { ListeningSticks } from "./listening-sticks";
@@ -109,7 +114,15 @@ import {
   resizeImageDataUrl,
 } from "./image-utils";
 import { TranscriptPanel } from "./transcript-panel";
-import { useSettings, type Settings } from "@/lib/hooks/use-settings";
+import {
+  useSettings,
+  type Settings,
+} from "@/lib/hooks/use-settings";
+import { useManagedPolicy } from "@/lib/hooks/use-managed-policy";
+import {
+  DEFAULT_ENTERPRISE_AI_PRESET_POLICY,
+  filterPresetsForEnterprisePolicy,
+} from "@/lib/enterprise-ai-preset-policy";
 import {
   MeetingNoteSaveQueue,
   sameMeetingNoteDraft,
@@ -127,7 +140,10 @@ import {
 } from "./meeting-share-menu";
 import { copyMeetingSummary, emailMeetingSummary } from "./share-summary";
 import { ConnectedShareDialog } from "@/components/connected-share-dialog";
-import { createMeetingShareArtifact } from "@/lib/connected-share";
+import {
+  createMeetingShareArtifact,
+  type ConnectedShareDestination,
+} from "@/lib/connected-share";
 import {
   readRememberedShare,
   rememberedSendLabel,
@@ -151,6 +167,7 @@ import {
 } from "./meeting-summary-lifecycle";
 import { QUOTA_PLAN_LABELS } from "@/lib/chat/quota-errors";
 import { openExternalUrl } from "@/lib/open-external-url";
+import { openBusinessUpgradeSurface } from "@/lib/upgrade-flow";
 import { MeetingSummaryTransition } from "./meeting-summary-transition";
 import {
   advanceMeetingSummaryStream,
@@ -159,18 +176,61 @@ import {
 } from "./meeting-summary-stream";
 import {
   extractMeetingSummary,
+  meetingSummarySaveIsVisible,
   MEETING_QUIET_CONTROL_CLASS,
   MEETING_READING_COLUMN_CLASS,
   MEETING_RULE_ACTION_CLASS,
   MEETING_SHELL_CLASS,
   MeetingSummarySurface,
   MeetingWorkspaceTabs,
+  stopMeetingAndOpenSummary,
   type MeetingWorkspaceTab,
 } from "./meeting-workspace";
 import { meetingRetranscribeSuccessCopy } from "./transcript-recovery-copy";
-import { startMeetingSummaryRun } from "./meeting-summary-run";
+import {
+  loadMeetingSummaryPipeConfig,
+  startMeetingSummaryRun,
+  updateMeetingSummaryPrimaryPreset,
+} from "./meeting-summary-run";
+import { MeetingChatPanel } from "./meeting-chat-panel";
+import {
+  useMeetingChat,
+  type MeetingChatContext,
+} from "./use-meeting-chat";
+import type { MeetingChatConditions } from "./meeting-chat-state";
+import type { AcpConfigDefaultChange } from "@/components/chat/standalone/acp-config-selector";
+import {
+  readStoredChatWidth,
+  writeStoredChatWidth,
+} from "./meeting-chat-width";
+import {
+  findTranscriptRowForTime,
+  readTranscriptRowBounds,
+} from "./transcript-focus";
+import {
+  readActiveAiPresetId,
+  resolveActiveAiPreset,
+  writeActiveAiPresetId,
+} from "@/lib/active-ai-preset";
+import { useAcpRolloutEnabled } from "@/lib/acp-rollout";
+import {
+  implicitSummaryPresetId,
+  summaryPresetModelLabel,
+  summaryPresetOptions,
+} from "./meeting-summary-presets";
+import {
+  hostedAiAllowanceForModel,
+  useUsageStatus,
+} from "@/lib/hooks/use-usage-status";
+import { useGT, useMessages } from "gt-react";
+import { useUiLocale as useLocale } from "@/lib/i18n/provider";
+
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
+// Transcript window handed to a chat turn. Long meetings are windowed to the
+// most recent span rather than silently truncated mid-prompt (case 76).
+const CHAT_TRANSCRIPT_MAX_CHARS = 24_000;
+const MEETING_CHAT_LIVE_REFRESH_MS = 30_000;
 // How long a successful save stays on screen before the footer goes quiet.
 const SAVE_RECEIPT_DWELL_MS = 4000;
 
@@ -188,9 +248,16 @@ interface NoteViewProps {
   captureDevices?: LiveCaptureDevice[];
   onCaptureDevicesRefresh?: () => void | Promise<void>;
   calendarEvents?: CalendarEvent[];
+  onOpenCalendarConnections?: () => void;
   transcriptOpenIntent?: TranscriptOpenIntent;
   transcriptOpenRequestKey?: number;
   initialWorkspaceTab?: MeetingWorkspaceTab;
+}
+
+interface MeetingChatTranscriptSnapshot {
+  text: string;
+  turnCount: number;
+  truncated: boolean;
 }
 
 type SaveState =
@@ -235,10 +302,15 @@ export function NoteView({
   captureDevices = [],
   onCaptureDevicesRefresh,
   calendarEvents = [],
+  onOpenCalendarConnections,
   transcriptOpenIntent,
   transcriptOpenRequestKey,
   initialWorkspaceTab,
 }: NoteViewProps) {
+  const uiLanguage = useLocale();
+
+  const ui = useGT();
+  const uiMessages = useMessages();
   const { toast } = useToast();
   const [title, setTitle] = useState(meeting.title ?? "");
   const [attendees, setAttendees] = useState(meeting.attendees ?? "");
@@ -254,6 +326,8 @@ export function NoteView({
     null,
   );
   const [shareOpen, setShareOpen] = useState(false);
+  const [requestedShareDestination, setRequestedShareDestination] =
+    useState<ConnectedShareDestination | null>(null);
   // Read once per open rather than on every render: the menu only needs to
   // name the app, and the dialog re-reads the full preference when it mounts.
   const sendLabel = useMemo(
@@ -269,6 +343,9 @@ export function NoteView({
     useState<MeetingSummaryLifecycle>({ kind: "idle" });
   const [summaryStatusRefreshKey, setSummaryStatusRefreshKey] = useState(0);
   const [summaryRevealKey, setSummaryRevealKey] = useState(0);
+  const [summaryPresetIds, setSummaryPresetIds] = useState<string[]>([]);
+  const [summaryPresetReady, setSummaryPresetReady] = useState(false);
+  const [summaryPresetSaving, setSummaryPresetSaving] = useState(false);
   const [meetingCtx, setMeetingCtx] = useState<MeetingContext | null>(null);
   const [activeTab, setActiveTab] = useState<MeetingWorkspaceTab>(() =>
     initialWorkspaceTab ??
@@ -308,9 +385,36 @@ export function NoteView({
     "retranscribe" | "delete" | null
   >(null);
   const { settings, updateSettings } = useSettings();
+  const { isManagedDeployment, policy: enterprisePolicy } =
+    useManagedPolicy();
+  const chatUsage = useUsageStatus();
   const noteEditorRef = useRef<NoteEditorHandle>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
   const [isDraggingImage, setIsDraggingImage] = useState(false);
+  // Chat rail state. The transcript itself lives in TranscriptPanel; the rail
+  // only needs a count to know whether there is anything to ask about, and a
+  // rendered window when a turn is actually sent.
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatTranscript, setChatTranscript] =
+    useState<MeetingChatTranscriptSnapshot>({
+      text: "",
+      turnCount: 0,
+      truncated: false,
+    });
+  const [chatPresetId, setChatPresetId] = useState<string | null>(() =>
+    readActiveAiPresetId(),
+  );
+  const [chatPresetOverride, setChatPresetOverride] =
+    useState<AIPreset | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [paneWidth, setPaneWidth] = useState(0);
+  const [storedPanelWidth, setStoredPanelWidth] = useState<number | null>(
+    () => readStoredChatWidth(),
+  );
+  const [pendingCitationMs, setPendingCitationMs] = useState<number | null>(
+    null,
+  );
   const canSummarizeMeeting =
     !isLive &&
     !resuming &&
@@ -327,7 +431,25 @@ export function NoteView({
       }),
     [attendees, meeting, note, title],
   );
-  const oneTapSend = useMeetingOneTapSend(shareArtifact);
+  // The activity bundle is already loaded for receipts and replay. Reuse it to
+  // rank connected destinations without adding another history query or moving
+  // raw window/app evidence off device.
+  const meetingShareEvidence = useMemo(() => {
+    const activity = meetingCtx?.activity;
+    if (!activity) return [];
+    return [
+      ...activity.apps.map((app) => app.name),
+      ...activity.windows.flatMap((window) => [
+        window.app_name,
+        window.window_name,
+        window.browser_url,
+      ]),
+    ].filter(Boolean);
+  }, [meetingCtx?.activity]);
+  const oneTapSend = useMeetingOneTapSend(
+    shareArtifact,
+    meetingShareEvidence,
+  );
 
   /**
    * The press is the confirmation, so the receipt has to be unmissable.
@@ -344,13 +466,101 @@ export function NoteView({
       return;
     }
     toast({
-      title: "couldn't send",
+      title: ui("Couldn't send"),
       description: result.error,
       variant: "destructive",
     });
-  }, [oneTapSend, toast]);
+  }, [oneTapSend, toast, uiLanguage]);
 
   const summaryPipeSlug = settings.meetingSummaryPipeSlug || "meeting-summary";
+  // The picker offers ACP presets behind the same rollout gate as the rest of
+  // the ACP UI, and falls back to a pipe-compatible model. Both rules live in
+  // meeting-summary-presets.ts, next to their tests.
+  const acpEnabled = useAcpRolloutEnabled();
+  const summaryPresets = useMemo(
+    () =>
+      summaryPresetOptions(settings.aiPresets, {
+        acpEnabled,
+        isManagedDeployment,
+        aiPresetPolicy: enterprisePolicy.aiPresetPolicy,
+      }),
+    [
+      acpEnabled,
+      enterprisePolicy.aiPresetPolicy,
+      isManagedDeployment,
+      settings.aiPresets,
+    ],
+  );
+  const defaultSummaryPresetId = useMemo(
+    () => implicitSummaryPresetId(summaryPresets),
+    [summaryPresets],
+  );
+  const summaryPresetId = summaryPresetReady
+    ? summaryPresetIds[0] ?? defaultSummaryPresetId
+    : null;
+  const summaryPreset = summaryPresets.find(
+    (preset) => preset.id === summaryPresetId,
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setSummaryPresetReady(false);
+    void loadMeetingSummaryPipeConfig(summaryPipeSlug)
+      .then(({ presetIds }) => {
+        if (cancelled) return;
+        setSummaryPresetIds(presetIds);
+        setSummaryPresetReady(true);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn("failed to read meeting summary model", error);
+        setSummaryPresetIds([]);
+        setSummaryPresetReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [summaryPipeSlug]);
+
+  const handleSummaryPresetSelect = useCallback(
+    async (preset: AIPreset | null) => {
+      if (!preset || summaryPresetSaving) return false;
+      const previousPresetIds = summaryPresetIds;
+      const optimisticPresetIds = [
+        preset.id,
+        ...previousPresetIds
+          .slice(1)
+          .filter((presetId) => presetId !== preset.id),
+      ];
+      setSummaryPresetIds(optimisticPresetIds);
+      setSummaryPresetSaving(true);
+      try {
+        const saved = await updateMeetingSummaryPrimaryPreset({
+          pipeSlug: summaryPipeSlug,
+          presetId: preset.id,
+          currentPresetIds: previousPresetIds,
+        });
+        setSummaryPresetIds(saved.presetIds);
+        posthog.capture("meeting_summary_model_changed", {
+          pipe_slug: summaryPipeSlug,
+          provider: preset.provider,
+        });
+        return true;
+      } catch (error) {
+        setSummaryPresetIds(previousPresetIds);
+        console.error("failed to save meeting summary model", error);
+        toast({
+          title: ui("Couldn't change summary model"),
+          description: ui("Your previous model is still selected."),
+          variant: "destructive",
+        });
+        return false;
+      } finally {
+        setSummaryPresetSaving(false);
+      }
+    },
+    [summaryPipeSlug, summaryPresetIds, summaryPresetSaving, toast, uiLanguage],
+  );
   const summaryPresentation = meetingSummaryPresentation({
     isLive,
     resuming,
@@ -368,7 +578,8 @@ export function NoteView({
       visibleSummaryLifecycle.kind === "running");
   const summaryExecutionId =
     visibleSummaryLifecycle.kind === "queued" ||
-    visibleSummaryLifecycle.kind === "running"
+    visibleSummaryLifecycle.kind === "running" ||
+    visibleSummaryLifecycle.kind === "completed"
       ? visibleSummaryLifecycle.execution.id
       : null;
   const summaryExecutionIdRef = useRef<number | null>(summaryExecutionId);
@@ -514,35 +725,45 @@ export function NoteView({
             });
           }
         }
-        setSummaryLifecycle(next);
-
+        let summarySavePending = false;
         if (
           next.kind === "completed" &&
           refreshedSummaryExecutionRef.current !== next.execution.id
         ) {
-          refreshedSummaryExecutionRef.current = next.execution.id;
           const meetingResponse = await localFetch(`/meetings/${meeting.id}`);
           if (meetingResponse.ok && !cancelled) {
             const updatedMeeting =
               (await meetingResponse.json()) as MeetingRecord;
-            if (
-              summaryRevealPendingRef.current &&
-              updatedMeeting.note !== meeting.note
-            ) {
+            const saveIsVisible = meetingSummarySaveIsVisible(
+              meeting.note ?? "",
+              updatedMeeting.note ?? "",
+              summaryRevealPendingRef.current,
+            );
+            if (saveIsVisible) {
+              refreshedSummaryExecutionRef.current = next.execution.id;
               summaryRevealPendingRef.current = false;
-              setSummaryRevealKey((key) => key + 1);
+              if (updatedMeeting.note !== meeting.note) {
+                setSummaryRevealKey((key) => key + 1);
+              }
+              onSavedRef.current(updatedMeeting);
             } else {
-              summaryRevealPendingRef.current = false;
+              // Execution completion and the meeting-note write are separate
+              // observable operations. Retry the authoritative meeting read
+              // until the summary is actually there; marking this execution
+              // refreshed on the first stale read made the empty state stick.
+              summarySavePending = true;
             }
-            onSavedRef.current(updatedMeeting);
+          } else {
+            summarySavePending = true;
           }
         }
+        setSummaryLifecycle(next);
 
         // Never stop: settling to idle used to end the poll, which is how a
         // deleted Pipe or a late run stayed invisible until the note remounted.
         pollHandle = setTimeout(
           () => void poll(),
-          summaryLifecycleIsWorking(next)
+          summarySavePending || summaryLifecycleIsWorking(next)
             ? SUMMARY_ACTIVE_POLL_MS
             : SUMMARY_IDLE_POLL_MS,
         );
@@ -608,8 +829,8 @@ export function NoteView({
       if (paths.length === 0) return;
       if (imagePaths.length === 0) {
         toast({
-          title: "couldn't insert image",
-          description: "drop a png, jpg, gif, webp, bmp, or svg file.",
+          title: ui("Couldn't insert image"),
+          description: ui("Drop a png, jpg, gif, webp, bmp, or svg file."),
           variant: "destructive",
         });
         return;
@@ -618,11 +839,22 @@ export function NoteView({
         const images: string[] = [];
         for (const path of imagePaths) {
           const raw = imageBytesToDataUrl(path, await readFile(path));
-          if (raw) images.push(await resizeImageDataUrl(raw));
+          const image = raw && (await resizeImageDataUrl(raw));
+          if (image) images.push(image);
         }
         if (images.length === 0) return;
         const { x, y } = toClient(pos);
-        noteEditorRef.current?.insertImages(images, { clientX: x, clientY: y });
+        const editor = noteEditorRef.current;
+        // The note closed (another meeting opened) while the files were read.
+        if (!editor) return;
+        if (!editor.insertImages(images, { clientX: x, clientY: y })) {
+          // The note is read-only while a summary is written into it.
+          toast({
+            title: ui("Couldn't insert image"),
+            description: ui("Wait for the summary to finish, then drop the image again."),
+          });
+          return;
+        }
         posthog.capture("meeting_note_images_inserted", {
           meeting_id: meeting.id,
           count: images.length,
@@ -631,7 +863,7 @@ export function NoteView({
       } catch (err) {
         console.error("failed to insert dropped meeting note image", err);
         toast({
-          title: "couldn't insert image",
+          title: ui("Couldn't insert image"),
           description: String(err),
           variant: "destructive",
         });
@@ -944,9 +1176,9 @@ export function NoteView({
     });
     if (!canSummarizeMeeting) {
       toast({
-        title: "stop the meeting first",
+        title: ui("Stop the meeting first"),
         description:
-          "summaries run on the saved transcript after the meeting ends.",
+          ui("Summaries run on the saved transcript after the meeting ends."),
       });
       return;
     }
@@ -978,8 +1210,8 @@ export function NoteView({
     } catch (err) {
       console.error("failed to summarize meeting", err);
       toast({
-        title: "couldn't start summary",
-        description: "try again in a moment.",
+        title: ui("Couldn't start summary"),
+        description: ui("Try again in a moment."),
         variant: "destructive",
       });
     } finally {
@@ -991,9 +1223,9 @@ export function NoteView({
     if (retranscribing || summaryWorking) return;
     if (!meeting.meeting_end) {
       toast({
-        title: "stop the meeting first",
+        title: ui("Stop the meeting first"),
         description:
-          "batch retranscribe runs on the saved audio after a meeting ends.",
+          ui("Batch retranscribe runs on the saved audio after a meeting ends."),
       });
       return;
     }
@@ -1020,7 +1252,7 @@ export function NoteView({
       }
       setTranscriptRefreshKey((key) => key + 1);
       toast({
-        title: "transcript refreshed",
+        title: ui("Transcript refreshed"),
         description: meetingRetranscribeSuccessCopy({
           batchesProcessed: body?.batches_processed,
           autoSummaryEnabled,
@@ -1031,7 +1263,7 @@ export function NoteView({
     } catch (err) {
       console.error("failed to retranscribe meeting", err);
       toast({
-        title: "couldn't retranscribe",
+        title: ui("Couldn't retranscribe"),
         description: String(err),
         variant: "destructive",
       });
@@ -1061,18 +1293,18 @@ export function NoteView({
         } catch (saveErr) {
           console.error("failed to save meeting note before stop", saveErr);
           toast({
-            title: "couldn't save notes",
+            title: ui("Couldn't save notes"),
             description:
-              "stopping anyway — your latest edits may not be saved.",
+              ui("Stopping anyway — your latest edits may not be saved."),
             variant: "destructive",
           });
         }
       }
-      await onStop();
+      await stopMeetingAndOpenSummary(onStop, setActiveTab);
     } catch (err) {
       console.error("failed to stop meeting", err);
       toast({
-        title: "couldn't stop meeting",
+        title: ui("Couldn't stop meeting"),
         description: String(err),
         variant: "destructive",
       });
@@ -1085,9 +1317,9 @@ export function NoteView({
     if (exporting) return;
     if (!meeting.meeting_end) {
       toast({
-        title: "stop the meeting first",
+        title: ui("Stop the meeting first"),
         description:
-          "mp4 export runs on the saved frames and audio after a meeting ends.",
+          ui("Mp4 export runs on the saved frames and audio after a meeting ends."),
       });
       return;
     }
@@ -1110,7 +1342,7 @@ export function NoteView({
     } catch (err) {
       console.error("failed to open save dialog", err);
       toast({
-        title: "couldn't open save dialog",
+        title: ui("Couldn't open save dialog"),
         description: String(err),
         variant: "destructive",
       });
@@ -1120,9 +1352,9 @@ export function NoteView({
 
     setExporting(true);
     toast({
-      title: "exporting mp4…",
+      title: ui("Exporting mp4…"),
       description:
-        "stitching frames and audio — this can take a minute for long meetings.",
+        ui("Stitching frames and audio — this can take a minute for long meetings."),
     });
     let jobId: string | null = null;
     let unlisten: (() => void) | null = null;
@@ -1144,7 +1376,7 @@ export function NoteView({
             ? (summary.file_size_bytes / (1024 * 1024)).toFixed(1)
             : null;
           toast({
-            title: "mp4 exported",
+            title: ui("Mp4 exported"),
             description: [
               `${summary?.frame_count ?? 0} frames`,
               `${summary?.audio_chunk_count ?? 0} audio chunks`,
@@ -1168,7 +1400,7 @@ export function NoteView({
             stack: event.error,
           });
           toast({
-            title: "couldn't export mp4",
+            title: ui("Couldn't export mp4"),
             description: event.error,
             variant: "destructive",
           });
@@ -1195,7 +1427,7 @@ export function NoteView({
         stack: err instanceof Error ? (err.stack ?? err.message) : String(err),
       });
       toast({
-        title: "couldn't export mp4",
+        title: ui("Couldn't export mp4"),
         description: String(err),
         variant: "destructive",
       });
@@ -1232,11 +1464,11 @@ export function NoteView({
       const ctx = await copyMeetingToClipboard(fresh);
       setMeetingCtx(ctx);
       confirmCopied("meeting");
-      toast({ title: "copied to clipboard" });
+      toast({ title: ui("Copied to clipboard") });
     } catch (err) {
       console.error("failed to copy meeting", err);
       toast({
-        title: "couldn't copy",
+        title: ui("Couldn't copy"),
         description: String(err),
         variant: "destructive",
       });
@@ -1251,15 +1483,15 @@ export function NoteView({
     try {
       const copiedTranscript = await copyMeetingTranscript(currentMeeting());
       if (!copiedTranscript) {
-        toast({ title: "nothing transcribed yet" });
+        toast({ title: ui("Nothing transcribed yet") });
         return;
       }
       confirmCopied("transcript");
-      toast({ title: "transcript copied" });
+      toast({ title: ui("Transcript copied") });
     } catch (err) {
       console.error("failed to copy transcript", err);
       toast({
-        title: "couldn't copy transcript",
+        title: ui("Couldn't copy transcript"),
         description: String(err),
         variant: "destructive",
       });
@@ -1278,15 +1510,15 @@ export function NoteView({
         extractMeetingSummary(note),
       );
       if (!shared) {
-        toast({ title: "no summary to copy yet" });
+        toast({ title: ui("No summary to copy yet") });
         return;
       }
       confirmCopied("summary");
-      toast({ title: "summary copied", description: "paste it anywhere" });
+      toast({ title: ui("Summary copied"), description: ui("Paste it anywhere") });
     } catch (err) {
       console.error("failed to copy meeting summary", err);
       toast({
-        title: "couldn't copy summary",
+        title: ui("Couldn't copy summary"),
         description: String(err),
         variant: "destructive",
       });
@@ -1299,11 +1531,11 @@ export function NoteView({
         currentMeeting(),
         extractMeetingSummary(note),
       );
-      if (!shared) toast({ title: "no summary to send yet" });
+      if (!shared) toast({ title: ui("No summary to send yet") });
     } catch (err) {
       console.error("failed to open email draft", err);
       toast({
-        title: "couldn't open your email app",
+        title: ui("Couldn't open your email app"),
         description: String(err),
         variant: "destructive",
       });
@@ -1320,7 +1552,7 @@ export function NoteView({
       onBack();
     } catch (err) {
       toast({
-        title: "couldn't delete meeting",
+        title: ui("Couldn't delete meeting"),
         description: String(err),
         variant: "destructive",
       });
@@ -1328,8 +1560,6 @@ export function NoteView({
   };
 
   const attendeeCount = parseAttendees(attendees).length;
-  const englishOnly =
-    settings.languages.length === 1 && settings.languages[0] === "english";
   const meetingDateLabel = formatDateOnly(meeting.meeting_start);
   const meetingStartClock = formatClock(meeting.meeting_start);
   const meetingEndClock = meeting.meeting_end
@@ -1369,18 +1599,6 @@ export function NoteView({
       !!meetingTitle && !!eventTitle && meetingTitle === eventTitle;
     return { link, mapped };
   }, [calendarEvents, dismissedJoinUrl, isLive, meeting, meetingCtx]);
-
-  const setLanguagePreference = async (languages: string[]) => {
-    try {
-      await updateSettings({ languages });
-    } catch (err) {
-      toast({
-        title: "couldn't update language",
-        description: String(err),
-        variant: "destructive",
-      });
-    }
-  };
 
   const handleResumeAfterInactivity = async () => {
     setInactivityPrompt(false);
@@ -1446,12 +1664,12 @@ export function NoteView({
         );
       }
       toast({
-        title: "microphone capture resumed",
-        description: "Transcript should start once speech is detected.",
+        title: ui("Microphone capture resumed"),
+        description: ui("Transcript should start once speech is detected."),
       });
     } catch (err) {
       toast({
-        title: "couldn't resume microphone",
+        title: ui("Couldn't resume microphone"),
         description: String(err),
         variant: "destructive",
       });
@@ -1466,7 +1684,7 @@ export function NoteView({
       setDismissedJoinUrl(link.url);
     } catch (err) {
       toast({
-        title: "couldn't open meeting",
+        title: ui("Couldn't open meeting"),
         description: String(err),
         variant: "destructive",
       });
@@ -1480,57 +1698,90 @@ export function NoteView({
   const summaryStatus = (() => {
     if (isLive) {
       return {
-        title: captureState?.label ?? "recording meeting",
-        detail: "notes and transcript save automatically",
+        title: captureState?.label ?? ui("Recording meeting"),
+        detail: ui("notes and transcript save automatically"),
       };
     }
     if (resuming) {
       return {
-        title: "resuming meeting",
-        detail: "reopening this note for live capture",
+        title: ui("Resuming meeting"),
+        detail: ui("reopening this note for live capture"),
       };
     }
     if (summaryPresentation.transitionPhase === "finalizing") {
       return {
-        title: "meeting saved",
+        title: ui("Meeting saved"),
         detail:
-          "finishing the transcript before summary · you can safely leave",
+          ui("finishing the transcript before summary · you can safely leave"),
       };
     }
     if (summaryWorking) {
       return {
         title: retranscriptionSummaryRefreshWorking
-          ? "refreshing summary"
-          : "summarizing meeting",
+          ? ui("Refreshing summary")
+          : ui("Summarizing meeting"),
         detail: retranscriptionSummaryRefreshWorking
-          ? "using the refreshed transcript · it appears here live"
-          : "you can leave · it appears here live and saves when finished",
+          ? ui("using the refreshed transcript · it appears here live")
+          : ui("you can leave · it appears here live and saves when finished"),
       };
     }
     if (visibleSummaryLifecycle.kind === "completed") {
       return {
-        title: "summary ready",
-        detail: "saved to this meeting note",
+        title: extractMeetingSummary(note) ? ui("Summary ready") : ui("Summary needs attention"),
+        detail: extractMeetingSummary(note)
+          ? ui("saved to this meeting note")
+          : ui("The run finished without saving a meeting summary."),
       };
     }
     if (visibleSummaryLifecycle.kind === "failed") {
+      const failure = meetingSummaryFailure(visibleSummaryLifecycle.execution, uiMessages);
       return {
-        title: "summary needs attention",
-        detail: meetingSummaryFailure(visibleSummaryLifecycle.execution).copy,
+        // "Nothing to summarize" is a factual outcome, not something the user
+        // needs to fix — keep "needs attention" for actionable failures only.
+        title:
+          failure.kind === "nothing_to_summarize"
+            ? ui("Nothing to summarize")
+            : ui("Summary needs attention"),
+        detail: failure.copy,
       };
     }
     return {
-      title: "meeting saved",
+      title: ui("Meeting saved"),
       detail:
         autoSummaryEnabled === false
-          ? "automatic summary is off"
-          : "notes and transcript saved locally",
+          ? ui("automatic summary is off")
+          : ui("notes and transcript saved locally"),
     };
   })();
-  const summaryUpgrade =
+  const summaryFailure =
     visibleSummaryLifecycle.kind === "failed"
-      ? meetingSummaryFailure(visibleSummaryLifecycle.execution).upgrade
+      ? meetingSummaryFailure(visibleSummaryLifecycle.execution, uiMessages)
       : null;
+  const summaryUpgrade = summaryFailure?.upgrade ?? null;
+  const handleSummaryUpgrade = useCallback(async () => {
+    if (!summaryUpgrade) return;
+    posthog.capture("meeting_summary_upgrade_clicked", {
+      source: "meeting-summary-limit",
+      target_plan: summaryUpgrade.requiredPlan,
+    });
+    try {
+      // The native account surface owns the common Basic → Business offer.
+      // Higher tiers and Basic have gateway-owned billing URLs whose exact
+      // target cannot be represented by that one offer card.
+      if (summaryUpgrade.requiredPlan === "business") {
+        await openBusinessUpgradeSurface("meeting-summary-limit");
+      } else {
+        await openExternalUrl(summaryUpgrade.upgradeUrl);
+      }
+    } catch (error) {
+      console.error("failed to open meeting summary upgrade", error);
+      toast({
+        title: ui("Couldn't open upgrade options"),
+        description: ui("Try again from Settings → Account."),
+        variant: "destructive",
+      });
+    }
+  }, [summaryUpgrade, toast, uiLanguage]);
   // Notes and Summary now own their summary lifecycle in the reading area.
   // Repeating the same state in the footer made the page look like two jobs
   // were running. Transcript still gets the global footer because it has no
@@ -1597,12 +1848,258 @@ export function NoteView({
     : visibleSummaryLifecycle.kind === "failed"
       ? "attention"
       : null;
+
+  // ── chat rail ──────────────────────────────────────────────────────────
+  // The rail can ask during or after a meeting and reports while it is working.
+  // Everything decidable without React lives in meeting-chat-state.ts.
+  const chatPresets = useMemo(() => {
+    const presets = (settings.aiPresets ?? []) as AIPreset[];
+    if (!isManagedDeployment) return presets;
+    return filterPresetsForEnterprisePolicy(
+      presets,
+      enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY,
+    );
+  }, [
+    enterprisePolicy.aiPresetPolicy,
+    isManagedDeployment,
+    settings.aiPresets,
+  ]);
+  const resolvedChatPreset = useMemo(
+    () => resolveActiveAiPreset(chatPresets, chatPresetId),
+    [chatPresetId, chatPresets],
+  );
+  // ACP configuration can be chosen before the private turn session exists.
+  // Keep that choice local immediately while the settings context persists it.
+  const chatPreset =
+    chatPresetOverride?.id === resolvedChatPreset?.id
+      ? chatPresetOverride
+      : resolvedChatPreset;
+  const handleChatPresetSelect = useCallback((preset: AIPreset) => {
+    setChatPresetId(preset.id);
+    setChatPresetOverride(null);
+    // This is the same shared choice as the main Chat composer, so moving
+    // between Chat and a meeting never silently changes the running model.
+    writeActiveAiPresetId(preset.id);
+  }, []);
+  const handleChatAcpConfigDefault = useCallback(
+    (change: AcpConfigDefaultChange) => {
+      const agent = chatPreset?.acpAgent;
+      if (!chatPreset || !agent) return;
+      const nextAgent = { ...agent };
+      if ("modeId" in change && change.modeId !== undefined) {
+        nextAgent.modeId = change.modeId;
+      }
+      if (change.approvalMode !== undefined) {
+        nextAgent.approvalMode = change.approvalMode;
+      }
+      if (
+        "optionId" in change &&
+        change.optionId !== undefined &&
+        change.value !== undefined
+      ) {
+        nextAgent.config = {
+          ...(agent.config ?? {}),
+          [change.optionId]: change.value,
+        };
+      }
+      const nextPreset = { ...chatPreset, acpAgent: nextAgent };
+      setChatPresetOverride(nextPreset);
+      void updateSettings({
+        aiPresets: settings.aiPresets.map((preset) =>
+          preset.id === chatPreset.id ? nextPreset : preset,
+        ),
+      });
+    },
+    [chatPreset, settings.aiPresets, updateSettings],
+  );
+  const chatCloudflareAllowance = hostedAiAllowanceForModel(
+    chatUsage,
+    chatPreset?.model,
+  );
+  const chatQuotaExhausted = Boolean(
+    chatPreset?.provider === "screenpipe-cloud" &&
+      chatUsage &&
+      (chatUsage.hosted_ai?.allowance_managed_by === "cloudflare"
+        ? chatCloudflareAllowance?.remaining_percent === 0
+        : chatUsage.remaining <= 0),
+  );
+
+  const readChatTranscript = useCallback(
+    async (): Promise<MeetingChatTranscriptSnapshot> => {
+      const chunks = await fetchMeetingAudio(
+        meeting.meeting_start,
+        meeting.meeting_end ?? new Date().toISOString(),
+        1_000,
+        typeof meeting.id === "number" ? meeting.id : undefined,
+      );
+      const rendered = renderMeetingTranscript(chunks);
+      const truncated = rendered.length > CHAT_TRANSCRIPT_MAX_CHARS;
+      return {
+        text: truncated
+          ? rendered.slice(rendered.length - CHAT_TRANSCRIPT_MAX_CHARS)
+          : rendered,
+        turnCount: chunks?.length ?? 0,
+        truncated,
+      };
+    },
+    [meeting.id, meeting.meeting_start, meeting.meeting_end],
+  );
+  const buildChatContext = useCallback(
+    (snapshot: MeetingChatTranscriptSnapshot): MeetingChatContext => ({
+      meetingId: meeting.id,
+      title,
+      startIso: meeting.meeting_start,
+      endIso: meeting.meeting_end,
+      transcript: snapshot.text,
+      note,
+      transcriptTruncated: snapshot.truncated,
+      transcriptSettling:
+        isLive ||
+        stopping ||
+        savingBeforeStop ||
+        summaryLifecycle.kind === "finalizing",
+    }),
+    [
+      isLive,
+      meeting.id,
+      meeting.meeting_end,
+      meeting.meeting_start,
+      note,
+      savingBeforeStop,
+      stopping,
+      summaryLifecycle.kind,
+      title,
+    ],
+  );
+  const meetingChatContext = useMemo(
+    () => buildChatContext(chatTranscript),
+    [buildChatContext, chatTranscript],
+  );
+  const refreshMeetingChatContext = useCallback(async () => {
+    const latest = await readChatTranscript();
+    setChatTranscript(latest);
+    return buildChatContext(latest);
+  }, [buildChatContext, readChatTranscript]);
+
+  const meetingChat = useMeetingChat({
+    context: meetingChatContext,
+    refreshContext: refreshMeetingChatContext,
+    preset: chatPreset,
+    userToken: settings.user?.token ?? null,
+  });
+
+  const chatConditions: MeetingChatConditions = {
+    isLive,
+    isStopping: stopping || savingBeforeStop,
+    captureDegraded: Boolean(captureState && isLiveCaptureDegraded(captureState)),
+    summaryLifecycle,
+    refreshingAfterRetranscription: retranscriptionSummaryRefreshWorking,
+    transcriptTurnCount: chatTranscript.turnCount,
+    hasWrittenContext: Boolean(note.trim()),
+    hasPreset: Boolean(chatPreset),
+    quotaExhausted: chatQuotaExhausted,
+    turnInFlight: meetingChat.inFlight,
+  };
+
+  // The transcript panel owns its own copy for rendering; chat keeps a bounded
+  // plain-text window. Opening a live panel refreshes immediately and then at
+  // the same cadence as TranscriptPanel. The send path above refreshes once
+  // more, so a question never relies on the mount-time snapshot (case 16).
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const latest = await readChatTranscript();
+        if (cancelled) return;
+        setChatTranscript(latest);
+      } catch {
+        // A transcript we cannot read means "nothing to ask about", which the
+        // rail already renders as a disabled composer.
+        if (!cancelled) {
+          setChatTranscript({ text: "", turnCount: 0, truncated: false });
+        }
+      }
+    };
+    void load();
+    const interval =
+      isLive && chatOpen
+        ? window.setInterval(() => void load(), MEETING_CHAT_LIVE_REFRESH_MS)
+        : null;
+    return () => {
+      cancelled = true;
+      if (interval !== null) window.clearInterval(interval);
+    };
+  }, [chatOpen, isLive, readChatTranscript, transcriptRefreshKey]);
+
+  // Case 50/51: widths re-clamp against the live shell, not a stored guess,
+  // and the same measurement decides overlay versus dock.
+  useEffect(() => {
+    const node = mainRef.current;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    setPaneWidth(node.clientWidth);
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width;
+      if (typeof width === "number") setPaneWidth(width);
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  // Case 81/82: a citation switches tabs, then scrolls once the rows exist.
+  useEffect(() => {
+    if (pendingCitationMs === null) return;
+    if (activeTab !== "transcript") return;
+    let frame = 0;
+    let attempts = 0;
+    const tryScroll = () => {
+      const container = mainRef.current;
+      if (!container) return;
+      const rows = readTranscriptRowBounds(container);
+      if (rows.length === 0) {
+        // Case 82: the transcript may not have loaded yet. Keep the intent.
+        if (attempts++ < 40) {
+          frame = requestAnimationFrame(tryScroll);
+          return;
+        }
+        setPendingCitationMs(null);
+        return;
+      }
+      const hit = findTranscriptRowForTime(rows, pendingCitationMs);
+      setPendingCitationMs(null);
+      if (!hit) return;
+      const target = rows[hit.index].element;
+      target.scrollIntoView({ block: "center", behavior: "smooth" });
+      // A brief ring rather than a persistent selection: the point is to show
+      // where the answer came from, not to leave the row selected.
+      target.setAttribute("data-cited", "true");
+      window.setTimeout(() => target.removeAttribute("data-cited"), 2_000);
+    };
+    frame = requestAnimationFrame(tryScroll);
+    return () => cancelAnimationFrame(frame);
+  }, [pendingCitationMs, activeTab]);
+
+  const handleCitationClick = useCallback((atMs: number) => {
+    setActiveTab("transcript");
+    setPendingCitationMs(atMs);
+  }, []);
+
+  const citationWindow = useMemo(() => {
+    const startMs = new Date(meeting.meeting_start).getTime();
+    if (!Number.isFinite(startMs)) return null;
+    // A live meeting stays open-ended: the citation parser resolves "now" when
+    // it runs, so an answer streaming during the call can still cite a moment
+    // that happened after this memo was computed.
+    if (!meeting.meeting_end) return { startMs, endMs: null };
+    const endMs = new Date(meeting.meeting_end).getTime();
+    return { startMs, endMs: Number.isFinite(endMs) ? endMs : null };
+  }, [meeting.meeting_start, meeting.meeting_end]);
   const summarySurfaceState = summaryWorking
     ? "working"
-    : visibleSummaryLifecycle.kind === "completed"
-      ? "ready"
-      : visibleSummaryLifecycle.kind === "failed"
-        ? "attention"
+    : visibleSummaryLifecycle.kind === "failed"
+      ? "attention"
+      : visibleSummaryLifecycle.kind === "completed" ||
+          extractMeetingSummary(note)
+        ? "ready"
         : "idle";
 
   // Every meeting action hangs off the single `⋯` menu on the tab rule.
@@ -1613,62 +2110,86 @@ export function NoteView({
   // neither trigger says what it holds, so finding anything meant opening both.
   // One menu with labelled groups means "it is in the menu" is a complete
   // instruction. Summarize loses its square here but keeps the prominent
-  // button inside the summary tab, next to the output it produces.
-  const meetingMenuGroups: MeetingMenuGroup[] = isLive || resuming
-    ? []
-    : [
-        {
-          label: "summary",
-          items: [
-            {
-              key: "summarize",
-              label: summaryActionLabel,
-              icon: summaryWorking
-                ? Loader2
-                : visibleSummaryLifecycle.kind === "completed" ||
-                    visibleSummaryLifecycle.kind === "failed"
-                  ? RefreshCw
-                  : Sparkles,
-              onSelect: () => handleSummaryAction(),
-              disabled:
-                summaryWorking || retranscribing || !canSummarizeMeeting,
-            },
-          ],
-        },
-        {
-          label: "meeting",
-          items: [
-            {
-              key: "resume",
-              label: resuming ? "resuming meeting" : "resume meeting",
-              icon: resuming ? Loader2 : Play,
-              onSelect: () => void onResume(),
-              disabled: resuming,
-            },
-            {
-              key: "retranscribe",
-              label: "retranscribe saved audio",
-              icon: retranscribing ? Loader2 : AudioLines,
-              onSelect: () => setConfirmingAction("retranscribe"),
-              disabled: retranscribing || summaryWorking,
-            },
-            {
-              key: "export",
-              label: "export to mp4",
-              icon: exporting ? Loader2 : Download,
-              onSelect: () => void handleExport(),
-              disabled: exporting,
-            },
-            {
-              key: "delete",
-              label: "delete meeting",
-              icon: Trash2,
-              onSelect: () => setConfirmingAction("delete"),
-              destructive: true,
-            },
-          ],
-        },
-      ];
+  // button inside the summary tab, next to the output it produces. Model
+  // choice stays reachable during a live meeting so the post-stop automatic
+  // summary uses the intended model.
+  const summaryMenuItems: MeetingMenuGroup["items"] = [
+    {
+      key: "summary-model",
+      label: ui("Summary model"),
+      icon: Sparkles,
+      disabled:
+        !summaryPresetReady ||
+        summaryPresetSaving ||
+        summaryPresets.length === 0,
+      submenu: {
+        selectedKey: summaryPresetId,
+        selectedLabel: summaryPresetReady
+          ? summaryPresetModelLabel(summaryPreset) || "select"
+          : "loading…",
+        options: summaryPresets.map((preset) => ({
+          key: preset.id,
+          label: preset.id,
+          detail: summaryPresetModelLabel(preset),
+          onSelect: () => void handleSummaryPresetSelect(preset),
+        })),
+      },
+    },
+  ];
+  if (!isLive && !resuming) {
+    summaryMenuItems.push({
+      key: "summarize",
+      label: summaryActionLabel,
+      icon: summaryWorking
+        ? Loader2
+        : visibleSummaryLifecycle.kind === "completed" ||
+            visibleSummaryLifecycle.kind === "failed"
+          ? RefreshCw
+          : Sparkles,
+      onSelect: () => handleSummaryAction(),
+      disabled: summaryWorking || retranscribing || !canSummarizeMeeting,
+    });
+  }
+  const meetingMenuGroups: MeetingMenuGroup[] = [
+    { label: ui("Summary"), items: summaryMenuItems },
+    ...(isLive || resuming
+      ? []
+      : [
+          {
+            label: ui("Meeting"),
+            items: [
+              {
+                key: "resume",
+                label: resuming ? ui("Resuming meeting") : ui("Resume meeting"),
+                icon: resuming ? Loader2 : Play,
+                onSelect: () => void onResume(),
+                disabled: resuming,
+              },
+              {
+                key: "retranscribe",
+                label: ui("Retranscribe saved audio"),
+                icon: retranscribing ? Loader2 : AudioLines,
+                onSelect: () => setConfirmingAction("retranscribe"),
+                disabled: retranscribing || summaryWorking,
+              },
+              {
+                key: "export",
+                label: ui("Export to mp4"),
+                icon: exporting ? Loader2 : Download,
+                onSelect: () => void handleExport(),
+                disabled: exporting,
+              },
+              {
+                key: "delete",
+                label: ui("Delete meeting"),
+                icon: Trash2,
+                onSelect: () => setConfirmingAction("delete"),
+                destructive: true,
+              },
+            ],
+          },
+        ]),
+  ];
 
   // The confirmations are controlled by `confirmingAction`, so they no longer
   // need to wrap the trigger that opens them.
@@ -1682,34 +2203,34 @@ export function NoteView({
       {confirmingAction === "retranscribe" ? (
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>retranscribe meeting</AlertDialogTitle>
+            <AlertDialogTitle>Retranscribe meeting</AlertDialogTitle>
             <AlertDialogDescription>
-              rebuild the transcript from saved audio. this replaces the current
+              Rebuild the transcript from saved audio. This replaces the current
               transcript and refreshes the summary when automatic summary is on.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={() => void handleRetranscribe()}>
-              retranscribe
+              Retranscribe
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       ) : confirmingAction === "delete" ? (
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>delete meeting</AlertDialogTitle>
+            <AlertDialogTitle>Delete meeting</AlertDialogTitle>
             <AlertDialogDescription>
-              your notes and transcript will be permanently deleted.
+              Your notes and transcript will be permanently deleted.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               onClick={() => void handleDelete()}
             >
-              delete
+              Delete
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1721,15 +2242,19 @@ export function NoteView({
     <div ref={rootRef} className="relative flex h-full flex-col bg-background">
       <ConnectedShareDialog
         open={shareOpen}
-        onOpenChange={setShareOpen}
+        onOpenChange={(open) => {
+          setShareOpen(open);
+          if (!open) setRequestedShareDestination(null);
+        }}
         artifact={shareArtifact}
+        initialDestination={requestedShareDestination}
       />
       {meetingConfirmations}
-      {isDraggingImage && (
+      {isDraggingImage && !summaryWorking && (
         <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center bg-background/60">
           <div className="border border-foreground bg-foreground px-12 py-10 text-background">
             <span className="text-sm font-medium tracking-tight">
-              drop image to add to note
+              Drop image to add to note
             </span>
           </div>
         </div>
@@ -1743,23 +2268,23 @@ export function NoteView({
             variant="ghost"
             size="sm"
             onClick={onBack}
-            aria-label="back to meetings"
+            aria-label={ui("Back to meetings")}
             className={cn(
               MEETING_QUIET_CONTROL_CLASS,
               "-ml-2 h-7 gap-1.5 px-2 text-xs",
             )}
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            meetings
+            Meetings
           </Button>
 
           <div className="mt-1 flex min-w-0 items-center gap-2">
             <input
               value={title}
               onChange={(event) => setTitle(event.target.value)}
-              placeholder="untitled meeting"
+              placeholder={ui("Untitled meeting")}
               spellCheck={false}
-              aria-label="meeting title"
+              aria-label={ui("Meeting title")}
               className="min-w-0 flex-1 bg-transparent text-xl font-medium leading-tight tracking-tight text-foreground placeholder:text-muted-foreground/40 focus:outline-none sm:text-2xl"
             />
           </div>
@@ -1788,7 +2313,7 @@ export function NoteView({
             {meeting.meeting_app && meeting.meeting_app !== "manual" && (
               <>
                 <span aria-hidden>·</span>
-                <span>{meeting.meeting_app.toLowerCase()}</span>
+                <span>{meeting.meeting_app}</span>
               </>
             )}
             <span className="ml-1">
@@ -1799,6 +2324,8 @@ export function NoteView({
               />
             </span>
           </div>
+
+          {onOpenCalendarConnections && <CalendarNudge meeting={meeting} onConnect={onOpenCalendarConnections} />}
 
           <MeetingWorkspaceTabs
             value={activeTab}
@@ -1816,6 +2343,36 @@ export function NoteView({
             // and one menu holding everything else — destinations and meeting
             // lifecycle both, which is what let the second dropdown go away.
             trailing={
+              <>
+              {/* The one entry point. Chat is a lens over whichever tab is
+                  open, so it belongs on the rule that spans all of them,
+                  beside the other whole-meeting actions. Nothing is rendered
+                  until this is pressed. */}
+              <button
+                type="button"
+                data-testid="meeting-chat-toggle"
+                aria-label={ui("Ask about this meeting")}
+                aria-pressed={chatOpen}
+                title={ui("Ask about this meeting")}
+                onClick={() => {
+                  setChatOpen((open) => {
+                    if (!open) {
+                      posthog.capture("meeting_chat_opened", {
+                        tab: activeTab,
+                        has_summary: canShareSummary,
+                      });
+                    }
+                    return !open;
+                  });
+                }}
+                className={cn(
+                  MEETING_RULE_ACTION_CLASS,
+                  "px-4",
+                  chatOpen && "bg-foreground text-background",
+                )}
+              >
+                <MessageSquareText className="h-3.5 w-3.5" />
+              </button>
               <MeetingShareMenu
                 canShareSummary={canShareSummary}
                 canSend={shareArtifact.sections.length > 0}
@@ -1837,6 +2394,7 @@ export function NoteView({
                   });
                 }}
                 resendLabel={oneTapSend.label ?? undefined}
+                suggestedDestinations={oneTapSend.suggestions}
                 onShare={(action) => {
                   posthog.capture("meeting_share_action", {
                     action,
@@ -1849,11 +2407,26 @@ export function NoteView({
                   if (action === "summary") void handleCopySummary();
                   else if (action === "email") void handleEmailSummary();
                   else if (action === "transcript") void handleCopyTranscript();
-                  else if (action === "send") setShareOpen(true);
+                  else if (action === "send") {
+                    setRequestedShareDestination(null);
+                    setShareOpen(true);
+                  }
                   else if (action === "resend") void handleOneTapSend();
                   else void handleCopy();
                 }}
+                onDestinationSelect={(destination) => {
+                  const suggestion = oneTapSend.suggestions.find(
+                    (item) => item.destination === destination,
+                  );
+                  posthog.capture("meeting_share_destination_clicked", {
+                    destination,
+                    observed_in_meeting: suggestion?.observed === true,
+                  });
+                  setRequestedShareDestination(destination);
+                  setShareOpen(true);
+                }}
               />
+              </>
             }
           />
         </div>
@@ -1862,7 +2435,10 @@ export function NoteView({
       {/* Each tab owns exactly one scroll viewport. The notes editor remains
           mounted while hidden so switching tabs never drops draft/selection
           state. The footer is a flex sibling, so no tab can render beneath it. */}
-      <main className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
+      <div ref={mainRef} className="relative flex min-h-0 min-w-0 flex-1">
+      <main
+        className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
+      >
         <section
           id="meeting-panel-notes"
           role="tabpanel"
@@ -1886,7 +2462,9 @@ export function NoteView({
               key={meeting.id}
               value={note}
               onChange={setNote}
-              placeholder={'write notes, or type "/" for blocks'}
+              placeholder={
+                ui("Write what matters — it helps focus the summary · \"/\" for blocks")
+              }
               readOnly={summaryWorking}
               summaryRevealKey={summaryRevealKey}
               className={cn(
@@ -1913,8 +2491,6 @@ export function NoteView({
               devices={audioStatusDevices}
               isLive={isLive}
               settings={settings}
-              englishOnly={englishOnly}
-              onLanguagePreference={setLanguagePreference}
             />
           }
         />
@@ -1927,7 +2503,57 @@ export function NoteView({
             streamedSummary={streamedSummary}
             onGenerate={handleSummaryAction}
             canGenerate={
-              canSummarizeMeeting && !summaryWorking && !retranscribing
+              canSummarizeMeeting &&
+              !summaryWorking &&
+              !retranscribing &&
+              !summaryPresetSaving
+            }
+            recovery={
+              summaryFailure
+                ? {
+                    title: summaryFailure.title,
+                    detail: summaryFailure.copy,
+                    retryable: summaryFailure.retryable,
+                    upgrade: summaryUpgrade
+                      ? {
+                          label: ui("Upgrade to {value1}", { value1: QUOTA_PLAN_LABELS[
+                            summaryUpgrade.requiredPlan
+                          ].toLowerCase() }),
+                          onSelect: () => void handleSummaryUpgrade(),
+                        }
+                      : undefined,
+                    model: summaryFailure.changeModelRecommended
+                      ? {
+                          selectedId: summaryPresetId,
+                          selectedLabel: summaryPreset
+                            ? `${summaryPreset.id} · ${summaryPreset.model}`
+                            : "no summary model selected",
+                          saving: summaryPresetSaving,
+                          options: summaryPresets
+                            .filter((preset) => preset.id !== summaryPresetId)
+                            .map((preset) => ({
+                              id: preset.id,
+                              label: preset.id,
+                              detail: `${preset.provider.replace(/-/g, " ")} · ${preset.model}`,
+                              onSelect: () => {
+                                void (async () => {
+                                  const changed =
+                                    await handleSummaryPresetSelect(preset);
+                                  if (changed) await handleSummarize();
+                                })();
+                              },
+                            })),
+                          onManage: () => {
+                            window.dispatchEvent(
+                              new CustomEvent("open-settings", {
+                                detail: { section: "ai" },
+                              }),
+                            );
+                          },
+                        }
+                      : undefined,
+                  }
+                : undefined
             }
             // Mounted with the tab rather than always: the strip pulls the
             // meeting's transcript rows and frame samples, and opening a
@@ -1958,6 +2584,38 @@ export function NoteView({
           />
         )}
       </main>
+
+      {/* Beside the document, not beneath it. Nothing renders until the ask
+          control is used, so notes and summary keep the footer-free shell they
+          have today. */}
+      {chatOpen && (
+        <MeetingChatPanel
+          conditions={chatConditions}
+          meetingTitle={title}
+          meetingStart={meeting.meeting_start}
+          meetingEnd={meeting.meeting_end}
+          turns={meetingChat.turns}
+          draft={chatDraft}
+          onDraftChange={setChatDraft}
+          onSubmit={meetingChat.send}
+          onStop={meetingChat.stop}
+          onRetry={meetingChat.retry}
+          onClose={() => setChatOpen(false)}
+          activePreset={chatPreset}
+          onPresetSelect={handleChatPresetSelect}
+          onAcpConfigDefault={handleChatAcpConfigDefault}
+          onRunSummary={handleSummaryAction}
+          citationWindow={citationWindow}
+          onCitationClick={handleCitationClick}
+          viewportWidth={paneWidth}
+          storedWidth={storedPanelWidth}
+          onWidthChange={(next) => {
+            setStoredPanelWidth(next);
+            writeStoredChatWidth(next);
+          }}
+        />
+      )}
+      </div>
 
       {footerVisible && (
       <footer className="z-30 min-w-0 shrink-0 border-t border-border bg-background">
@@ -2018,11 +2676,11 @@ export function NoteView({
                 )}
               >
                 {isLive && captureState?.severity !== "warning" ? (
-                  // Live waveform driven by the polled device levels — motion
-                  // (not color) carries the "listening" state. A flat line
-                  // means armed but hearing nothing yet.
+                  // Keep listening while capture continues, including silence
+                  // and transcription backlog. Waiting severity alone does not
+                  // mean the recorder stopped.
                   <ListeningSticks
-                    active={captureState?.severity !== "waiting"}
+                    active={captureState?.recordingContinues ?? true}
                     level={audioLevelToMeterValue(
                       maxAudioDeviceLevel(audioStatusDevices),
                     )}
@@ -2073,11 +2731,9 @@ export function NoteView({
                         type="button"
                         data-testid="meeting-summary-upgrade-link"
                         className="underline underline-offset-2 transition-colors hover:text-foreground"
-                        onClick={() =>
-                          void openExternalUrl(summaryUpgrade.upgradeUrl)
-                        }
+                        onClick={() => void handleSummaryUpgrade()}
                       >
-                        upgrade to{" "}
+                        Upgrade to{" "}
                         {QUOTA_PLAN_LABELS[
                           summaryUpgrade.requiredPlan
                         ].toLowerCase()}
@@ -2106,7 +2762,7 @@ export function NoteView({
                       onClick={() => void handleStopClick()}
                       disabled={stopping || savingBeforeStop}
                       aria-label={stopActionLabel}
-                      className="h-9 gap-2 rounded-none px-3 font-mono text-[10px] uppercase tracking-[0.1em] disabled:border-border disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-100"
+                      className="h-9 gap-2 rounded-md px-3 font-mono text-[10px] normal-case tracking-[0.1em] disabled:border-border disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-100"
                     >
                       {stopping || savingBeforeStop ? (
                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -2145,7 +2801,7 @@ function MeetingControlTooltip({
       <TooltipTrigger asChild>
         <span className="inline-flex">{children}</span>
       </TooltipTrigger>
-      <TooltipContent side="top" className="rounded-none font-mono text-xs">
+      <TooltipContent side="top" className="rounded-lg font-mono text-xs">
         {label}
       </TooltipContent>
     </Tooltip>
@@ -2156,17 +2812,20 @@ function AudioHealthButton({
   devices,
   isLive,
   settings,
-  englishOnly,
-  onLanguagePreference,
 }: {
   devices: AudioStatusDevice[];
   isLive: boolean;
   settings: Settings;
-  englishOnly: boolean;
-  onLanguagePreference: (languages: string[]) => void | Promise<void>;
 }) {
+
+  const ui = useGT();
   const inputs = devices.filter((device) => device.kind === "input");
   const outputs = devices.filter((device) => device.kind === "output");
+  const languageLabel = settings.languages.length === 0
+    ? ui("Auto-detect")
+    : settings.languages
+        .map((code) => LANGUAGE_OPTIONS.find((language) => language.code === code)?.name ?? code)
+        .join(", ");
   const selectedDevices = (settings.audioDevices ?? []).filter(
     (device) => device && device !== "default",
   );
@@ -2196,11 +2855,11 @@ function AudioHealthButton({
           variant="ghost"
           size="sm"
           className={cn(
-            "relative h-7 w-7 rounded-none p-0",
+            "relative h-7 w-7 rounded-md p-0",
             open && "invisible",
           )}
-          title="audio health"
-          aria-label="audio health"
+          title={ui("Audio health")}
+          aria-label={ui("Audio health")}
         >
           <AudioLines className="h-3.5 w-3.5" />
           {anyAudioActive && (
@@ -2224,14 +2883,14 @@ function AudioHealthButton({
                 <span className="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full bg-foreground" />
               )}
             </span>
-            audio settings
+            Audio settings
           </div>
           <button
             type="button"
             onClick={openAudioSettings}
             className="flex h-7 w-7 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
-            title="open audio settings"
-            aria-label="open audio settings"
+            title={ui("Open audio settings")}
+            aria-label={ui("Open audio settings")}
           >
             <ExternalLink className="h-3.5 w-3.5" />
           </button>
@@ -2240,7 +2899,7 @@ function AudioHealthButton({
         <div className="px-3 py-3">
           <AudioDeviceRow
             icon={<Mic2 className="h-3.5 w-3.5" />}
-            label="audio input"
+            label={ui("Audio input")}
             value={audioDeviceLabel({
               devices: inputs,
               selectedDevices,
@@ -2254,7 +2913,7 @@ function AudioHealthButton({
           />
           <AudioDeviceRow
             icon={<Volume2 className="h-3.5 w-3.5" />}
-            label="system audio"
+            label={ui("System audio")}
             value={audioDeviceLabel({
               devices: outputs,
               selectedDevices,
@@ -2268,14 +2927,14 @@ function AudioHealthButton({
           />
 
           <div className="mt-3 grid grid-cols-[112px_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[11px] leading-tight">
-            <span className="text-muted-foreground">transcription engine</span>
+            <span className="text-muted-foreground">Transcription engine</span>
             <span className="truncate">
               {liveEnabled
                 ? providerLabel(
                     settings.meetingLiveTranscriptionProvider,
                     settings.audioTranscriptionEngine,
                   )
-                : "off"}
+                : ui("Off")}
             </span>
           </div>
         </div>
@@ -2283,36 +2942,11 @@ function AudioHealthButton({
         <div className="flex items-center justify-between gap-3 border-t border-border px-3 py-2.5">
           <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
             <Languages className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate">language</span>
+            <span className="truncate">Language</span>
           </div>
-          <div className="inline-flex shrink-0 border border-border">
-            <button
-              type="button"
-              onClick={() => void onLanguagePreference(["english"])}
-              className={cn(
-                "flex h-8 min-w-16 items-center justify-center gap-1.5 px-2 text-[11px] transition-colors hover:bg-muted",
-                englishOnly
-                  ? "bg-foreground text-background"
-                  : "text-muted-foreground",
-              )}
-            >
-              <span>english</span>
-              {englishOnly && <Check className="h-3 w-3" />}
-            </button>
-            <button
-              type="button"
-              onClick={() => void onLanguagePreference([])}
-              className={cn(
-                "flex h-8 min-w-14 items-center justify-center gap-1.5 border-l border-border px-2 text-[11px] transition-colors hover:bg-muted",
-                !englishOnly
-                  ? "bg-foreground text-background"
-                  : "text-muted-foreground",
-              )}
-            >
-              <span>auto</span>
-              {!englishOnly && <Check className="h-3 w-3" />}
-            </button>
-          </div>
+          <span className="max-w-[170px] truncate text-xs" title={languageLabel}>
+            {languageLabel}
+          </span>
         </div>
       </PopoverContent>
     </Popover>
@@ -2330,7 +2964,8 @@ function JoinMeetingSuggestion({
   onJoin: () => void;
   onDismiss: () => void;
 }) {
-  const label = mapped ? link.label : "nearby calendar event — join the call?";
+  const ui = useGT();
+  const label = mapped ? link.label : "Nearby calendar event — join the call?";
   return (
     <div className="mb-3 flex justify-center">
       <div className="inline-flex max-w-full items-center gap-1 rounded-full border border-border bg-muted px-1 py-1 shadow-sm">
@@ -2347,8 +2982,8 @@ function JoinMeetingSuggestion({
           type="button"
           onClick={onDismiss}
           className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
-          aria-label="dismiss join suggestion"
-          title="dismiss"
+          aria-label={ui("Dismiss join suggestion")}
+          title={ui("Dismiss")}
         >
           <X className="h-4 w-4" />
         </button>
@@ -2366,6 +3001,7 @@ function InactivityResumeBanner({
   onDismiss: () => void;
   onResume: () => void;
 }) {
+  const ui = useGT();
   return (
     <div className="mb-3 flex items-center justify-between gap-3 border border-border bg-background px-3 py-2 shadow-sm">
       <div className="flex min-w-0 items-center gap-3">
@@ -2379,32 +3015,32 @@ function InactivityResumeBanner({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 rounded-none px-2 text-muted-foreground hover:text-foreground"
+          className="h-8 rounded-md px-2 text-muted-foreground hover:text-foreground"
           onClick={onDismiss}
         >
-          dismiss
+          Dismiss
         </Button>
         <Button
           type="button"
           variant="secondary"
           size="sm"
-          className="h-8 rounded-none px-3"
+          className="h-8 rounded-md px-3"
           onClick={onResume}
           disabled={resuming}
         >
           {resuming ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (
-            "resume"
+            ui("Resume")
           )}
         </Button>
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 w-8 rounded-none p-0 text-muted-foreground hover:text-foreground sm:hidden"
+          className="h-8 w-8 rounded-md p-0 text-muted-foreground hover:text-foreground sm:hidden"
           onClick={onDismiss}
-          aria-label="dismiss inactivity message"
+          aria-label={ui("Dismiss inactivity message")}
         >
           <X className="h-3.5 w-3.5" />
         </Button>
@@ -2424,6 +3060,7 @@ function LiveCaptureIssueBanner({
   resuming: boolean;
   onResumeInput: () => void;
 }) {
+  const ui = useGT();
   return (
     <div className="mb-3 flex items-center justify-between gap-3 border border-amber-500/30 bg-amber-500/10 px-3 py-2 shadow-sm">
       <div className="flex min-w-0 items-start gap-3">
@@ -2434,7 +3071,7 @@ function LiveCaptureIssueBanner({
           </div>
           <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
             {state.description}
-            {state.recordingContinues ? " Recording continues." : ""}
+            {state.recordingContinues ? ui(" Recording continues.") : ""}
           </div>
         </div>
       </div>
@@ -2443,14 +3080,14 @@ function LiveCaptureIssueBanner({
           type="button"
           variant="secondary"
           size="sm"
-          className="h-8 shrink-0 rounded-none px-3"
+          className="h-8 shrink-0 rounded-md px-3"
           onClick={onResumeInput}
           disabled={resuming}
         >
           {resuming ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (
-            "resume mic"
+            ui("Resume mic")
           )}
         </Button>
       )}
@@ -2486,6 +3123,7 @@ function AudioDeviceRow({
 }
 
 function AudioLevelBars({ active, level }: { active: boolean; level: number }) {
+
   const meterValue = active ? audioLevelToMeterValue(level) : 0;
   const bars = [0.45, 0.72, 1, 0.72, 0.45];
 
@@ -2535,11 +3173,12 @@ function Pill({
 }
 
 function SaveIndicator({ state }: { state: SaveState }) {
+
   if (state.kind === "saving") {
     return (
       <span className="flex items-center gap-1.5">
         <Loader2 className="h-3 w-3 animate-spin" />
-        saving…
+        Saving…
       </span>
     );
   }
@@ -2547,12 +3186,12 @@ function SaveIndicator({ state }: { state: SaveState }) {
     return (
       <span className="flex items-center gap-1.5">
         <Check className="h-3 w-3" />
-        saved · {formatClock(new Date(state.at).toISOString())}
+        Saved · {formatClock(new Date(state.at).toISOString())}
       </span>
     );
   }
   if (state.kind === "error") {
-    return <span className="text-destructive">offline — will retry</span>;
+    return <span className="text-destructive">Offline — will retry</span>;
   }
   return <span aria-hidden>&nbsp;</span>;
 }
@@ -2566,6 +3205,7 @@ function MeetingDuration({
   endIso: string | null;
   isLive: boolean;
 }) {
+
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -2765,25 +3405,25 @@ function providerLabel(
     case "selected-engine":
       return transcriptionEngineLabel(selectedEngine);
     case "deepgram-live":
-      return "deepgram live";
+      return "Deepgram live";
     case "screenpipe-cloud":
     default:
-      return "screenpipe cloud";
+      return "Screenpipe cloud";
   }
 }
 
 function transcriptionEngineLabel(engine: string) {
   switch (engine) {
     case "screenpipe-cloud":
-      return "screenpipe cloud";
+      return "Screenpipe cloud";
     case "deepgram":
-      return "deepgram";
+      return "Deepgram";
     case "whisper-large-v3-turbo":
-      return "whisper turbo";
+      return "Whisper turbo";
     case "whisper-large-v3-turbo-quantized":
-      return "whisper turbo fast";
+      return "Whisper turbo fast";
     case "openai-compatible":
-      return "openai compatible";
+      return "OpenAI compatible";
     case "disabled":
       return "off";
     default:

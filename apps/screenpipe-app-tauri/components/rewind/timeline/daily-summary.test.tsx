@@ -253,7 +253,7 @@ describe("TimelineDailySummary", () => {
 				screen.queryByTestId("timeline-daily-summary-panel"),
 			).not.toBeInTheDocument();
 		});
-		expect(screen.queryByText("turn on enhanced ai?")).not.toBeInTheDocument();
+		expect(screen.queryByText("Turn on enhanced AI?")).not.toBeInTheDocument();
 	});
 
 	it("closes the top summary before Escape can close its overlay host", async () => {
@@ -293,7 +293,7 @@ describe("TimelineDailySummary", () => {
 
 		fireEvent.click(screen.getByTestId("timeline-daily-summary-trigger"));
 
-		expect(screen.getByText("turn on enhanced ai?")).toBeInTheDocument();
+		expect(screen.getByText("Turn on enhanced AI?")).toBeInTheDocument();
 		expect(
 			screen.getByText(/never run on a timer or generate automatically/i),
 		).toBeInTheDocument();
@@ -327,6 +327,7 @@ describe("TimelineDailySummary", () => {
 				preset: PIPE_PRESET,
 				userToken: "test-token",
 				signal: expect.any(AbortSignal),
+				recoverTransientRuntimeStart: true,
 			}),
 		);
 		expect(
@@ -340,6 +341,39 @@ describe("TimelineDailySummary", () => {
 				format_valid: true,
 			}),
 		);
+	});
+
+	it("records an explicit terminal event when generation is cancelled", async () => {
+		mocks.settings.enhancedAI = true;
+		mocks.runDailySummaryWithPi.mockImplementation(
+			({ signal }: { signal: AbortSignal }) =>
+				new Promise((_resolve, reject) => {
+					signal.addEventListener(
+						"abort",
+						() => {
+							const error = new Error("daily summary generation aborted");
+							error.name = "AbortError";
+							reject(error);
+						},
+						{ once: true },
+					);
+				}),
+		);
+		render(<TimelineDailySummary currentDate={new Date(2026, 6, 25)} />);
+
+		fireEvent.click(screen.getByTestId("timeline-daily-summary-trigger"));
+		fireEvent.click(
+			await screen.findByRole("button", {
+				name: "Stop and close daily summary",
+			}),
+		);
+
+		await waitFor(() => {
+			expect(mocks.posthogCapture).toHaveBeenCalledWith(
+				"timeline_daily_summary_cancelled",
+				expect.objectContaining({ reason: "panel_closed" }),
+			);
+		});
 	});
 
 	it("offers a plan upgrade instead of a bare retry when the usage limit is hit", async () => {

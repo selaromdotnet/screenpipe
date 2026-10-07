@@ -33,6 +33,7 @@ pub mod enhanced_mode_cache;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use screenpipe_config::{DomainRule, UrlRule};
 use screenpipe_core::window_pattern::WindowPattern;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -193,6 +194,10 @@ pub struct AccessibilityTreeNode {
     /// Space-delimited parser-only DOM classes.
     #[serde(skip)]
     pub semantic_dom_classes: Option<String>,
+    /// Positive-sized native geometry lies outside the window, even when
+    /// screenshot-normalized bounds were discarded. Parser-only evidence.
+    #[serde(skip)]
+    pub semantic_offscreen: bool,
 }
 
 impl AccessibilityTreeNode {
@@ -227,6 +232,7 @@ impl AccessibilityTreeNode {
             semantic_description: None,
             semantic_dom_identifier: None,
             semantic_dom_classes: None,
+            semantic_offscreen: false,
         }
     }
 }
@@ -346,6 +352,9 @@ pub enum TruncationReason {
     Timeout,
     /// Hit the maximum node count (`max_nodes`).
     MaxNodes,
+    /// Retained discovery has more bounded work queued. This is cooperative
+    /// continuation, not provider overload.
+    Pending,
 }
 
 /// Screen bounds of the focused window, normalized to the monitor's extent
@@ -402,6 +411,9 @@ pub struct TreeSnapshot {
     pub truncated: bool,
     /// Why the walk stopped (timeout, max_nodes, or completed naturally).
     pub truncation_reason: TruncationReason,
+    /// Internal owner-thread work may remain after this snapshot becomes
+    /// publishable (for example, bounded property refresh at the node cap).
+    pub retained_work_pending: bool,
     /// Deepest depth reached during the walk.
     pub max_depth_reached: usize,
     /// Screen bounds of the walked (focused) window, normalized to the
@@ -488,9 +500,12 @@ pub struct TreeWalkerConfig {
     pub ignored_window_patterns: Vec<WindowPattern>,
     /// Cached parse of `included_windows`, populated by `compile_patterns()`.
     pub included_window_patterns: Vec<WindowPattern>,
-    /// User-configured URLs to ignore (domain-level match on the focused
-    /// browser tab's URL — see [`crate::url_filter::is_url_blocked`]).
-    pub ignored_urls: Vec<String>,
+    /// User-configured URL block rules. Legacy strings and strict structured
+    /// hostname rules share this one list.
+    pub ignored_urls: Vec<UrlRule>,
+    /// Strict hostname allowlist. When non-empty, a positively detected
+    /// matching browser URL is required for every captured tree.
+    pub included_urls: Vec<DomainRule>,
     /// Monitor origin X in screen points (virtual desktop coordinate space).
     /// Used to normalize element bounds to monitor-relative 0-1 coords.
     pub monitor_x: f64,
@@ -558,6 +573,7 @@ impl Default for TreeWalkerConfig {
             ignored_window_patterns: Vec::new(),
             included_window_patterns: Vec::new(),
             ignored_urls: Vec::new(),
+            included_urls: Vec::new(),
             monitor_x: 0.0,
             monitor_y: 0.0,
             monitor_width: 0.0,
@@ -667,6 +683,51 @@ pub enum FocusedWindowFilterResult {
     NotFound,
 }
 
+impl FocusedWindowFilterResult {
+    /// Whether metadata alone permits a screenshot while tree extraction is
+    /// deferred. URL policies and ignored browser-extension popups require
+    /// fresh tree data; fail closed without it.
+    pub fn permits_deferred_capture(&self, config: &TreeWalkerConfig) -> bool {
+        config.ignored_windows.is_empty()
+            && config.ignored_urls.is_empty()
+            && config.included_urls.is_empty()
+            && matches!(self, Self::Allowed { .. })
+    }
+}
+
+#[cfg(test)]
+mod deferred_capture_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_preserves_privacy_and_requires_known_window_metadata() {
+        let mut config = TreeWalkerConfig::default();
+        let allowed = FocusedWindowFilterResult::Allowed {
+            app_name: "msedge.exe".into(),
+            window_name: "CPU list".into(),
+        };
+        assert!(allowed.permits_deferred_capture(&config));
+        assert!(!FocusedWindowFilterResult::NotFound.permits_deferred_capture(&config));
+        config.ignored_windows.push("Private extension".into());
+        assert!(!allowed.permits_deferred_capture(&config));
+        config.ignored_windows.clear();
+        for reason in [
+            SkipReason::Incognito,
+            SkipReason::ExcludedApp,
+            SkipReason::UserIgnored,
+            SkipReason::NotInIncludeList,
+            SkipReason::BlockedUrl,
+        ] {
+            assert!(!FocusedWindowFilterResult::Skipped(reason).permits_deferred_capture(&config));
+        }
+        config.ignored_urls = serde_json::from_str(r#"["private.example"]"#).unwrap();
+        assert!(!allowed.permits_deferred_capture(&config));
+        config.ignored_urls.clear();
+        config.included_urls = serde_json::from_str(r#"[{"domain":"work.example"}]"#).unwrap();
+        assert!(!allowed.permits_deferred_capture(&config));
+    }
+}
+
 /// Reason a window was skipped during tree walk.
 #[derive(Debug, Clone)]
 pub enum SkipReason {
@@ -678,8 +739,12 @@ pub enum SkipReason {
     UserIgnored,
     /// User-configured included window whitelist didn't match.
     NotInIncludeList,
-    /// Focused browser tab's URL matched a user-configured ignored URL.
+    /// Focused browser tab was rejected by the configured URL policy.
     BlockedUrl,
+    /// URL policy is configured and bounded discovery has not reached the
+    /// committed browser document yet. Pixels remain withheld, but retained
+    /// discovery must continue rather than resetting on every slice.
+    UrlPending,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -689,7 +754,8 @@ impl std::fmt::Display for SkipReason {
             SkipReason::ExcludedApp => write!(f, "excluded app"),
             SkipReason::UserIgnored => write!(f, "user-configured ignored window"),
             SkipReason::NotInIncludeList => write!(f, "not in included windows list"),
-            SkipReason::BlockedUrl => write!(f, "user-configured ignored URL"),
+            SkipReason::BlockedUrl => write!(f, "blocked by browser URL policy"),
+            SkipReason::UrlPending => write!(f, "browser URL privacy validation pending"),
         }
     }
 }
@@ -704,6 +770,10 @@ pub trait TreeWalkerPlatform: Send {
     /// Windows keeps COM/UIA cache objects on the walker thread, so callers
     /// should update the config instead of recreating the walker in hot paths.
     fn update_config(&mut self, _config: TreeWalkerConfig) {}
+
+    /// Release subscriptions and retained private state on the platform
+    /// walker's owning thread. The next walk must start from a fresh tree.
+    fn suspend(&mut self) {}
 }
 
 /// Evaluate app, title, and incognito filters without walking the focused
@@ -782,6 +852,7 @@ fn apply_focused_window_filters(
 /// Create a platform-appropriate tree walker.
 pub fn create_tree_walker(config: TreeWalkerConfig) -> Box<dyn TreeWalkerPlatform> {
     let ignored_urls = config.ignored_urls.clone();
+    let included_urls = config.included_urls.clone();
     let walker: Box<dyn TreeWalkerPlatform> = {
         #[cfg(target_os = "macos")]
         {
@@ -800,10 +871,10 @@ pub fn create_tree_walker(config: TreeWalkerConfig) -> Box<dyn TreeWalkerPlatfor
             Box::new(StubTreeWalker)
         }
     };
-    if ignored_urls.is_empty() {
+    if ignored_urls.is_empty() && included_urls.is_empty() {
         walker
     } else {
-        Box::new(UrlFilteredWalker::new(walker, ignored_urls))
+        Box::new(UrlFilteredWalker::new(walker, ignored_urls, included_urls))
     }
 }
 
@@ -812,17 +883,23 @@ pub fn create_tree_walker(config: TreeWalkerConfig) -> Box<dyn TreeWalkerPlatfor
 /// platform walker) applies the filter uniformly across macOS/Windows/Linux.
 struct UrlFilteredWalker {
     inner: Box<dyn TreeWalkerPlatform>,
-    ignored_urls: Vec<String>,
-    ignored_url_patterns: Vec<String>,
+    ignored_urls: Vec<UrlRule>,
+    included_urls: Vec<DomainRule>,
+    policy: crate::url_filter::UrlPolicy,
 }
 
 impl UrlFilteredWalker {
-    fn new(inner: Box<dyn TreeWalkerPlatform>, ignored_urls: Vec<String>) -> Self {
-        let ignored_url_patterns = crate::url_filter::normalize_blocked_patterns(&ignored_urls);
+    fn new(
+        inner: Box<dyn TreeWalkerPlatform>,
+        ignored_urls: Vec<UrlRule>,
+        included_urls: Vec<DomainRule>,
+    ) -> Self {
+        let policy = crate::url_filter::UrlPolicy::new(&ignored_urls, &included_urls);
         Self {
             inner,
             ignored_urls,
-            ignored_url_patterns,
+            included_urls,
+            policy,
         }
     }
 }
@@ -831,25 +908,28 @@ impl TreeWalkerPlatform for UrlFilteredWalker {
     fn walk_focused_window(&self) -> Result<TreeWalkResult> {
         let result = self.inner.walk_focused_window()?;
         if let TreeWalkResult::Found(ref snapshot) = result {
-            if let Some(ref url) = snapshot.browser_url {
-                if crate::url_filter::is_url_blocked_by_normalized_patterns(
-                    url,
-                    &self.ignored_url_patterns,
-                ) {
-                    return Ok(TreeWalkResult::Skipped(SkipReason::BlockedUrl));
-                }
+            if !self
+                .policy
+                .should_capture_window(Some(&snapshot.app_name), snapshot.browser_url.as_deref())
+            {
+                return Ok(TreeWalkResult::Skipped(SkipReason::BlockedUrl));
             }
         }
         Ok(result)
     }
 
     fn update_config(&mut self, config: TreeWalkerConfig) {
-        if self.ignored_urls != config.ignored_urls {
-            self.ignored_url_patterns =
-                crate::url_filter::normalize_blocked_patterns(&config.ignored_urls);
+        if self.ignored_urls != config.ignored_urls || self.included_urls != config.included_urls {
             self.ignored_urls = config.ignored_urls.clone();
+            self.included_urls = config.included_urls.clone();
+            self.policy =
+                crate::url_filter::UrlPolicy::new(&self.ignored_urls, &self.included_urls);
         }
         self.inner.update_config(config);
+    }
+
+    fn suspend(&mut self) {
+        self.inner.suspend();
     }
 }
 
@@ -887,6 +967,7 @@ mod tests {
             simhash: 0,
             truncated: false,
             truncation_reason: TruncationReason::None,
+            retained_work_pending: false,
             max_depth_reached: 1,
             window_bounds: None,
         }
@@ -896,6 +977,14 @@ mod tests {
     impl TreeWalkerPlatform for FakeWalker {
         fn walk_focused_window(&self) -> Result<TreeWalkResult> {
             Ok(TreeWalkResult::Found(snapshot_with_url(self.0.as_deref())))
+        }
+    }
+
+    fn domain_rule(domain: &str, include_subdomains: bool) -> DomainRule {
+        DomainRule {
+            domain: domain.into(),
+            include_subdomains,
+            excluded_subdomains: Vec::new(),
         }
     }
 
@@ -941,7 +1030,8 @@ mod tests {
     fn test_url_filtered_walker_blocks_matching_url() {
         let walker = UrlFilteredWalker::new(
             Box::new(FakeWalker(Some("https://www.chase.com/login".into()))),
-            vec!["chase.com".into()],
+            vec![UrlRule::Legacy("chase.com".into())],
+            vec![],
         );
         assert!(matches!(
             walker.walk_focused_window().unwrap(),
@@ -953,7 +1043,8 @@ mod tests {
     fn test_url_filtered_walker_passes_other_urls() {
         let walker = UrlFilteredWalker::new(
             Box::new(FakeWalker(Some("https://example.com".into()))),
-            vec!["chase.com".into()],
+            vec![UrlRule::Legacy("chase.com".into())],
+            vec![],
         );
         assert!(matches!(
             walker.walk_focused_window().unwrap(),
@@ -962,11 +1053,72 @@ mod tests {
     }
 
     #[test]
-    fn test_url_filtered_walker_passes_non_browser_windows() {
-        let walker = UrlFilteredWalker::new(Box::new(FakeWalker(None)), vec!["chase.com".into()]);
+    fn test_url_filtered_walker_rejects_browser_without_url() {
+        let walker = UrlFilteredWalker::new(
+            Box::new(FakeWalker(None)),
+            vec![UrlRule::Legacy("chase.com".into())],
+            vec![],
+        );
+        assert!(matches!(
+            walker.walk_focused_window().unwrap(),
+            TreeWalkResult::Skipped(SkipReason::BlockedUrl)
+        ));
+    }
+
+    #[test]
+    fn url_allowlist_preserves_native_accessibility_snapshots() {
+        struct NativeWalker;
+        impl TreeWalkerPlatform for NativeWalker {
+            fn walk_focused_window(&self) -> Result<TreeWalkResult> {
+                let mut snapshot = snapshot_with_url(None);
+                snapshot.app_name = "Notepad".into();
+                snapshot.app_id = None;
+                Ok(TreeWalkResult::Found(snapshot))
+            }
+        }
+        let walker = UrlFilteredWalker::new(
+            Box::new(NativeWalker),
+            vec![],
+            vec![domain_rule("en.wikipedia.org", false)],
+        );
         assert!(matches!(
             walker.walk_focused_window().unwrap(),
             TreeWalkResult::Found(_)
+        ));
+    }
+
+    #[test]
+    fn url_allowlist_passes_only_matching_detected_browser_urls() {
+        let allowed = UrlFilteredWalker::new(
+            Box::new(FakeWalker(Some(
+                "https://docs.google.com/document/1".into(),
+            ))),
+            vec![],
+            vec![domain_rule("docs.google.com", false)],
+        );
+        assert!(matches!(
+            allowed.walk_focused_window().unwrap(),
+            TreeWalkResult::Found(_)
+        ));
+
+        let missing_browser_url = UrlFilteredWalker::new(
+            Box::new(FakeWalker(None)),
+            vec![],
+            vec![domain_rule("docs.google.com", false)],
+        );
+        assert!(matches!(
+            missing_browser_url.walk_focused_window().unwrap(),
+            TreeWalkResult::Skipped(SkipReason::BlockedUrl)
+        ));
+
+        let other = UrlFilteredWalker::new(
+            Box::new(FakeWalker(Some("https://example.com".into()))),
+            vec![],
+            vec![domain_rule("docs.google.com", false)],
+        );
+        assert!(matches!(
+            other.walk_focused_window().unwrap(),
+            TreeWalkResult::Skipped(SkipReason::BlockedUrl)
         ));
     }
 
@@ -1005,6 +1157,7 @@ mod tests {
         node.semantic_description = Some("parser description".into());
         node.semantic_dom_identifier = Some("message-list".into());
         node.semantic_dom_classes = Some("message selected".into());
+        node.semantic_offscreen = true;
 
         let json = serde_json::to_string(&node).expect("serialize persisted node");
         assert!(!json.contains("walk_index"));
@@ -1012,6 +1165,7 @@ mod tests {
         assert!(!json.contains("parser description"));
         assert!(!json.contains("message-list"));
         assert!(!json.contains("message selected"));
+        assert!(!json.contains("semantic_offscreen"));
     }
 
     #[test]

@@ -11,23 +11,96 @@ use super::{install_spawned_pid, AgentExecutor, AgentOutput, ExecutionHandle};
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
+
+static USER_SKILL_SYNC_LOCK: Mutex<()> = Mutex::new(());
+
+struct PiPromptInput {
+    user_prompt: std::fs::File,
+    system_prompt: Option<tempfile::NamedTempFile>,
+}
+
+fn prepare_pi_prompt_input(
+    prompt: &str,
+    pipe_system_prompt: Option<&str>,
+) -> Result<PiPromptInput> {
+    // Pi 0.84.1 treats piped stdin as the initial user message without adding
+    // attachment markup. A seeked tempfile avoids both the Windows command-line
+    // limit and the deadlock risk of writing a large prompt into a child pipe.
+    let mut user_prompt = tempfile::tempfile()?;
+    user_prompt.write_all(prompt.as_bytes())?;
+    user_prompt.seek(std::io::SeekFrom::Start(0))?;
+
+    // Pi resolves an existing --append-system-prompt value as a UTF-8 file.
+    // Keep the named file alive until the child exits so the user/system roles
+    // and the system-prefix caching boundary remain unchanged.
+    let system_prompt = pipe_system_prompt
+        .map(|prompt| -> Result<_> {
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(prompt.as_bytes())?;
+            file.flush()?;
+            Ok(file)
+        })
+        .transpose()?;
+
+    Ok(PiPromptInput {
+        user_prompt,
+        system_prompt,
+    })
+}
+
+fn user_skill_fingerprint(root: &Path) -> std::io::Result<String> {
+    fn hash_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let file_type = entry.file_type()?;
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+            hasher.update(if file_type.is_dir() { b"d" } else { b"f" });
+            hasher.update((relative.len() as u64).to_le_bytes());
+            hasher.update(relative.as_bytes());
+
+            if file_type.is_dir() {
+                hash_dir(root, &path, hasher)?;
+            } else {
+                let mut file = std::fs::File::open(path)?;
+                let mut buffer = [0_u8; 16 * 1024];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hash_dir(root, root, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 pub const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent@0.84.1";
 pub const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.84.1";
+pub const TINFOIL_SDK_VERSION: &str = "1.2.1";
 pub const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
-const PI_INSTALL_ARGS: [&str; 5] = [
-    "add",
-    "--ignore-scripts",
-    PI_PACKAGE,
-    PI_AI_PACKAGE,
-    "@anthropic-ai/sdk",
-];
+const PI_INSTALL_ARGS: [&str; 3] = ["install", "--force", "--ignore-scripts"];
 const CUSTOM_PROVIDER_USER_AGENT: &str = "screenpipe";
+const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
 
 /// Apply compatibility settings required by OpenAI-compatible custom endpoints.
@@ -42,9 +115,18 @@ const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// origin both serve non-API routes at `/`. Older presets commonly saved one of
 /// those bare origins; repair only those proven aliases instead of guessing that
 /// every custom provider uses `/v1`.
+///
+/// Google's Gemini OpenAI-compatible endpoint rejects the optional `store`
+/// request field. Pi otherwise sends `store: false` for standard-compatible
+/// providers, so disable that capability on each Gemini model while preserving
+/// any other explicit compatibility overrides.
 pub fn apply_custom_provider_compat(provider: &mut serde_json::Value) {
-    if let Some(base_url) = provider.get_mut("baseUrl").and_then(|value| value.as_str()) {
-        let trimmed = base_url.trim().trim_end_matches('/');
+    let normalized_base_url = provider
+        .get("baseUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(|base_url| base_url.trim().trim_end_matches('/').to_string());
+
+    if let Some(trimmed) = normalized_base_url.as_deref() {
         if trimmed.eq_ignore_ascii_case("https://ai.ai-genesis.app")
             || trimmed.eq_ignore_ascii_case("https://api.ai-genesis.app")
         {
@@ -69,6 +151,35 @@ pub fn apply_custom_provider_compat(provider: &mut serde_json::Value) {
         .any(|header| header.eq_ignore_ascii_case("user-agent"))
     {
         headers.insert("User-Agent".to_string(), json!(CUSTOM_PROVIDER_USER_AGENT));
+    }
+
+    let is_gemini_openai = normalized_base_url
+        .as_deref()
+        .is_some_and(|base_url| base_url.eq_ignore_ascii_case(GEMINI_OPENAI_BASE_URL));
+    if !is_gemini_openai {
+        return;
+    }
+
+    let Some(models) = provider_object
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for model in models {
+        let Some(model_object) = model.as_object_mut() else {
+            continue;
+        };
+        let compat = model_object
+            .entry("compat".to_string())
+            .or_insert_with(|| json!({}));
+        if !compat.is_object() {
+            *compat = json!({});
+        }
+        compat
+            .as_object_mut()
+            .expect("custom provider model compat was initialized as an object")
+            .insert("supportsStore".to_string(), json!(false));
     }
 }
 
@@ -434,7 +545,9 @@ fn gateway_models_to_pi_models(data: &[serde_json::Value]) -> Vec<serde_json::Va
                 "id": id,
                 "name": name,
                 "reasoning": reasoning,
-                "input": ["text", "image"],
+                // A distinct API fails closed when its secure extension is absent.
+                "api": if id == "glm-5.3-flash-reap50-iq3m" { "screenpipe-tinfoil" } else { "openai-completions" },
+                "input": if id == "glm-5.3-flash-reap50-iq3m" { json!(["text"]) } else { json!(["text", "image"]) },
                 "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 "contextWindow": ctx,
                 "maxTokens": max_tokens,
@@ -620,7 +733,7 @@ impl PiExecutor {
     /// app-owned, non-discovered root and return its exact skill file.
     ///
     /// This skill teaches pi how to query org-wide telemetry (devices,
-    /// search, records) via `https://screenpi.pe/api/enterprise/v1/*`. It
+    /// search, records, cited frame images) via the configured Enterprise API. It
     /// MUST only be present inside the separately distributed Enterprise app
     /// when the user is an admin with an active license, because exposing the
     /// prompts to non-admins is misleading (every call would 403) and dropping
@@ -738,8 +851,16 @@ impl PiExecutor {
         let skills: &[(&str, &str)] = &[
             ("screenpipe-api", api_skill.as_str()),
             (
+                "screenpipe-workflow-maintenance",
+                include_str!("../../assets/skills/screenpipe-workflow-maintenance/SKILL.md"),
+            ),
+            (
                 "screenpipe-cli",
                 include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
+            ),
+            (
+                "screenpipe-chats",
+                include_str!("../../assets/skills/screenpipe-chats/SKILL.md"),
             ),
             (
                 "render-html-report",
@@ -810,9 +931,11 @@ impl PiExecutor {
     /// [`Self::USER_SKILL_MARKER`], be deleted by a later sync. The desktop
     /// importer already rejects these names; this guards any folder that reaches
     /// the store another way.
-    const BASELINE_SKILL_NAMES: [&'static str; 4] = [
+    const BASELINE_SKILL_NAMES: [&'static str; 6] = [
         "screenpipe-api",
+        "screenpipe-workflow-maintenance",
         "screenpipe-cli",
+        "screenpipe-chats",
         "screenpipe-team",
         "render-html-report",
     ];
@@ -824,7 +947,8 @@ impl PiExecutor {
     ///
     /// Idempotent + self-cleaning: each mirrored skill is stamped with
     /// [`Self::USER_SKILL_MARKER`]; on every call we refresh the contents of
-    /// skills still in the store and remove previously-mirrored skills that
+    /// skills changed in the store, skip managed copies whose recorded source
+    /// fingerprint still matches, and remove previously-mirrored skills that
     /// have left it. Baseline + hand-authored skills (no marker) are never
     /// touched. Best-effort: a single malformed skill is logged and skipped so
     /// it can never break a session.
@@ -836,6 +960,9 @@ impl PiExecutor {
     /// Implementation of [`Self::sync_user_skills`] with the store path passed
     /// in, so it can be unit-tested without touching the real data dir.
     fn sync_user_skills_from(store: &Path, project_dir: &Path) -> Result<()> {
+        let _sync_guard = USER_SKILL_SYNC_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dest_root = project_dir.join(".pi").join("skills");
 
         // Copy/refresh every store skill (a folder containing SKILL.md).
@@ -856,22 +983,27 @@ impl PiExecutor {
                 if Self::BASELINE_SKILL_NAMES.contains(&key.as_str()) {
                     continue;
                 }
+                store_keys.insert(key.clone());
                 let dest = dest_root.join(&key);
                 let copy = (|| -> std::io::Result<()> {
+                    let fingerprint = user_skill_fingerprint(&src)?;
+                    let marker = format!(
+                        "mirrored from <data>/skills by screenpipe\nfingerprint={fingerprint}\n"
+                    );
+                    if std::fs::read_to_string(dest.join(Self::USER_SKILL_MARKER))
+                        .is_ok_and(|existing| existing == marker)
+                    {
+                        return Ok(());
+                    }
                     if dest.exists() {
                         std::fs::remove_dir_all(&dest)?;
                     }
                     crate::paths::copy_dir_all(&src, &dest)?;
-                    std::fs::write(
-                        dest.join(Self::USER_SKILL_MARKER),
-                        b"mirrored from <data>/skills by screenpipe\n",
-                    )?;
+                    std::fs::write(dest.join(Self::USER_SKILL_MARKER), marker)?;
                     Ok(())
                 })();
                 match copy {
-                    Ok(()) => {
-                        store_keys.insert(key);
-                    }
+                    Ok(()) => {}
                     Err(e) => warn!("failed to mirror user skill {:?}: {}", src, e),
                 }
             }
@@ -947,9 +1079,19 @@ impl PiExecutor {
                 Box::new(|_| true), // always installed — unified API skill
             ),
             (
+                "screenpipe-workflow-maintenance",
+                include_str!("../../assets/skills/screenpipe-workflow-maintenance/SKILL.md"),
+                Box::new(|_| true), // guidance only; existing API permissions still apply
+            ),
+            (
                 "screenpipe-cli",
                 include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
                 Box::new(|_| true), // always installed — pipe & connection management
+            ),
+            (
+                "screenpipe-chats",
+                include_str!("../../assets/skills/screenpipe-chats/SKILL.md"),
+                Box::new(|_| true), // search is read-only; unattended delivery is tool-gated
             ),
             (
                 "render-html-report",
@@ -1022,6 +1164,92 @@ impl PiExecutor {
         Ok(())
     }
 
+    /// Normal tools and MCP must use the scheduled Pipe's scoped recorder access.
+    /// Interactive chats without a permissions file keep their existing auth.
+    fn configure_local_api(&self, cmd: &mut tokio::process::Command, dir: &Path) -> Result<()> {
+        let permissions = dir.join(".screenpipe-permissions.json");
+        let key = if permissions.exists() {
+            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(permissions)?)?;
+            let base = value["api_base"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Pipe recorder address unavailable"))?;
+            let url = reqwest::Url::parse(base)?;
+            if url.scheme() != "http"
+                || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            {
+                anyhow::bail!("Pipe requires its local recorder");
+            }
+            let token = value["pipe_token"]
+                .as_str()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| anyhow!("Pipe recorder token unavailable"))?;
+            cmd.env("SCREENPIPE_LOCAL_API_URL", base);
+            cmd.env(
+                "SCREENPIPE_PORT",
+                url.port_or_known_default().unwrap_or(3030).to_string(),
+            );
+            Some(token.to_owned())
+        } else {
+            self.api_auth_key.clone()
+        };
+        if let Some(key) = key {
+            cmd.env("SCREENPIPE_LOCAL_API_KEY", &key);
+            cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
+        }
+        Ok(())
+    }
+
+    /// Install the shared self-improvement extension for native Pi sessions.
+    /// It exposes the same profile and skill-management contract ACP agents
+    /// receive from the bundled screenpipe-tools MCP server.
+    pub fn ensure_self_improvement_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(&ext_dir)?;
+        let ext_content = include_str!("../../assets/extensions/self-improvement.ts");
+        let ext_path = ext_dir.join("self-improvement.ts");
+        std::fs::write(&ext_path, ext_content)?;
+        debug!("self-improvement extension installed at {:?}", ext_path);
+        // Retire the duplicate history tools in both existing chats and tasks.
+        let legacy_memory = ext_dir.join("workflow-memory.ts");
+        if legacy_memory.exists() {
+            std::fs::remove_file(legacy_memory)?;
+        }
+        // Remove the retired workflow tool layer in existing installations too.
+        let legacy_catalog = ext_dir.join("workflow-catalog.ts");
+        if legacy_catalog.exists() {
+            std::fs::remove_file(legacy_catalog)?;
+        }
+
+        if project_dir.file_name().and_then(|name| name.to_str()) == Some("skill-learning")
+            && project_dir.join("pipe.md").is_file()
+        {
+            // The task requires its restricted tool surface. Fail the run if
+            // configuration or installation is missing; never silently fall
+            // back to the general-purpose self-improvement tools.
+            let _: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+                project_dir.join(".screenpipe-learning-config.json"),
+            )?)?;
+            std::fs::write(
+                ext_dir.join("skill-learning.ts"),
+                include_str!("../../assets/extensions/skill-learning.ts"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Install inter-chat discovery and delivery for an interactive chat.
+    /// Pipe executors do not call this: cross-chat sends are intentionally a
+    /// user-facing chat capability, not ambient automation authority.
+    pub fn ensure_chat_control_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(&ext_dir)?;
+        let ext_content = include_str!("../../assets/extensions/chat-control.ts");
+        let ext_path = ext_dir.join("chat-control.ts");
+        std::fs::write(&ext_path, ext_content)?;
+        debug!("chat-control extension installed at {:?}", ext_path);
+        Ok(())
+    }
+
     /// Install the register-artifact extension so pipes can register files
     /// as artifacts mid-execution via the local /artifacts/register API.
     pub fn ensure_register_artifact_extension(project_dir: &Path) -> Result<()> {
@@ -1046,6 +1274,38 @@ impl PiExecutor {
         // app build. Pi loads every extension in this directory.
         let _ = std::fs::remove_file(ext_dir.join("view-data.ts"));
         debug!("structured-output extension installed at {:?}", ext_path);
+        Ok(())
+    }
+
+    pub fn ensure_workflow_workspace_extension(project_dir: &Path) -> Result<()> {
+        let dir = project_dir.join(".pi/extensions");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("workflow-workspace.ts"),
+            include_str!("../../assets/extensions/workflow-workspace.ts"),
+        )?;
+        Ok(())
+    }
+
+    pub fn ensure_tinfoil_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(ext_dir.join("lib"))?;
+        let package_json = crate::paths::default_screenpipe_data_dir()
+            .join("pi-agent")
+            .join("package.json");
+        let source = include_str!("../../assets/extensions/tinfoil.ts").replace(
+            "__SCREENPIPE_PI_PACKAGE_JSON__",
+            &serde_json::to_string(&package_json.to_string_lossy())?,
+        );
+        std::fs::write(ext_dir.join("tinfoil.ts"), source)?;
+        std::fs::write(
+            ext_dir.join("lib").join("tinfoil-transport.ts"),
+            include_str!("../../assets/extensions/lib/tinfoil-transport.ts"),
+        )?;
+        std::fs::write(
+            ext_dir.join("lib").join("glm-protocol.ts"),
+            include_str!("../../assets/extensions/lib/glm-protocol.ts"),
+        )?;
         Ok(())
     }
 
@@ -1519,6 +1779,11 @@ impl PiExecutor {
     /// `Ok(model)`  → the requested model is allowed (or we can't validate).
     /// `Err(model)` → requested not allowed; the returned value is the fallback.
     fn pick_allowed_model(requested: &str, allowed: &[String]) -> Result<String, String> {
+        // Confidential selection is a transport promise. An unavailable model
+        // must fail rather than downgrade to a plaintext hosted provider.
+        if requested == "glm-5.3-flash-reap50-iq3m" {
+            return Ok(requested.to_string());
+        }
         // No catalog, or only the gateway fallback sentinel → we
         // couldn't actually validate, so don't second-guess the requested
         // model. Without the sentinel check the `["auto"]` list returned by
@@ -1571,12 +1836,16 @@ impl PiExecutor {
         continue_session: bool,
         pipe_system_prompt: Option<&str>,
     ) -> Result<AgentOutput> {
+        super::pi_compaction::ensure_for_entrypoint(Path::new(pi_path))?;
+        let PiPromptInput {
+            user_prompt,
+            system_prompt,
+        } = prepare_pi_prompt_input(prompt, pipe_system_prompt)?;
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
         apply_pi_isolation_env(&mut |k, v| {
             cmd.env(k, v);
         });
-        // Flags MUST come before -p on Windows (see spawn_pi_streaming comment)
         if continue_session {
             cmd.arg("--continue");
         } else {
@@ -1584,10 +1853,11 @@ impl PiExecutor {
         }
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
-        if let Some(sys) = pipe_system_prompt {
-            cmd.arg("--append-system-prompt").arg(sys);
+        if let Some(ref sys) = system_prompt {
+            cmd.arg("--append-system-prompt").arg(sys.path());
         }
-        cmd.arg("-p").arg(prompt);
+        cmd.arg("-p");
+        cmd.stdin(std::process::Stdio::from(user_prompt));
 
         let cloud_token = self.current_user_token();
         if let Some(ref token) = cloud_token {
@@ -1628,10 +1898,7 @@ impl PiExecutor {
         // pipe.md files that hardcoded the old name (e.g. an older
         // meeting-summary install on disk that install_builtin_pipes won't
         // overwrite). TODO(remove next release): drop SCREENPIPE_API_AUTH_KEY.
-        if let Some(ref key) = self.api_auth_key {
-            cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
-            cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
-        }
+        self.configure_local_api(&mut cmd, working_dir)?;
 
         // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
         // shim sourced from $BASH_ENV on every subshell. See bash_env.rs.
@@ -1716,14 +1983,16 @@ impl PiExecutor {
         mcp_server_allowlist: Option<&[String]>,
         session_owner: Option<&str>,
     ) -> Result<AgentOutput> {
+        super::pi_compaction::ensure_for_entrypoint(Path::new(pi_path))?;
+        let PiPromptInput {
+            user_prompt,
+            system_prompt,
+        } = prepare_pi_prompt_input(prompt, pipe_system_prompt)?;
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
         apply_pi_isolation_env(&mut |k, v| {
             cmd.env(k, v);
         });
-        // Flags MUST come before -p on Windows: cmd.exe /C passes everything
-        // as a single string, and the long prompt text can break arg parsing
-        // if flags come after it.
         cmd.arg("--mode").arg("json");
         // pi 0.80 gates project-dir resources (.pi/extensions — mcp-bridge,
         // connection-gate, …) behind a project-trust prompt that can never be
@@ -1743,10 +2012,11 @@ impl PiExecutor {
         }
         // Pass pipe instructions as system prompt for Anthropic prompt caching.
         // Pi's internal system prompt + this appended text form the cached prefix.
-        if let Some(sys) = pipe_system_prompt {
-            cmd.arg("--append-system-prompt").arg(sys);
+        if let Some(ref sys) = system_prompt {
+            cmd.arg("--append-system-prompt").arg(sys.path());
         }
-        cmd.arg("-p").arg(prompt);
+        cmd.arg("-p");
+        cmd.stdin(std::process::Stdio::from(user_prompt));
 
         let cloud_token = self.current_user_token();
         if let Some(ref token) = cloud_token {
@@ -1781,10 +2051,7 @@ impl PiExecutor {
         }
 
         // See spawn_pi above — TODO(remove next release): drop the deprecated alias.
-        if let Some(ref key) = self.api_auth_key {
-            cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
-            cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
-        }
+        self.configure_local_api(&mut cmd, working_dir)?;
 
         if let Some(ids) = mcp_server_allowlist {
             cmd.env("SCREENPIPE_MCP_SERVER_ALLOWLIST", ids.join(","));
@@ -1965,6 +2232,42 @@ impl AgentExecutor for PiExecutor {
         // Provider resolution:
         // 1. Explicit provider from pipe frontmatter → use it
         // 2. No provider specified → screenpipe cloud (default)
+        let workflow_task = crate::workflows::pipeline::task_at(working_dir).is_some();
+        let workflow_provider = if workflow_task {
+            Some(crate::workflows::model_choice::selected_provider()?)
+        } else {
+            None
+        };
+        let model = workflow_provider
+            .as_ref()
+            .map_or(model, |p| p.model.as_str());
+        let provider = workflow_provider
+            .as_ref()
+            .map_or(provider, |p| p.provider.as_deref());
+        let provider_url = workflow_provider
+            .as_ref()
+            .map_or(provider_url, |p| p.url.as_deref());
+        let provider_api_key = workflow_provider
+            .as_ref()
+            .map_or(provider_api_key, |p| p.api_key.as_deref());
+        if workflow_task {
+            if !crate::workflows::pipeline::has_pending_input(working_dir).await? {
+                return Ok(AgentOutput {
+                    stdout: "No new workflow input; saved results kept.".into(),
+                    stderr: String::new(),
+                    success: true,
+                    pid: None,
+                });
+            }
+            crate::workflows::pipeline::check_admission_for_provider(
+                &self.api_url,
+                self.current_user_token().as_deref(),
+                model,
+                provider.unwrap_or("screenpipe"),
+            )
+            .await?;
+        }
+        let workflow_save_state = crate::workflows::pipeline::save_state(working_dir).await?;
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
 
         let (resolved_model, fell_back_from) = self
@@ -1995,7 +2298,9 @@ impl AgentExecutor for PiExecutor {
             &self.api_url,
         )?;
         Self::ensure_context_pruning_extension(working_dir)?;
+        Self::ensure_tinfoil_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
+        Self::ensure_self_improvement_extension(working_dir)?;
         Self::ensure_mcp_bridge_extension(working_dir)?;
         Self::ensure_register_artifact_extension(working_dir)?;
         Self::ensure_structured_output_extension(working_dir)?;
@@ -2011,7 +2316,7 @@ impl AgentExecutor for PiExecutor {
             resolved_provider, resolved_model
         );
 
-        let output = self
+        let mut output = self
             .spawn_pi(
                 &pi_path,
                 prompt,
@@ -2021,7 +2326,7 @@ impl AgentExecutor for PiExecutor {
                 provider_api_key,
                 shared_pid.clone(),
                 continue_session,
-                None, // no pipe system prompt for trait-based calls
+                workflow_provider.as_ref().and_then(|p| p.prompt.as_deref()),
             )
             .await?;
 
@@ -2047,7 +2352,7 @@ impl AgentExecutor for PiExecutor {
                 provider_url,
             )
             .await?;
-            return self
+            output = self
                 .spawn_pi(
                     &pi_path,
                     prompt,
@@ -2057,11 +2362,24 @@ impl AgentExecutor for PiExecutor {
                     provider_api_key,
                     None,
                     continue_session,
-                    None,
+                    workflow_provider.as_ref().and_then(|p| p.prompt.as_deref()),
                 )
-                .await;
+                .await?;
         }
 
+        if output.success {
+            if let Err(error) =
+                crate::workflows::pipeline::verify_saved(working_dir, workflow_save_state).await
+            {
+                output.success = false;
+                output.stderr.push_str(
+                    &serde_json::json!({"error": {
+                        "code": "missing_output", "message": error.to_string()
+                    }})
+                    .to_string(),
+                );
+            }
+        }
         Ok(output)
     }
 
@@ -2080,7 +2398,54 @@ impl AgentExecutor for PiExecutor {
         pipe_system_prompt: Option<&str>,
         mcp_server_allowlist: Option<&[String]>,
         session_owner: Option<&str>,
+        _executor_config: Option<&serde_json::Value>,
     ) -> Result<AgentOutput> {
+        let workflow_task = crate::workflows::pipeline::task_at(working_dir).is_some();
+        let workflow_provider = if workflow_task {
+            Some(crate::workflows::model_choice::selected_provider()?)
+        } else {
+            None
+        };
+        let workflow_system_prompt = workflow_provider.as_ref().and_then(|preset| {
+            preset.prompt.as_deref().map(|preset_prompt| {
+                [pipe_system_prompt.unwrap_or(""), preset_prompt]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+        });
+        let pipe_system_prompt = workflow_system_prompt.as_deref().or(pipe_system_prompt);
+        let model = workflow_provider
+            .as_ref()
+            .map_or(model, |p| p.model.as_str());
+        let provider = workflow_provider
+            .as_ref()
+            .map_or(provider, |p| p.provider.as_deref());
+        let provider_url = workflow_provider
+            .as_ref()
+            .map_or(provider_url, |p| p.url.as_deref());
+        let provider_api_key = workflow_provider
+            .as_ref()
+            .map_or(provider_api_key, |p| p.api_key.as_deref());
+        if workflow_task {
+            if !crate::workflows::pipeline::has_pending_input(working_dir).await? {
+                return Ok(AgentOutput {
+                    stdout: "No new workflow input; saved results kept.".into(),
+                    stderr: String::new(),
+                    success: true,
+                    pid: None,
+                });
+            }
+            crate::workflows::pipeline::check_admission_for_provider(
+                &self.api_url,
+                self.current_user_token().as_deref(),
+                model,
+                provider.unwrap_or("screenpipe"),
+            )
+            .await?;
+        }
+        let workflow_save_state = crate::workflows::pipeline::save_state(working_dir).await?;
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
         let (resolved_model, fell_back_from) = self
             .resolve_screenpipe_model(model, &resolved_provider)
@@ -2115,7 +2480,9 @@ impl AgentExecutor for PiExecutor {
             &self.api_url,
         )?;
         Self::ensure_context_pruning_extension(working_dir)?;
+        Self::ensure_tinfoil_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
+        Self::ensure_self_improvement_extension(working_dir)?;
         Self::ensure_mcp_bridge_extension(working_dir)?;
         Self::ensure_register_artifact_extension(working_dir)?;
         Self::ensure_structured_output_extension(working_dir)?;
@@ -2224,6 +2591,19 @@ impl AgentExecutor for PiExecutor {
         })
         .await?;
 
+        if output.success {
+            if let Err(error) =
+                crate::workflows::pipeline::verify_saved(working_dir, workflow_save_state).await
+            {
+                output.success = false;
+                output.stderr.push_str(
+                    &serde_json::json!({"error": {
+                        "code": "missing_output", "message": error.to_string()
+                    }})
+                    .to_string(),
+                );
+            }
+        }
         Ok(output)
     }
 
@@ -2240,17 +2620,6 @@ impl AgentExecutor for PiExecutor {
     }
 
     async fn ensure_installed(&self) -> Result<()> {
-        if find_pi_executable().is_some() {
-            // Check if local install matches expected version; upgrade if stale
-            if !is_local_pi_version_current() {
-                info!("pi version mismatch — upgrading to {}", PI_PACKAGE);
-                // Fall through to install
-            } else {
-                debug!("pi already installed");
-                return Ok(());
-            }
-        }
-
         let bun = find_bun_executable()
             .ok_or_else(|| anyhow!("bun not found — install from https://bun.sh"))?;
 
@@ -2270,8 +2639,11 @@ impl AgentExecutor for PiExecutor {
             PI_INSTALL_ARGS.join(" "),
         );
 
-        // Seed package.json with overrides to fix lru-cache resolution on Windows
-        seed_pi_package_json(&install_dir);
+        // Keep the manifest authoritative, then rematerialize the complete tree.
+        // A prior interrupted install can leave the pinned top-level Pi package
+        // present while a transitive dependency is absent. Plain `bun install`
+        // trusts that tree, so `--force` is required to repair it generically.
+        seed_pi_package_json(&install_dir)?;
 
         let mut cmd = tokio_bun_command(&bun);
         // CREATE_NO_WINDOW only covers this Bun process. Lifecycle scripts can
@@ -2367,7 +2739,45 @@ pub fn pi_config_dir() -> Result<PathBuf> {
         _ => crate::paths::default_screenpipe_data_dir().join("pi-config"),
     };
     seed_pi_config_from_global(&dir);
+    ensure_pi_compaction_default(&dir)?;
     Ok(dir)
+}
+
+/// Pi's 20k recent-history default leaves too little room for the system prompt,
+/// skill instructions and a summary on 32k models. Use its standard setting for
+/// both chat and Pipes. Explicit user settings (including disabled compaction)
+/// remain authoritative; no model selection or summarization logic lives here.
+fn ensure_pi_compaction_default(config_dir: &Path) -> Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK
+        .lock()
+        .map_err(|_| anyhow!("pi settings lock poisoned"))?;
+    let path = config_dir.join("settings.json");
+    let mut settings: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            // Leave malformed/user-owned configuration intact for Pi to report.
+            Err(_) => return Ok(()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(object) = settings.as_object_mut() else {
+        return Ok(());
+    };
+    let compaction = object.entry("compaction").or_insert_with(|| json!({}));
+    let Some(compaction) = compaction.as_object_mut() else {
+        return Ok(());
+    };
+    if compaction.contains_key("keepRecentTokens") {
+        return Ok(());
+    }
+    compaction.insert("keepRecentTokens".into(), json!(8192));
+    std::fs::create_dir_all(config_dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(config_dir)?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), &settings)?;
+    temporary.persist(path)?;
+    Ok(())
 }
 
 fn pi_package_source_matches(source: &str, package_name: &str) -> bool {
@@ -2427,6 +2837,11 @@ pub fn apply_pi_isolation_env(apply: &mut dyn FnMut(&str, &str)) {
     // We pin the pi version ourselves (ensure_installed); don't let the
     // subprocess phone pi.dev for update checks on every run.
     apply("PI_SKIP_VERSION_CHECK", "1");
+    // Bun's native-first import bypasses Pi's host SDK aliases. Extensions
+    // with top-level await (pi-subagents) can then be only partly initialized
+    // when jiti retries them. Use jiti's alias-aware loader from the start;
+    // nested Pi processes inherit the same setting.
+    apply("JITI_TRY_NATIVE", "0");
     // Same reasoning one layer out: the bundled skills tell agents to run the
     // screenpipe CLI, and `bun x screenpipe@latest` spends ~1.5s resolving the
     // registry on every single call. Hand them an already-resolved native
@@ -2846,9 +3261,9 @@ const BOUNDED_OUTPUT_TAIL: usize = 192 * 1024;
 ///
 /// The agent's stdout was accumulated into an unbounded `String` for the whole
 /// run, so a long agent turn with large tool results held all of it resident.
-/// Nothing parses this buffer — the JSON events are decoded per line as they
-/// arrive and this is only the stored record — so eliding the middle costs no
-/// behavior.
+/// Live JSON events are decoded before buffering. The scheduler also checks
+/// the stored final event, so an oversized agent_end keeps its final assistant
+/// outcome without retaining a second copy of the entire tool history.
 ///
 /// Both ends are kept deliberately: the head carries the run's setup and the
 /// tail carries the result or the error, which are the two things anyone
@@ -2862,6 +3277,8 @@ pub struct BoundedOutput {
 
 impl BoundedOutput {
     pub fn push_line(&mut self, line: &str) {
+        let compact = compact_oversized_agent_end(line);
+        let line = compact.as_deref().unwrap_or(line);
         // `self.tail.is_empty()` closes the head for good once anything has
         // spilled. Without it a short line still fits the head's leftover
         // capacity after longer lines have already gone to the tail, and the
@@ -2896,6 +3313,49 @@ impl BoundedOutput {
             self.head, self.dropped, self.tail
         )
     }
+}
+
+// Pi repeats the complete run history (including images) in agent_end. Keep
+// its terminal outcome small enough to survive the same bounded stdout buffer.
+fn compact_oversized_agent_end(line: &str) -> Option<String> {
+    if line.len() <= BOUNDED_OUTPUT_TAIL || !line.contains("agent_end") {
+        return None;
+    }
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    if event["type"] != "agent_end" {
+        return None;
+    }
+    let last = event["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")?;
+    let reason = last["stopReason"].as_str()?;
+    if !matches!(reason, "stop" | "error" | "aborted" | "length") {
+        return None;
+    }
+    let text: String = last["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .flat_map(str::chars)
+        .take(8192)
+        .collect();
+    let error: String = last["errorMessage"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(2048)
+        .collect();
+    Some(
+        serde_json::json!({"type":"agent_end","messages":[{
+            "role":"assistant","stopReason":reason,"errorMessage":error,
+            "content":[{"type":"text","text":text}]
+        }]})
+        .to_string(),
+    )
 }
 
 /// Last `max` bytes of a captured process stream, lossy-decoded and
@@ -3033,48 +3493,17 @@ fn apply_pi_child_path(cmd: &mut tokio::process::Command) {
     }
 }
 
-/// Check whether the locally-installed Pi version matches `PI_PACKAGE`.
-fn is_local_pi_version_current() -> bool {
-    let dir = match pi_local_install_dir() {
-        Some(d) => d,
-        None => return false,
-    };
-    let pkg_json = dir
-        .join("node_modules")
-        .join(PI_NAMESPACE_DIR)
-        .join("pi-coding-agent")
-        .join("package.json");
-    let contents = match std::fs::read_to_string(&pkg_json) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let installed = match parsed.get("version").and_then(|v| v.as_str()) {
-        Some(v) => v,
-        None => return false,
-    };
-    // PI_PACKAGE is "<scope>/pi-coding-agent@<ver>" — extract version after last '@'
-    let expected = PI_PACKAGE.rsplit('@').next().unwrap_or("");
-    if installed != expected {
-        info!(
-            "local pi version {} differs from expected {}",
-            installed, expected
-        );
-        return false;
-    }
-    true
-}
-
-/// Seed the pi-agent package.json with overrides + strip legacy deps.
+/// Seed the pi-agent package.json with pinned direct deps and overrides.
 /// `hosted-git-info` requires `lru-cache@^10`, but bun on Windows can hoist
 /// an ESM-only lru-cache@7.x that breaks CJS `require()`. Also drops any
 /// stale `@mariozechner/*` keys carried over from before the upstream
 /// namespace rename (issue #3527).
-fn seed_pi_package_json(install_dir: &Path) {
+fn seed_pi_package_json(install_dir: &Path) -> Result<()> {
     let pkg_path = install_dir.join("package.json");
+    let expected_pi_version = json!(PI_PACKAGE.rsplit('@').next().unwrap_or(""));
+    let expected_pi_ai_version = json!(PI_AI_PACKAGE.rsplit('@').next().unwrap_or(""));
+    let expected_sdk = json!("^0.91.1");
+    let expected_tinfoil = json!(TINFOIL_SDK_VERSION);
     let expected_overrides = json!({
         "hosted-git-info": {
             "lru-cache": "^10.0.0"
@@ -3112,44 +3541,76 @@ fn seed_pi_package_json(install_dir: &Path) {
                     obj.insert("overrides".to_string(), expected_overrides.clone());
                     changed = true;
                 }
-                if let Some(deps_obj) = obj.get_mut("dependencies").and_then(|d| d.as_object_mut())
-                {
-                    let legacy: Vec<String> = deps_obj
-                        .keys()
-                        .filter(|k| k.starts_with("@mariozechner/"))
-                        .cloned()
-                        .collect();
-                    for k in &legacy {
-                        deps_obj.remove(k);
+                let deps = obj.entry("dependencies").or_insert_with(|| json!({}));
+                if !deps.is_object() {
+                    *deps = json!({});
+                    changed = true;
+                }
+                let deps_obj = deps
+                    .as_object_mut()
+                    .expect("dependencies was normalized to an object");
+                let legacy: Vec<String> = deps_obj
+                    .keys()
+                    .filter(|k| k.starts_with("@mariozechner/"))
+                    .cloned()
+                    .collect();
+                for k in &legacy {
+                    deps_obj.remove(k);
+                    changed = true;
+                }
+                for (name, version) in [
+                    ("@earendil-works/pi-coding-agent", &expected_pi_version),
+                    ("@earendil-works/pi-ai", &expected_pi_ai_version),
+                    ("@anthropic-ai/sdk", &expected_sdk),
+                    ("tinfoil", &expected_tinfoil),
+                ] {
+                    if deps_obj.get(name) != Some(version) {
+                        deps_obj.insert(name.to_string(), version.clone());
                         changed = true;
                     }
                 }
             }
             if changed {
-                if let Ok(new_contents) = serde_json::to_string_pretty(&pkg) {
-                    let _ = std::fs::write(&pkg_path, new_contents);
-                    let _ = std::fs::remove_file(install_dir.join("bun.lock"));
-                    let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
-                    info!("Patched pi-agent package.json (overrides + legacy dep cleanup)");
-                }
+                let new_contents = serde_json::to_string_pretty(&pkg)
+                    .map_err(|e| anyhow!("failed to serialize Pi package.json: {}", e))?;
+                std::fs::write(&pkg_path, new_contents).map_err(|e| {
+                    anyhow!(
+                        "failed to write Pi package.json at {}: {}",
+                        pkg_path.display(),
+                        e
+                    )
+                })?;
+                let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+                let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+                info!("Patched pi-agent package.json (managed deps + overrides)");
             }
-            return;
+            return Ok(());
         }
     }
     let pkg_json = json!({
+        "dependencies": {
+            "@earendil-works/pi-coding-agent": expected_pi_version,
+            "@earendil-works/pi-ai": expected_pi_ai_version,
+            "@anthropic-ai/sdk": expected_sdk,
+            "tinfoil": expected_tinfoil,
+        },
         "overrides": {
             "hosted-git-info": {
                 "lru-cache": "^10.0.0"
             }
         }
     });
-    match std::fs::write(
-        &pkg_path,
-        serde_json::to_string_pretty(&pkg_json).unwrap_or_default(),
-    ) {
-        Ok(_) => info!("Seeded pi-agent package.json with lru-cache overrides"),
-        Err(e) => warn!("Failed to seed pi-agent package.json: {}", e),
-    }
+    let contents = serde_json::to_string_pretty(&pkg_json)
+        .map_err(|e| anyhow!("failed to serialize Pi package.json: {}", e))?;
+    std::fs::write(&pkg_path, contents).map_err(|e| {
+        anyhow!(
+            "failed to write Pi package.json at {}: {}",
+            pkg_path.display(),
+            e
+        )
+    })?;
+    info!("Seeded pi-agent package.json with managed deps + overrides");
+    Ok(())
 }
 
 /// Find the JS entrypoint for the locally-installed pi package.
@@ -3312,7 +3773,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
                 let mut new_path = format!("{};{}", bun_dir.display(), current_path);
 
                 // On Windows, ensure bash is available for Pi's bash tool.
-                // ensure_bash_available: fast file-existence check first, then
+                // ensure_bash_available: bounded startup probe first, then
                 // OnceLock-guarded PortableGit download if needed (one-time ~50MB).
                 // Concurrent callers block on the single download, never duplicate.
                 if let Some(bash_dir) = ensure_bash_available() {
@@ -3453,7 +3914,115 @@ pub fn kill_process_group(pid: u32) -> Result<()> {
 /// (where bash is always available). Checks:
 /// 1. Our bundled PortableGit in %LOCALAPPDATA%\screenpipe\git-portable\
 /// 2. Standard Git for Windows install
-/// 3. bash.exe on PATH (Git Bash, MSYS2, WSL, etc.)
+/// 3. A native Windows bash.exe on PATH (Git Bash, MSYS2, etc.)
+///
+/// Windows' `System32\\bash.exe` and the WindowsApps alias are WSL launchers,
+/// not standalone shells. Treating either as usable makes Pi depend on an
+/// installed WSL distribution and prevents the PortableGit fallback.
+#[cfg(any(windows, test))]
+fn is_windows_bash_launcher(path: &str) -> bool {
+    let normalized = path
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+
+    normalized.ends_with("\\windows\\system32\\bash.exe")
+        || normalized.ends_with("\\windows\\sysnative\\bash.exe")
+        || normalized.ends_with("\\windows\\syswow64\\bash.exe")
+        || normalized.contains("\\microsoft\\windowsapps\\bash.exe")
+}
+
+#[cfg(any(windows, test))]
+fn first_usable_windows_bash_candidate<F>(stdout: &str, mut is_usable: F) -> Option<String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    stdout.lines().find_map(|line| {
+        let candidate = line.trim().trim_matches('"');
+        if candidate.is_empty() || is_windows_bash_launcher(candidate) {
+            return None;
+        }
+
+        let path = Path::new(candidate);
+        is_usable(path).then(|| candidate.to_string())
+    })
+}
+
+#[cfg(windows)]
+fn bash_executable_is_usable(path: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const PROBE_OUTPUT: &[u8] = b"screenpipe-bash-ok";
+
+    let mut child = match std::process::Command::new(path)
+        .args(["--noprofile", "--norc", "-c", "printf screenpipe-bash-ok"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            warn!(
+                "bash candidate {} could not start: {}",
+                path.display(),
+                error
+            );
+            return false;
+        }
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let Some(mut pipe) = child.stdout.take() else {
+                    warn!("bash candidate {} had no stdout pipe", path.display());
+                    return false;
+                };
+                if let Err(error) = pipe.read_to_end(&mut stdout) {
+                    warn!(
+                        "bash candidate {} probe output failed: {}",
+                        path.display(),
+                        error
+                    );
+                    return false;
+                }
+                let usable = status.success() && stdout == PROBE_OUTPUT;
+                if !usable {
+                    warn!(
+                        "bash candidate {} failed its startup probe (status: {})",
+                        path.display(),
+                        status
+                    );
+                }
+                return usable;
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!("bash candidate {} startup probe timed out", path.display());
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!(
+                    "bash candidate {} startup probe failed: {}",
+                    path.display(),
+                    error
+                );
+                return false;
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn find_bash_executable() -> Option<String> {
     // 1. Bundled PortableGit in screenpipe's data directory
@@ -3463,7 +4032,7 @@ pub fn find_bash_executable() -> Option<String> {
             .join("git-portable")
             .join("bin")
             .join("bash.exe");
-        if bundled.exists() {
+        if bundled.exists() && bash_executable_is_usable(&bundled) {
             info!("Found bundled bash at: {}", bundled.display());
             return Some(bundled.to_string_lossy().to_string());
         }
@@ -3475,7 +4044,7 @@ pub fn find_bash_executable() -> Option<String> {
         r"C:\Program Files (x86)\Git\bin\bash.exe",
     ];
     for p in &standard_paths {
-        if Path::new(p).exists() {
+        if Path::new(p).exists() && bash_executable_is_usable(Path::new(p)) {
             info!("Found system bash at: {}", p);
             return Some(p.to_string());
         }
@@ -3492,12 +4061,14 @@ pub fn find_bash_executable() -> Option<String> {
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(line) = stdout.lines().next() {
-                    let path = line.trim().to_string();
-                    if !path.is_empty() && Path::new(&path).exists() {
-                        info!("Found bash on PATH: {}", path);
-                        return Some(path);
-                    }
+                if let Some(path) =
+                    first_usable_windows_bash_candidate(&stdout, bash_executable_is_usable)
+                {
+                    info!("Found native bash on PATH: {}", path);
+                    return Some(path);
+                }
+                if stdout.lines().any(is_windows_bash_launcher) {
+                    info!("Ignoring Windows WSL bash launcher; PortableGit is required instead");
                 }
             }
         }
@@ -3515,13 +4086,74 @@ fn download_portable_git() -> std::result::Result<String, String> {
     let local_app_data =
         std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA env var not set".to_string())?;
     let screenpipe_dir = PathBuf::from(&local_app_data).join("screenpipe");
+    download_portable_git_into(&screenpipe_dir)
+}
+
+#[cfg(windows)]
+fn retry_transient_windows_file_lock(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if (error.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(error.raw_os_error(), Some(32 | 33)))
+                    && std::time::Instant::now() < deadline =>
+            {
+                // Git Bash under Windows-on-ARM emulation and endpoint security
+                // may briefly retain image handles after the startup probe exits.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rename_directory_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    retry_transient_windows_file_lock(|| std::fs::rename(source, destination))
+}
+
+#[cfg(windows)]
+fn remove_directory_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_transient_windows_file_lock(|| match std::fs::remove_dir_all(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    })
+}
+
+#[cfg(windows)]
+fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_transient_windows_file_lock(|| match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    })
+}
+
+#[cfg(windows)]
+fn download_portable_git_into(screenpipe_dir: &Path) -> std::result::Result<String, String> {
+    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _install_guard = INSTALL_LOCK
+        .lock()
+        .map_err(|_| "PortableGit install lock was poisoned".to_string())?;
+
     let git_dir = screenpipe_dir.join("git-portable");
     let bash_path = git_dir.join("bin").join("bash.exe");
 
     // Already downloaded
-    if bash_path.exists() {
+    if bash_path.exists() && bash_executable_is_usable(&bash_path) {
         info!("PortableGit already present at {}", git_dir.display());
         return Ok(bash_path.to_string_lossy().to_string());
+    }
+    if git_dir.exists() {
+        warn!(
+            "PortableGit at {} is incomplete or failed its startup probe; reinstalling it",
+            git_dir.display()
+        );
+        remove_directory_with_retry(&git_dir)
+            .map_err(|e| format!("Failed to remove broken PortableGit install: {}", e))?;
     }
 
     // Pinned version for reproducibility
@@ -3540,9 +4172,17 @@ fn download_portable_git() -> std::result::Result<String, String> {
         .map_err(|e| format!("Failed to create screenpipe data dir: {}", e))?;
 
     // Download to temp file
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("System clock is before Unix epoch: {}", e))?
+            .as_nanos()
+    );
     let temp_file = std::env::temp_dir().join(format!(
-        "PortableGit-{}-64-bit.7z.exe",
-        PORTABLE_GIT_VERSION
+        "PortableGit-{}-{}.7z.exe",
+        PORTABLE_GIT_VERSION, unique_suffix
     ));
 
     // Use bun or curl to download (bun is always available since we bundle it)
@@ -3578,7 +4218,7 @@ fn download_portable_git() -> std::result::Result<String, String> {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let _ = std::fs::remove_file(&temp_file);
+            let _ = remove_file_with_retry(&temp_file);
             return Err(format!("PortableGit download failed: {}", stderr));
         }
         Err(e) => {
@@ -3595,8 +4235,7 @@ fn download_portable_git() -> std::result::Result<String, String> {
     info!("Extracting PortableGit to {}...", git_dir.display());
 
     // Extract to a temp directory first (atomic: rename on success)
-    let extract_temp = screenpipe_dir.join("git-portable-extracting");
-    let _ = std::fs::remove_dir_all(&extract_temp);
+    let extract_temp = screenpipe_dir.join(format!("git-portable-extracting-{}", unique_suffix));
 
     {
         let mut cmd = std::process::Command::new(&temp_file);
@@ -3616,13 +4255,13 @@ fn download_portable_git() -> std::result::Result<String, String> {
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = std::fs::remove_dir_all(&extract_temp);
-                let _ = std::fs::remove_file(&temp_file);
+                let _ = remove_directory_with_retry(&extract_temp);
+                let _ = remove_file_with_retry(&temp_file);
                 return Err(format!("PortableGit extraction failed: {}", stderr));
             }
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&extract_temp);
-                let _ = std::fs::remove_file(&temp_file);
+                let _ = remove_directory_with_retry(&extract_temp);
+                let _ = remove_file_with_retry(&temp_file);
                 return Err(format!("Failed to run PortableGit extractor: {}", e));
             }
         }
@@ -3631,8 +4270,8 @@ fn download_portable_git() -> std::result::Result<String, String> {
     // Verify extraction produced bash.exe
     let extracted_bash = extract_temp.join("bin").join("bash.exe");
     if !extracted_bash.exists() {
-        let _ = std::fs::remove_dir_all(&extract_temp);
-        let _ = std::fs::remove_file(&temp_file);
+        let _ = remove_directory_with_retry(&extract_temp);
+        let _ = remove_file_with_retry(&temp_file);
         return Err("Extraction completed but bash.exe not found in expected location".to_string());
     }
 
@@ -3662,10 +4301,21 @@ fn download_portable_git() -> std::result::Result<String, String> {
         }
     }
 
+    if !bash_executable_is_usable(&extracted_bash) {
+        let _ = remove_directory_with_retry(&extract_temp);
+        let _ = remove_file_with_retry(&temp_file);
+        return Err("Extracted PortableGit bash.exe failed its startup probe".to_string());
+    }
+
     // Atomic rename: move extracted dir to final location
-    let _ = std::fs::remove_dir_all(&git_dir);
-    std::fs::rename(&extract_temp, &git_dir).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&extract_temp);
+    if git_dir.exists() {
+        remove_directory_with_retry(&git_dir).map_err(|e| {
+            let _ = remove_directory_with_retry(&extract_temp);
+            format!("Failed to clear PortableGit destination: {}", e)
+        })?;
+    }
+    rename_directory_with_retry(&extract_temp, &git_dir).map_err(|e| {
+        let _ = remove_directory_with_retry(&extract_temp);
         format!(
             "Failed to move extracted PortableGit to final location: {}",
             e
@@ -3673,7 +4323,7 @@ fn download_portable_git() -> std::result::Result<String, String> {
     })?;
 
     // Clean up temp download
-    let _ = std::fs::remove_file(&temp_file);
+    let _ = remove_file_with_retry(&temp_file);
 
     let final_bash = git_dir.join("bin").join("bash.exe");
     info!(
@@ -3918,7 +4568,7 @@ static BASH_DIR_ONCE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock:
 /// Returns the bash bin directory (for PATH injection) or None.
 #[cfg(windows)]
 pub fn ensure_bash_available() -> Option<String> {
-    // Fast path: if bash is already on disk, return immediately without touching OnceLock.
+    // Fast path: if bash is healthy, return immediately without touching OnceLock.
     // This avoids caching a stale "not found" from a previous failed attempt.
     if let Some(bash_path) = find_bash_executable() {
         return Path::new(&bash_path)
@@ -3955,8 +4605,235 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pi_prompt_input_preserves_long_user_and_system_roles() {
+        let user = format!(
+            "user role\n{}\nUnicode: 雪 🚀\nShell: %PATH% & | < > ^ $() `quoted`",
+            "u".repeat(40_000)
+        );
+        let system = format!(
+            "system role\r\n{}\nUnicode: café λ\nShell: %TEMP% & | < > ^ $()",
+            "s".repeat(40_000)
+        );
+
+        let PiPromptInput {
+            mut user_prompt,
+            system_prompt,
+        } = prepare_pi_prompt_input(&user, Some(&system)).expect("prepare prompt inputs");
+
+        let mut actual_user = String::new();
+        user_prompt
+            .read_to_string(&mut actual_user)
+            .expect("read user prompt input");
+        assert_eq!(actual_user, user);
+
+        let system_prompt = system_prompt.expect("system prompt file");
+        let system_path = system_prompt.path().to_path_buf();
+        assert_eq!(
+            std::fs::read_to_string(&system_path).expect("read system prompt input"),
+            system
+        );
+        drop(system_prompt);
+        assert!(
+            !system_path.exists(),
+            "named system prompt input must be removed when its run guard drops"
+        );
+    }
+
+    #[test]
+    fn pi_prompt_input_omits_system_file_when_not_requested() {
+        let PiPromptInput {
+            mut user_prompt,
+            system_prompt,
+        } = prepare_pi_prompt_input("short prompt", None).expect("prepare prompt input");
+
+        let mut actual_user = String::new();
+        user_prompt
+            .read_to_string(&mut actual_user)
+            .expect("read user prompt input");
+        assert_eq!(actual_user, "short prompt");
+        assert!(system_prompt.is_none());
+    }
+
+    #[test]
+    fn pi_prompt_inputs_are_isolated_between_overlapping_runs() {
+        let first = prepare_pi_prompt_input("first user", Some("first system")).unwrap();
+        let second = prepare_pi_prompt_input("second user", Some("second system")).unwrap();
+
+        let first_path = first.system_prompt.as_ref().unwrap().path();
+        let second_path = second.system_prompt.as_ref().unwrap().path();
+        assert_ne!(first_path, second_path);
+        assert_eq!(std::fs::read_to_string(first_path).unwrap(), "first system");
+        assert_eq!(
+            std::fs::read_to_string(second_path).unwrap(),
+            "second system"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pi_launch_error_display_preserves_windows_io_cause() {
+        let missing = std::env::temp_dir().join(format!(
+            "screenpipe-missing-pi-{}-{}.exe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut command = build_async_command(missing.to_str().unwrap());
+        let io_error = match command.spawn() {
+            Ok(mut child) => {
+                let _ = child.kill().await;
+                panic!("unexpectedly launched missing pi executable")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(io_error.raw_os_error(), Some(2));
+
+        // Scheduler logging and execution history both use ordinary Display.
+        // Raw propagation must therefore retain the Windows OS text there.
+        let expected = io_error.to_string();
+        let persisted_error = anyhow::Error::from(io_error).to_string();
+        assert_eq!(persisted_error, expected);
+        assert!(persisted_error.contains("os error 2"));
+    }
+
+    #[test]
+    fn windows_bash_launcher_detection_rejects_wsl_shims() {
+        assert!(is_windows_bash_launcher(r#"C:\Windows\System32\bash.exe"#));
+        assert!(is_windows_bash_launcher(r#"C:\Windows\Sysnative\bash.exe"#));
+        assert!(is_windows_bash_launcher(r#"C:\Windows\SysWOW64\bash.exe"#));
+        assert!(is_windows_bash_launcher(
+            r#"C:\Users\steve\AppData\Local\Microsoft\WindowsApps\bash.exe"#
+        ));
+        assert!(is_windows_bash_launcher(
+            r#""C:/WINDOWS/System32/BASH.EXE""#
+        ));
+        assert!(!is_windows_bash_launcher(
+            r#"C:\Program Files\Git\bin\bash.exe"#
+        ));
+    }
+
+    #[test]
+    fn windows_bash_candidate_skips_wsl_and_uses_native_shell() {
+        let candidates = [
+            r#"C:\Windows\System32\bash.exe"#,
+            r#"C:\Program Files\Git\bin\bash.exe"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            first_usable_windows_bash_candidate(&candidates, |_| true).as_deref(),
+            Some(r#"C:\Program Files\Git\bin\bash.exe"#)
+        );
+    }
+
+    #[test]
+    fn windows_bash_candidate_skips_unusable_native_candidates() {
+        let candidates = [
+            r#"C:\tools\broken\bash.exe"#,
+            r#"C:\Windows\SysWOW64\bash.exe"#,
+            r#"C:\custom tools\git\bin\bash.exe"#,
+        ]
+        .join("\r\n");
+
+        assert_eq!(
+            first_usable_windows_bash_candidate(&candidates, |path| {
+                path == Path::new(r#"C:\custom tools\git\bin\bash.exe"#)
+            })
+            .as_deref(),
+            Some(r#"C:\custom tools\git\bin\bash.exe"#)
+        );
+    }
+
+    #[test]
+    fn windows_bash_candidate_rejects_wsl_only_output() {
+        let candidates = [
+            r#"C:\Windows\System32\bash.exe"#,
+            r#"C:\Users\steve\AppData\Local\Microsoft\WindowsApps\bash.exe"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            first_usable_windows_bash_candidate(&candidates, |_| true),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "network-backed acceptance test for disposable Windows VMs"]
+    fn portable_git_fresh_install_and_broken_install_repair() {
+        let root = std::env::temp_dir().join(format!(
+            "screenpipe-portable-git-test-{}",
+            std::process::id()
+        ));
+        let screenpipe_dir = root.join("screenpipe");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let first = download_portable_git_into(&screenpipe_dir)
+            .expect("fresh PortableGit install should succeed");
+        assert!(bash_executable_is_usable(Path::new(&first)));
+
+        retry_transient_windows_file_lock(|| std::fs::write(&first, b"broken portable git"))
+            .expect("test should corrupt the managed bash executable");
+        assert!(!bash_executable_is_usable(Path::new(&first)));
+
+        let repaired = download_portable_git_into(&screenpipe_dir)
+            .expect("broken managed PortableGit install should be replaced");
+        assert_eq!(repaired, first);
+        assert!(bash_executable_is_usable(Path::new(&repaired)));
+
+        remove_file_with_retry(Path::new(&repaired))
+            .expect("test should remove bash from the managed install");
+        let repaired_incomplete = download_portable_git_into(&screenpipe_dir)
+            .expect("incomplete managed PortableGit install should be replaced");
+        assert_eq!(repaired_incomplete, first);
+        assert!(bash_executable_is_usable(Path::new(&repaired_incomplete)));
+
+        remove_directory_with_retry(&root).expect("test should clean up its PortableGit install");
+    }
+
+    #[test]
     fn managed_pi_install_disables_dependency_lifecycle_scripts() {
         assert!(PI_INSTALL_ARGS.contains(&"--ignore-scripts"));
+    }
+
+    #[test]
+    fn managed_pi_install_rematerializes_declared_dependencies() {
+        assert_eq!(PI_INSTALL_ARGS[0], "install");
+        assert!(PI_INSTALL_ARGS.contains(&"--force"));
+    }
+
+    #[test]
+    fn seed_pi_package_json_pins_managed_runtime_dependencies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        seed_pi_package_json(dir.path()).expect("seed managed manifest");
+
+        let contents = std::fs::read_to_string(dir.path().join("package.json"))
+            .expect("seeded package.json readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&contents).expect("seeded package.json parses");
+        assert_eq!(
+            parsed["dependencies"]["tinfoil"],
+            json!(TINFOIL_SDK_VERSION)
+        );
+        let dependencies = parsed["dependencies"]
+            .as_object()
+            .expect("managed dependencies object");
+        assert_eq!(
+            dependencies.get("@earendil-works/pi-coding-agent"),
+            Some(&json!(PI_PACKAGE.rsplit('@').next().unwrap_or("")))
+        );
+        assert_eq!(
+            dependencies.get("@earendil-works/pi-ai"),
+            Some(&json!(PI_AI_PACKAGE.rsplit('@').next().unwrap_or("")))
+        );
+        assert_eq!(
+            dependencies.get("@anthropic-ai/sdk"),
+            Some(&json!("^0.91.1"))
+        );
     }
 
     #[test]
@@ -3991,6 +4868,33 @@ mod tests {
     }
 
     #[test]
+    fn workflow_maintenance_skill_installs_in_chat_and_restricted_pipes() {
+        let chat = tempfile::tempdir().unwrap();
+        let pipe = tempfile::tempdir().unwrap();
+        PiExecutor::ensure_screenpipe_skill(chat.path()).unwrap();
+        let config: crate::pipes::PipeConfig = serde_yaml::from_str(
+            "name: test\npermissions:\n  allow: [Api(GET /workflows/context)]\n",
+        )
+        .unwrap();
+        PiExecutor::ensure_screenpipe_skill_filtered(pipe.path(), &config).unwrap();
+        let expected = include_str!("../../assets/skills/screenpipe-workflow-maintenance/SKILL.md");
+        assert!(
+            expected.len() < 5000,
+            "maintenance guide must fit small-context models"
+        );
+        for root in [chat.path(), pipe.path()] {
+            assert_eq!(
+                std::fs::read_to_string(
+                    root.join(".pi/skills/screenpipe-workflow-maintenance/SKILL.md")
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert!(PiExecutor::BASELINE_SKILL_NAMES.contains(&"screenpipe-workflow-maintenance"));
+    }
+
+    #[test]
     fn managed_pipe_guidance_only_ships_in_enterprise_team_skill() {
         let consumer_skill = include_str!("../../assets/skills/screenpipe-cli/SKILL.md");
         let enterprise_skill = include_str!("../../assets/skills/screenpipe-team/SKILL.md");
@@ -3999,12 +4903,27 @@ mod tests {
         assert!(!consumer_skill.contains("screenpipe team pipes"));
         assert!(enterprise_skill.contains("screenpipe team pipes list"));
         assert!(enterprise_skill.contains("screenpipe team pipes schedule"));
+        assert!(enterprise_skill.contains("screenpipe team frame"));
+        assert!(enterprise_skill.contains("open the JPEG with your image tool"));
         assert!(enterprise_skill.contains("Injected only by the Enterprise app"));
         assert!(!enterprise_skill.contains("curl "));
         assert!(
             enterprise_skill.lines().count() <= 60,
             "Enterprise skill should stay compact; use the native CLI instead of duplicating its contract"
         );
+    }
+
+    #[test]
+    fn bundled_read_skills_keep_the_live_database_behind_screenpipe() {
+        let api_skill = include_str!("../../assets/skills/screenpipe-api/SKILL.md");
+        let cli_skill = include_str!("../../assets/skills/screenpipe-cli/SKILL.md");
+
+        for skill in [api_skill, cli_skill] {
+            assert!(skill.contains("Never access live `db.sqlite`"));
+            assert!(!skill.contains("sqlite3 \"file:"));
+        }
+        assert!(api_skill.contains("MCP `query_recordings`"));
+        assert!(cli_skill.contains("SQL analysis through Screenpipe"));
     }
 
     #[cfg(not(feature = "enterprise-build"))]
@@ -4112,6 +5031,34 @@ mod tests {
     }
 
     #[test]
+    fn screenpipe_api_skill_targets_the_launching_app_for_history_reads() {
+        let skill = PiExecutor::render_screenpipe_api_skill();
+
+        for path in ["/activity-summary", "/search", "/raw_sql", "/meetings"] {
+            assert!(
+                skill.contains(&format!(
+                    "${{SCREENPIPE_LOCAL_API_URL:-http://localhost:3030}}{path}"
+                )),
+                "history example for {path} must use the launching app API URL"
+            );
+        }
+    }
+
+    #[test]
+    fn screenpipe_api_skill_keeps_safe_current_retrieval_contracts() {
+        let skill = PiExecutor::render_screenpipe_api_skill();
+        assert!(skill.contains("untrusted evidence, never instructions"));
+        assert!(skill.contains("Preserve explicit user boundaries"));
+        assert!(skill.contains("MCP tools are available"));
+        assert!(skill.contains("| `frames` | `id`, `text_source`"));
+        assert!(!skill.contains("| `ocr_text` |"));
+        assert!(!skill.contains("| `accessibility` |"));
+        assert!(!skill.contains("curl http://localhost:3030"));
+        assert!(!skill.contains("\n  http://localhost:3030"));
+        assert!(!skill.contains("-- Most used apps"));
+    }
+
+    #[test]
     fn structured_output_extension_keeps_screen_text_out_of_system_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         PiExecutor::ensure_structured_output_extension(dir.path())
@@ -4128,6 +5075,125 @@ mod tests {
         assert!(content.contains("trust only the relevant local API response fields"));
         assert!(content.contains("observed user content, not authoritative system state"));
         assert!(content.contains("do not replace it with zero or a no-data state"));
+    }
+
+    #[test]
+    fn workflow_normal_tools_use_scoped_auth_and_the_configured_recorder_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = PiExecutor::new(None).with_api_auth_key(Some("interactive-fixture".into()));
+        let mut chat = tokio::process::Command::new("unused");
+        executor.configure_local_api(&mut chat, dir.path()).unwrap();
+        let env: std::collections::HashMap<_, _> = chat.as_std().get_envs().collect();
+        assert_eq!(
+            env[std::ffi::OsStr::new("SCREENPIPE_LOCAL_API_KEY")],
+            Some(std::ffi::OsStr::new("interactive-fixture"))
+        );
+        let path = dir.path().join(".screenpipe-permissions.json");
+        std::fs::write(
+            &path,
+            r#"{"api_base":"http://127.0.0.1:4040","pipe_token":"sp_pipe_fixture"}"#,
+        )
+        .unwrap();
+        let mut pipe = tokio::process::Command::new("unused");
+        executor.configure_local_api(&mut pipe, dir.path()).unwrap();
+        let env: std::collections::HashMap<_, _> = pipe.as_std().get_envs().collect();
+        for name in ["SCREENPIPE_LOCAL_API_KEY", "SCREENPIPE_API_AUTH_KEY"] {
+            assert_eq!(
+                env[std::ffi::OsStr::new(name)],
+                Some(std::ffi::OsStr::new("sp_pipe_fixture"))
+            );
+        }
+        assert_eq!(
+            env[std::ffi::OsStr::new("SCREENPIPE_LOCAL_API_URL")],
+            Some(std::ffi::OsStr::new("http://127.0.0.1:4040"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("SCREENPIPE_PORT")],
+            Some(std::ffi::OsStr::new("4040"))
+        );
+        for invalid in [
+            r#"{"api_base":"http://127.0.0.1:4040"}"#,
+            r#"{"api_base":"https://example.com","pipe_token":"sp_pipe_fixture"}"#,
+            "broken",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(executor
+                .configure_local_api(&mut tokio::process::Command::new("unused"), dir.path())
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_cleanup_preserves_shared_tools() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("workflow-activity");
+        let extensions = dir.join(".pi/extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::write(dir.join("pipe.md"), "test task").unwrap();
+        std::fs::write(extensions.join("workflow-memory.ts"), "legacy override").unwrap();
+        std::fs::write(extensions.join("workflow-catalog.ts"), "legacy override").unwrap();
+        std::fs::write(extensions.join("mcp-bridge.ts"), "shared bridge").unwrap();
+        PiExecutor::ensure_self_improvement_extension(&dir).unwrap();
+        assert!(!extensions.join("workflow-memory.ts").exists());
+        assert!(!extensions.join("workflow-catalog.ts").exists());
+        assert!(extensions.join("self-improvement.ts").exists());
+        assert_eq!(
+            std::fs::read_to_string(extensions.join("mcp-bridge.ts")).unwrap(),
+            "shared bridge"
+        );
+        PiExecutor::ensure_self_improvement_extension(&dir).unwrap();
+    }
+
+    #[test]
+    fn self_improvement_extension_installs_profile_and_skill_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        PiExecutor::ensure_self_improvement_extension(dir.path())
+            .expect("install self-improvement extension");
+
+        let content = std::fs::read_to_string(
+            dir.path()
+                .join(".pi")
+                .join("extensions")
+                .join("self-improvement.ts"),
+        )
+        .expect("read self-improvement extension");
+        assert!(content.contains("name: \"user_profile\""));
+        assert!(content.contains("name: \"skill_manage\""));
+        assert!(content.contains("/agent/skills/manage"));
+    }
+
+    #[test]
+    fn chat_control_extension_installs_guarded_search_and_send_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        PiExecutor::ensure_chat_control_extension(dir.path())
+            .expect("install chat-control extension");
+        PiExecutor::ensure_screenpipe_skill(dir.path()).expect("install screenpipe skills");
+
+        let content = std::fs::read_to_string(
+            dir.path()
+                .join(".pi")
+                .join("extensions")
+                .join("chat-control.ts"),
+        )
+        .expect("read chat-control extension");
+        assert!(content.contains("name: \"search_chats\""));
+        assert!(content.contains("name: \"send_to_chat\""));
+        assert!(content.contains("name: \"start_worktree\""));
+        assert!(content.contains("__worktree-route:"));
+        assert!(content.contains("confirmed=true"));
+        assert!(content.contains("SCREENPIPE_CHAT_CONTROL_ADDR"));
+        assert!(!content.contains("/agent/chats/"));
+
+        let skill = std::fs::read_to_string(
+            dir.path()
+                .join(".pi")
+                .join("skills")
+                .join("screenpipe-chats")
+                .join("SKILL.md"),
+        )
+        .expect("read screenpipe-chats skill");
+        assert!(skill.contains("Call `search_chats`"));
+        assert!(skill.contains("explicit user authorization"));
     }
 
     #[cfg(windows)]
@@ -4515,6 +5581,26 @@ mod tests {
             .join(PiExecutor::USER_SKILL_MARKER)
             .exists());
 
+        // An unchanged source preserves the managed copy instead of deleting
+        // and recursively copying the full skill tree again.
+        std::fs::write(skills.join("foo").join("copy-sentinel"), "preserved").unwrap();
+        PiExecutor::sync_user_skills_from(&store, &project).unwrap();
+        assert!(skills.join("foo").join("copy-sentinel").exists());
+
+        // A source content change invalidates the marker and refreshes the
+        // managed copy, removing anything that is no longer in the source.
+        std::fs::write(
+            store.join("foo").join("SKILL.md"),
+            "---\nname: foo\n---\nupdated",
+        )
+        .unwrap();
+        PiExecutor::sync_user_skills_from(&store, &project).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(skills.join("foo").join("SKILL.md")).unwrap(),
+            "---\nname: foo\n---\nupdated"
+        );
+        assert!(!skills.join("foo").join("copy-sentinel").exists());
+
         // Remove from store, sync again → our mirror is gone, baseline stays.
         std::fs::remove_dir_all(store.join("foo")).unwrap();
         PiExecutor::sync_user_skills_from(&store, &project).unwrap();
@@ -4561,6 +5647,54 @@ mod tests {
             "invalid bytes should become replacement chars"
         );
         assert_eq!(lines[1], "OK");
+    }
+
+    #[test]
+    fn pi_compaction_default_preserves_user_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"theme":"dark","compaction":{"enabled":false,"reserveTokens":12000}}"#,
+        )
+        .unwrap();
+        ensure_pi_compaction_default(dir.path()).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(
+            settings["compaction"],
+            json!({"enabled":false,"reserveTokens":12000,"keepRecentTokens":8192})
+        );
+        let original = std::fs::read(&path).unwrap();
+        ensure_pi_compaction_default(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn pi_compaction_default_does_not_replace_explicit_or_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for original in [
+            r#"{"compaction":{"keepRecentTokens":24000}}"#,
+            "invalid",
+            "[]",
+            r#"{"compaction":null}"#,
+        ] {
+            std::fs::write(&path, original).unwrap();
+            ensure_pi_compaction_default(dir.path()).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn pi_compaction_default_initializes_fresh_config() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_pi_compaction_default(dir.path()).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings, json!({"compaction":{"keepRecentTokens":8192}}));
     }
 
     /// First-run seed copies config + screenpipe-owned sessions from the
@@ -4707,6 +5841,13 @@ mod tests {
 
     #[test]
     fn test_pick_allowed_model() {
+        assert_eq!(
+            PiExecutor::pick_allowed_model(
+                "glm-5.3-flash-reap50-iq3m",
+                &["auto".into(), "gpt-5.6-luna".into()],
+            ),
+            Ok("glm-5.3-flash-reap50-iq3m".into())
+        );
         let allowed: Vec<String> = ["auto", "claude-haiku-4-5", "gemini-3.5-flash"]
             .iter()
             .map(|s| s.to_string())
@@ -4768,6 +5909,12 @@ mod tests {
 
     #[test]
     fn gateway_catalog_omits_locked_models_from_pi() {
+        let confidential = gateway_models_to_pi_models(&[json!({
+            "id": "glm-5.3-flash-reap50-iq3m", "context_window": 32768,
+            "max_output_tokens": 8192
+        })]);
+        assert_eq!(confidential[0]["api"], json!("screenpipe-tinfoil"));
+        assert_eq!(confidential[0]["input"], json!(["text"]));
         let models = gateway_models_to_pi_models(&[
             json!({
                 "id": "auto",
@@ -5181,10 +6328,34 @@ mod tests {
     }
 
     #[test]
+    fn custom_provider_compat_disables_store_for_gemini_openai_endpoint() {
+        let mut provider = json!({
+            "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "models": [
+                {
+                    "id": "gemini-3.1-flash-lite",
+                    "compat": {"maxTokensField": "max_tokens"}
+                },
+                {"id": "gemini-3.6-flash"}
+            ]
+        });
+        apply_custom_provider_compat(&mut provider);
+
+        assert_eq!(provider["models"][0]["compat"]["supportsStore"], false);
+        assert_eq!(
+            provider["models"][0]["compat"]["maxTokensField"],
+            "max_tokens"
+        );
+        assert_eq!(provider["models"][1]["compat"]["supportsStore"], false);
+        assert_eq!(provider["headers"]["User-Agent"], "screenpipe");
+    }
+
+    #[test]
     fn custom_provider_compat_preserves_generic_urls_and_explicit_user_agents() {
         let mut provider = json!({
             "baseUrl": "https://proxy.example.com/openai/",
-            "headers": {"user-agent": "my-client", "x-tenant": "tenant-1"}
+            "headers": {"user-agent": "my-client", "x-tenant": "tenant-1"},
+            "models": [{"id": "my-model"}]
         });
         apply_custom_provider_compat(&mut provider);
 
@@ -5192,6 +6363,7 @@ mod tests {
         assert_eq!(provider["headers"]["user-agent"], "my-client");
         assert_eq!(provider["headers"]["x-tenant"], "tenant-1");
         assert_eq!(provider["headers"].as_object().unwrap().len(), 2);
+        assert!(provider["models"][0].get("compat").is_none());
     }
 
     #[tokio::test]
@@ -5319,7 +6491,7 @@ mod tests {
         .expect("write corrupt pkg");
         std::fs::write(&lock_path, b"stale-lock").expect("write stale lock");
 
-        seed_pi_package_json(dir.path());
+        seed_pi_package_json(dir.path()).expect("recover managed manifest");
 
         let contents = std::fs::read_to_string(&pkg_path).expect("re-seeded pkg readable");
         assert!(

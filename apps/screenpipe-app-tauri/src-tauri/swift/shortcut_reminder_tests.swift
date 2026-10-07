@@ -13,6 +13,7 @@
 // covered only by Rust tests asserting the anchor strings round-trip.
 
 import Cocoa
+import CryptoKit
 
 private var failures: [String] = []
 private var checks = 0
@@ -390,6 +391,23 @@ private func testWireContract() {
     expect(actual == expected, "anchor raw values drifted: \(actual)")
 }
 
+/// The native overlay must use the same compact key notation as the webview
+/// fallback. Word labels made a two-modifier shortcut wider than its action.
+private func testShortcutGlyphs() {
+    expect(
+        prettifyShortcut("Control+Super+s") == "⌘⌃S",
+        "shortcut should render Command and Control as glyphs"
+    )
+    expect(
+        prettifyShortcut("Shift+Option+Command+k") == "⌘⌥⇧K",
+        "shortcut should keep a stable macOS glyph order"
+    )
+    expect(
+        prettifyShortcut("⌘⌃S") == "⌘⌃S",
+        "shortcut glyph input should be idempotent"
+    )
+}
+
 /// A drag inside a display must be left exactly alone. The clamp is a fence at
 /// the edge of the desktop, not a magnet, so ordinary dragging still tracks the
 /// cursor pixel for pixel.
@@ -500,6 +518,34 @@ private func testClampWithoutDisplaysIsIdentity() {
     expect(clamped == origin, "clamp with no displays should be identity, got \(clamped)")
 }
 
+/// Selecting a UI locale must translate labels and leave shortcut tokens intact.
+private func testLocalizedDisclosure() {
+    let sources = ["right-click", "star work session", "Starred session in progress", "timeline", "ask chat", "search", "mic capture", "live", "idle", "settings"]
+    let translations = Dictionary(uniqueKeysWithValues: sources.map { source in
+        (SHA256.hash(data: Data(source.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined(), "localized " + source)
+    })
+    let payload = try! JSONSerialization.data(withJSONObject: ["locale": "ja", "messages": translations])
+    String(data: payload, encoding: .utf8)!.withCString { UILocalization.shared.update($0) }
+    defer { "{\"locale\":\"en\",\"messages\":{}}".withCString { UILocalization.shared.update($0) } }
+    let metrics = OverlayMetrics()
+    for (control, label) in [("star", "star work session"), ("timeline", "timeline"), ("chat", "ask chat"), ("search", "search"), ("settings", "settings")] {
+        let content = disclosureContent(for: control, overlayShortcut: "⌥Space", chatShortcut: "⌥C", searchShortcut: "⌥S", starShortcut: "⌥B", metrics: metrics)
+        expect(content?.0 == "localized " + label, "untranslated overlay control: \(control)")
+        if control == "star" { expect(content?.1 == "⌥B", "star shortcut was not preserved") }
+        if control == "timeline" { expect(content?.1 == "⌥Space", "shortcut was translated") }
+    }
+    metrics.starredActive = true
+    let activeStar = disclosureContent(for: "star", overlayShortcut: "", chatShortcut: "", searchShortcut: "", starShortcut: "⌥B", metrics: metrics)
+    expect(activeStar?.0 == "localized Starred session in progress", "active session status must replace the start hint")
+    expect(activeStar?.1 == "⌥B", "active session preserves its stop shortcut")
+    metrics.starredActive = false
+    let disabledStar = disclosureContent(for: "star", overlayShortcut: "", chatShortcut: "", searchShortcut: "", starShortcut: "", metrics: metrics)
+    expect(disabledStar?.1 == "", "disabled star shortcut must not show a chord")
+    let brand = disclosureContent(for: "brand", overlayShortcut: "", chatShortcut: "", searchShortcut: "", starShortcut: "", metrics: metrics)
+    expect(brand?.0 == "screenpipe", "brand was translated")
+    expect(brand?.1 == "localized right-click", "right-click hint was not translated")
+}
+
 @main
 struct ShortcutReminderTests {
     static func main() {
@@ -514,6 +560,8 @@ struct ShortcutReminderTests {
         testAttachmentStacking()
         testAttachmentStaysOnScreen()
         testWireContract()
+        testShortcutGlyphs()
+        testLocalizedDisclosure()
         testClampLeavesOnScreenDragsAlone()
         testClampKeepsPillOnDesktop()
         testClampPicksNearestDisplay()

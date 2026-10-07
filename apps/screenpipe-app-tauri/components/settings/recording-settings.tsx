@@ -12,17 +12,11 @@ import { useInterval } from "@/lib/hooks/use-interval";
 import { useSettingsIndexDriftCheck, type SettingsField } from "./settings-search";
 import { CaptureFrequencyPreview, AudioCaptureModePreview } from "./setting-previews";
 import {
-  SEMANTIC_CONTEXT_MODE_COPY,
-  type SemanticContextMode,
-} from "@/lib/semantic-context-mode";
-import {
   getAecModeSettings,
   getRemoteAecModePolicy,
-  getRemoteBooleanPolicy,
   normalizeAecModeForPlatform,
   normalizeDesktopRemotePreferences,
   resolveAecModeRemoteValue,
-  resolveBooleanRemoteValue,
   type AecMode,
 } from "@/lib/desktop-remote-control";
 import {
@@ -33,34 +27,33 @@ import {
 
 /** Search fields for the Audio & meetings destination. */
 export const audioSearchIndex: SettingsField[] = [
-  { label: "Audio Recording", keywords: ["mic", "microphone", "audio"] },
-  { label: "Capture audio", keywords: ["continuous", "meetings only"] },
-  { label: "Transcription engine", keywords: ["whisper", "cloud", "stt"] },
-  { label: "Live meeting notes", keywords: ["captions", "meeting", "live"], conditional: true },
-  { label: "Append typed text to note", keywords: ["note", "append"], conditional: true },
-  { label: "Automatic meeting detection", keywords: ["zoom", "teams", "meet"], conditional: true },
-  { label: "Auto-select audio devices", keywords: ["devices", "bluetooth"], conditional: true },
-  { label: "Languages", keywords: ["transcript language", "language"], conditional: true },
-  { label: "Custom Vocabulary", keywords: ["vocabulary", "names", "jargon", "replacement"], conditional: true },
-  { label: "Smart recording", keywords: ["smart recording", "beta", "meeting", "piggyback", "per-process", "meeting audio"], conditional: true },
-  { label: "Always record bluetooth mic", keywords: ["bluetooth", "airpods", "headset", "a2dp", "sco", "meeting"], conditional: true },
-  { label: "Your name", keywords: ["speaker", "voice training"], conditional: true },
+  { label: msg("Audio Recording", {}), keywords: ["mic", "microphone", "audio", "meetings", "recording"] },
+  { label: msg("Capture audio", {}), keywords: ["continuous", "meetings only"] },
+  { label: msg("Transcription engine", {}), keywords: ["whisper", "cloud", "stt"] },
+  { label: msg("Max batch duration (seconds)", {}), keywords: ["batch", "timeout", "openai", "retranscription"], conditional: true },
+  { label: msg("Live meeting notes", {}), keywords: ["captions", "meeting", "live"], conditional: true },
+  { label: msg("Append typed text to note", {}), keywords: ["note", "append"], conditional: true },
+  { label: msg("Automatic meeting detection", {}), keywords: ["zoom", "teams", "meet"], conditional: true },
+  { label: msg("Auto-select audio devices", {}), keywords: ["devices", "bluetooth"], conditional: true },
+  { label: msg("Languages", {}), keywords: ["transcript language", "language"], conditional: true },
+  { label: msg("Custom Vocabulary", {}), keywords: ["vocabulary", "names", "jargon", "replacement"], conditional: true },
+  { label: msg("Always record bluetooth mic", {}), keywords: ["bluetooth", "airpods", "headset", "a2dp", "sco", "meeting"], conditional: true },
+  { label: msg("Your name", {}), keywords: ["speaker", "voice training"], conditional: true },
 ];
 
 /** Search fields for the Screen destination. */
 export const screenSearchIndex: SettingsField[] = [
-  { label: "Screen context capture", keywords: ["screen", "video", "accessibility"] },
-  { label: "Structured app context", keywords: ["semantic", "ai", "messages", "email", "tasks", "code"], conditional: true },
-  { label: "Use it for", keywords: ["memory", "computer use", "automation", "agent", "skills"], conditional: true },
-  { label: "Screen recording", keywords: ["screenshot", "pixels", "ocr", "jpeg", "capture"] },
-  { label: "Use all monitors", keywords: ["monitor", "display"], conditional: true },
+  { label: msg("Screen context capture", {}), keywords: ["screen", "video", "accessibility"] },
+  { label: msg("Screenshots", {}), keywords: ["screen recording", "timeline", "rewind", "pixels", "ocr", "jpeg", "capture"] },
+  { label: msg("Use all monitors", {}), keywords: ["monitor", "display"], conditional: true },
   // conditional: monitor picker only renders when "Use all monitors" is off — paired right under that toggle.
-  { label: "Monitors", conditional: true },
-  { label: "Recording quality", keywords: ["fps", "quality"], conditional: true },
+  { label: msg("Monitors", {}), conditional: true },
+  { label: msg("Scroll capture", {}), keywords: ["performance", "low impact", "scroll", "auto", "slow", "cpu"], conditional: true },
+  { label: msg("Recording quality", {}), keywords: ["fps", "quality"], conditional: true },
   // conditional: hidden when screen recording is off (same gate as Recording quality).
-  { label: "Capture frequency", keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
-  { label: "HD recording for meetings", keywords: ["hd", "meeting"] },
-  { label: "Chinese mirror", keywords: ["china", "mirror"] },
+  { label: msg("Capture frequency", {}), keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
+  { label: msg("HD recording for meetings", {}), keywords: ["hd", "meeting"] },
+  { label: msg("Chinese mirror", {}), keywords: ["china", "mirror"] },
 ];
 
 /** Backward-compatible aggregate for callers that still treat capture as one area. */
@@ -68,6 +61,7 @@ export const searchIndex: SettingsField[] = [
   ...audioSearchIndex,
   ...screenSearchIndex,
 ];
+import { RecordingDetailCard } from "./recording-detail-card";
 import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
 import {
   Select,
@@ -191,6 +185,12 @@ import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { useOpenAIModels } from "./hooks/use-openai-models";
 import { useTranscriptionDiagnostics } from "./hooks/use-transcription-diagnostics";
 import { useVoiceTraining } from "./hooks/use-voice-training";
+import { useGT } from "gt-react";
+import { msg, useMessages } from "gt-react";
+import { localizeDefinitions } from "@/lib/i18n/definitions";
+import { useUiLocale } from "@/lib/i18n/provider";
+import { useUiLocale as useLocale } from "@/lib/i18n/provider";
+
 
 type PermissionsStatus = {
   screenRecording: string;
@@ -442,6 +442,8 @@ function BackgroundTranscriptionDialog({
 }: {
   audioPipeline?: AudioPipelineSnapshot | null;
 }) {
+  const uiLocale = useUiLocale();
+  const ui = useGT();
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<AudioReconciliationBacklogItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -495,7 +497,7 @@ function BackgroundTranscriptionDialog({
       setPendingTotal(data.pending ?? data.items?.length ?? 0);
     } catch (error) {
       toast({
-        title: "could not load backlog",
+        title: ui("Could not load backlog"),
         description: error instanceof Error ? error.message : String(error),
         variant: "destructive",
       });
@@ -504,7 +506,7 @@ function BackgroundTranscriptionDialog({
         setLoading(false);
       }
     }
-  }, [toast]);
+  }, [toast, uiLocale]);
 
   useEffect(() => {
     if (open) {
@@ -551,7 +553,7 @@ function BackgroundTranscriptionDialog({
       .catch((error) => {
         if (canceled) return;
         toast({
-          title: "could not load audio",
+          title: ui("Could not load audio"),
           description: error instanceof Error ? error.message : String(error),
           variant: "destructive",
         });
@@ -640,12 +642,12 @@ function BackgroundTranscriptionDialog({
 
     void audio.play().catch(() => {
       toast({
-        title: "could not play audio",
-        description: "the audio file could not be opened for preview",
+        title: ui("Could not play audio"),
+        description: ui("The audio file could not be opened for preview"),
         variant: "destructive",
       });
     });
-  }, [previewSrc, toast]);
+  }, [previewSrc, toast, uiLocale]);
 
   const seekPreview = useCallback((seconds: number) => {
     const audio = audioRef.current;
@@ -677,27 +679,27 @@ function BackgroundTranscriptionDialog({
       }
       const result = await response.json();
       toast({
-        title: result.chunks_processed > 0 ? "chunk transcribed" : "nothing processed",
+        title: result.chunks_processed > 0 ? ui("Chunk transcribed") : ui("Nothing processed"),
         description:
           result.chunks_processed > 0
-            ? `audio chunk ${audioChunkId} was processed`
-            : `audio chunk ${audioChunkId} did not produce a transcript`,
+            ? ui("Audio chunk {value1} was processed", { value1: audioChunkId })
+            : ui("Audio chunk {value1} did not produce a transcript", { value1: audioChunkId }),
       });
       await refreshItems({ showLoading: false });
     } catch (error) {
       toast({
-        title: "could not run transcription",
+        title: ui("Could not run transcription"),
         description: error instanceof Error ? error.message : String(error),
         variant: "destructive",
       });
     } finally {
       setRunningId(null);
     }
-  }, [refreshItems, toast]);
+  }, [refreshItems, toast, uiLocale]);
 
   const handleDrop = useCallback(async (item: AudioReconciliationBacklogItem) => {
     const ok = window.confirm(
-      `drop audio chunk ${item.audio_chunk_id} from the background transcription backlog?`
+      ui("drop audio chunk {value1} from the background transcription backlog?", { value1: item.audio_chunk_id })
     );
     if (!ok) return;
 
@@ -715,19 +717,19 @@ function BackgroundTranscriptionDialog({
       );
       setPendingTotal((current) => Math.max(0, (current ?? visiblePending) - 1));
       toast({
-        title: "audio chunk dropped",
+        title: ui("Audio chunk dropped"),
         description: getAudioFileName(item.file_path),
       });
     } catch (error) {
       toast({
-        title: "could not drop chunk",
+        title: ui("Could not drop chunk"),
         description: error instanceof Error ? error.message : String(error),
         variant: "destructive",
       });
     } finally {
       setDroppingId(null);
     }
-  }, [toast, visiblePending]);
+  }, [toast, visiblePending, uiLocale]);
 
   const oldestPending = pending > 0
     ? formatBacklogAge(audioPipeline?.oldest_pending_transcription_at)
@@ -743,8 +745,8 @@ function BackgroundTranscriptionDialog({
         variant="ghost"
         size="icon"
         className="relative h-7 w-7 shrink-0 border border-border bg-background text-foreground hover:bg-muted hover:text-foreground active:bg-muted"
-        aria-label="open background transcription backlog"
-        title="background transcription backlog"
+        aria-label={ui("Open background transcription backlog")}
+        title={ui("Background transcription backlog")}
         onClick={() => setOpen(true)}
       >
         <ListTodo className="h-3.5 w-3.5" />
@@ -779,25 +781,25 @@ function BackgroundTranscriptionDialog({
               </DialogDescription>
             </div>
             <Badge variant="outline" className="mt-0.5 shrink-0 rounded-none font-mono text-[10px]">
-              worker {workerState}
+              Worker {workerState}
             </Badge>
           </div>
 
           <div className="grid shrink-0 grid-cols-2 gap-2 text-xs sm:grid-cols-4">
             <div className="border border-border px-2 py-1.5">
-              <div className="text-muted-foreground">ready loaded</div>
-              <div className="font-mono text-sm">{readyItems.length.toLocaleString()}</div>
+              <div className="text-muted-foreground">Ready loaded</div>
+              <div className="font-mono text-sm">{readyItems.length.toLocaleString(uiLocale)}</div>
             </div>
             <div className="border border-border px-2 py-1.5">
-              <div className="text-muted-foreground">quiet loaded</div>
-              <div className="font-mono text-sm">{quietItems.length.toLocaleString()}</div>
+              <div className="text-muted-foreground">Quiet loaded</div>
+              <div className="font-mono text-sm">{quietItems.length.toLocaleString(uiLocale)}</div>
             </div>
             <div className="border border-border px-2 py-1.5">
-              <div className="text-muted-foreground">total candidates</div>
-              <div className="font-mono text-sm">{visiblePending.toLocaleString()}</div>
+              <div className="text-muted-foreground">Total candidates</div>
+              <div className="font-mono text-sm">{visiblePending.toLocaleString(uiLocale)}</div>
             </div>
             <div className="border border-border px-2 py-1.5">
-              <div className="text-muted-foreground">oldest candidate</div>
+              <div className="text-muted-foreground">Oldest candidate</div>
               <div className="font-mono text-sm">{oldestPending}</div>
             </div>
           </div>
@@ -808,7 +810,7 @@ function BackgroundTranscriptionDialog({
               <Input
                 value={searchQuery}
                 onChange={(event) => setSearchQuery(event.target.value)}
-                placeholder="search chunk, time, or file..."
+                placeholder={ui("Search chunk, time, or file...")}
                 className="h-8 pl-7 text-xs"
                 spellCheck={false}
               />
@@ -828,13 +830,13 @@ function BackgroundTranscriptionDialog({
               ) : (
                 <EyeOff className="h-3 w-3" />
               )}
-              {showQuietChunks ? "quiet shown" : "quiet hidden"}
+              {showQuietChunks ? ui("quiet shown") : ui("quiet hidden")}
               <span className="font-mono text-[10px] text-muted-foreground">
-                {quietItems.length.toLocaleString()}
+                {quietItems.length.toLocaleString(uiLocale)}
               </span>
             </Button>
             <Badge variant="secondary" className="h-8 shrink-0 rounded-none px-2 font-mono text-[10px]">
-              {filteredItems.length.toLocaleString()} shown
+              {filteredItems.length.toLocaleString(uiLocale)} shown
             </Badge>
             <Button
               type="button"
@@ -845,7 +847,7 @@ function BackgroundTranscriptionDialog({
               onClick={() => void refreshItems()}
             >
               <RefreshCw className={cn("h-3 w-3", loading && "animate-spin")} />
-              refresh
+              Refresh
             </Button>
           </div>
 
@@ -853,12 +855,12 @@ function BackgroundTranscriptionDialog({
             <table className="w-full min-w-[720px] table-fixed text-xs">
               <thead className="sticky top-0 z-10 bg-background">
                 <tr className="border-b border-border/60 bg-muted/30 text-left text-muted-foreground">
-                  <th className="w-[72px] px-2 py-1.5 font-medium">chunk</th>
-                  <th className="w-[64px] px-2 py-1.5 font-medium">age</th>
-                  <th className="w-[92px] px-2 py-1.5 font-medium">captured</th>
-                  <th className="px-2 py-1.5 font-medium">file</th>
-                  <th className="w-[92px] px-2 py-1.5 font-medium">status</th>
-                  <th className="w-[120px] px-2 py-1.5 text-right font-medium">actions</th>
+                  <th className="w-[72px] px-2 py-1.5 font-medium">Chunk</th>
+                  <th className="w-[64px] px-2 py-1.5 font-medium">Age</th>
+                  <th className="w-[92px] px-2 py-1.5 font-medium">Captured</th>
+                  <th className="px-2 py-1.5 font-medium">File</th>
+                  <th className="w-[92px] px-2 py-1.5 font-medium">Status</th>
+                  <th className="w-[120px] px-2 py-1.5 text-right font-medium">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -895,10 +897,10 @@ function BackgroundTranscriptionDialog({
                   <tr>
                     <td colSpan={6} className="px-2 py-6 text-center text-muted-foreground">
                       {items.length === 0
-                        ? "no waiting chunks"
+                        ? ui("No waiting chunks")
                         : activeItems.length === 0 && !showQuietChunks
-                          ? "only quiet/no-speech chunks are loaded"
-                          : "no matching chunks"}
+                          ? ui("Only quiet/no-speech chunks are loaded")
+                          : ui("No matching chunks")}
                     </td>
                   </tr>
                 )}
@@ -924,7 +926,7 @@ function BackgroundTranscriptionDialog({
                         </td>
                         <td
                           className="px-2 py-1.5 font-mono text-muted-foreground whitespace-nowrap"
-                          title={new Date(item.captured_at).toLocaleString()}
+                          title={new Date(item.captured_at).toLocaleString(uiLocale)}
                         >
                           {formatBacklogCapturedAt(item.captured_at)}
                         </td>
@@ -964,7 +966,7 @@ function BackgroundTranscriptionDialog({
                                       "h-7 w-7 border border-border bg-background text-foreground hover:bg-muted hover:text-foreground active:bg-muted",
                                       isPreviewing && "bg-muted"
                                     )}
-                                    aria-label={`preview audio chunk ${item.audio_chunk_id}`}
+                                    aria-label={ui("Preview audio chunk {value1}", { value1: item.audio_chunk_id })}
                                     disabled={droppingId === item.audio_chunk_id}
                                     onClick={(event) => {
                                       event.stopPropagation();
@@ -979,7 +981,7 @@ function BackgroundTranscriptionDialog({
                                   </Button>
                                 </TooltipTrigger>
                                 <TooltipContent side="top">
-                                  {isPreviewing ? "close audio controls" : "open audio controls"}
+                                  {isPreviewing ? ui("Close audio controls") : ui("Open audio controls")}
                                 </TooltipContent>
                               </Tooltip>
                               <Tooltip>
@@ -989,7 +991,7 @@ function BackgroundTranscriptionDialog({
                                     variant="ghost"
                                     size="icon"
                                     className="h-7 w-7 border border-border bg-background text-foreground hover:bg-muted hover:text-foreground active:bg-muted"
-                                    aria-label={`transcribe audio chunk ${item.audio_chunk_id}`}
+                                    aria-label={ui("Transcribe audio chunk {value1}", { value1: item.audio_chunk_id })}
                                     disabled={runningId === item.audio_chunk_id || droppingId === item.audio_chunk_id}
                                     onClick={(event) => {
                                       event.stopPropagation();
@@ -1003,7 +1005,7 @@ function BackgroundTranscriptionDialog({
                                     )}
                                   </Button>
                                 </TooltipTrigger>
-                                <TooltipContent side="top">transcribe this chunk now</TooltipContent>
+                                <TooltipContent side="top">Transcribe this chunk now</TooltipContent>
                               </Tooltip>
                               <Tooltip>
                                 <TooltipTrigger asChild>
@@ -1012,7 +1014,7 @@ function BackgroundTranscriptionDialog({
                                     variant="ghost"
                                     size="icon"
                                     className="h-7 w-7 border border-border bg-background text-muted-foreground hover:bg-muted hover:text-destructive active:bg-muted"
-                                    aria-label={`drop audio chunk ${item.audio_chunk_id}`}
+                                    aria-label={ui("Drop audio chunk {value1}", { value1: item.audio_chunk_id })}
                                     disabled={droppingId === item.audio_chunk_id || runningId === item.audio_chunk_id}
                                     onClick={(event) => {
                                       event.stopPropagation();
@@ -1026,7 +1028,7 @@ function BackgroundTranscriptionDialog({
                                     )}
                                   </Button>
                                 </TooltipTrigger>
-                                <TooltipContent side="top">drop this waiting chunk</TooltipContent>
+                                <TooltipContent side="top">Drop this waiting chunk</TooltipContent>
                               </Tooltip>
                             </div>
                           </TooltipProvider>
@@ -1049,14 +1051,14 @@ function BackgroundTranscriptionDialog({
                   </div>
                   <div className="font-mono text-[10px] text-muted-foreground">
                     {formatBacklogFileSize(previewItem.file_size_bytes)}
-                    {previewItem.likely_empty ? " - quiet" : ""}
+                    {previewItem.likely_empty ? ui(" - quiet") : ""}
                   </div>
                 </div>
               </div>
               {previewLoadingId === previewItem.audio_chunk_id && !previewSrc ? (
                 <div className="flex h-9 items-center gap-2 bg-muted/60 px-3 text-[11px] text-muted-foreground">
                   <Loader2 className="h-3 w-3 animate-spin" />
-                  loading audio
+                  Loading audio
                 </div>
               ) : previewSrc ? (
                 <div className="flex h-9 min-w-0 items-center gap-2 bg-muted/60 px-2">
@@ -1088,7 +1090,7 @@ function BackgroundTranscriptionDialog({
                     size="icon"
                     className="h-7 w-7 shrink-0 border border-border bg-background text-foreground hover:bg-muted hover:text-foreground active:bg-muted"
                     onClick={handlePreviewPlayback}
-                    aria-label={previewPlaying ? "pause audio preview" : "play audio preview"}
+                    aria-label={previewPlaying ? ui("Pause audio preview") : ui("Play audio preview")}
                   >
                     {previewPlaying ? (
                       <Pause className="h-3.5 w-3.5" />
@@ -1102,7 +1104,7 @@ function BackgroundTranscriptionDialog({
                     size="icon"
                     className="h-7 w-7 shrink-0 border border-border bg-background text-foreground hover:bg-muted hover:text-foreground active:bg-muted"
                     onClick={() => stepPreview(-10)}
-                    aria-label="back 10 seconds"
+                    aria-label={ui("Back 10 seconds")}
                     disabled={previewDuration <= 0}
                   >
                     <Rewind className="h-3.5 w-3.5" />
@@ -1116,7 +1118,7 @@ function BackgroundTranscriptionDialog({
                     onChange={(event) => seekPreview(Number(event.target.value))}
                     disabled={previewDuration <= 0}
                     className="h-1 min-w-[180px] flex-1 accent-foreground"
-                    aria-label="audio preview position"
+                    aria-label={ui("Audio preview position")}
                   />
                   <span className="w-[76px] shrink-0 text-right font-mono text-[10px] text-muted-foreground">
                     {formatAudioPreviewTime(previewCurrentTime)} / {formatAudioPreviewTime(previewDuration)}
@@ -1127,7 +1129,7 @@ function BackgroundTranscriptionDialog({
                     size="icon"
                     className="h-7 w-7 shrink-0 border border-border bg-background text-foreground hover:bg-muted hover:text-foreground active:bg-muted"
                     onClick={() => stepPreview(10)}
-                    aria-label="forward 10 seconds"
+                    aria-label={ui("Forward 10 seconds")}
                     disabled={previewDuration <= 0}
                   >
                     <FastForward className="h-3.5 w-3.5" />
@@ -1135,7 +1137,7 @@ function BackgroundTranscriptionDialog({
                 </div>
               ) : (
                 <div className="flex h-9 items-center bg-muted/60 px-3 text-[11px] text-muted-foreground">
-                  audio unavailable
+                  Audio unavailable
                 </div>
               )}
             </div>
@@ -1143,11 +1145,11 @@ function BackgroundTranscriptionDialog({
 
           <div className="flex shrink-0 items-center justify-between gap-3 text-xs text-muted-foreground">
             <span className="min-w-0 truncate">
-              showing {filteredItems.length.toLocaleString()} of{" "}
-              {(showQuietChunks ? items.length : readyItems.length).toLocaleString()}{" "}
-              {showQuietChunks ? "loaded chunks" : "ready loaded chunks"}
-              {!showQuietChunks && quietItems.length > 0 ? ` - ${quietItems.length.toLocaleString()} quiet hidden` : ""}
-              {showingLimitedRows ? ` - ${visiblePending.toLocaleString()} total candidates incl. quiet` : ""}
+              Showing {filteredItems.length.toLocaleString(uiLocale)} of{" "}
+              {(showQuietChunks ? items.length : readyItems.length).toLocaleString(uiLocale)}{" "}
+              {showQuietChunks ? ui("loaded chunks") : ui("ready loaded chunks")}
+              {!showQuietChunks && quietItems.length > 0 ? ui(" - {value1} quiet hidden", { value1: quietItems.length.toLocaleString(uiLocale) }) : ""}
+              {showingLimitedRows ? ui(" - {value1} total candidates incl. quiet", { value1: visiblePending.toLocaleString(uiLocale) }) : ""}
             </span>
           </div>
         </DialogContent>
@@ -1273,6 +1275,8 @@ function TranscriptionDictionary({
   vocabularyWords: Array<{ word: string; replacement?: string }>;
   onChange: (words: Array<{ word: string; replacement?: string }>) => void;
 }) {
+
+  const ui = useGT();
   const [showBulk, setShowBulk] = useState(false);
   const [bulkText, setBulkText] = useState("");
   const [filter, setFilter] = useState("");
@@ -1297,15 +1301,15 @@ function TranscriptionDictionary({
     const available = VOCAB_LIMIT - vocabularyWords.length;
     const toAdd = newTerms.slice(0, available);
     if (toAdd.length === 0) {
-      toast({ title: "no new terms", description: "all terms already exist in your dictionary" });
+      toast({ title: ui("No new terms"), description: ui("All terms already exist in your dictionary") });
       return;
     }
     const updated = [...vocabularyWords, ...toAdd.map((w) => ({ word: w }))];
     onChange(updated);
     toast({
-      title: `added ${toAdd.length} terms`,
+      title: ui("Added {value1} terms", { value1: toAdd.length }),
       description: newTerms.length > toAdd.length
-        ? `${newTerms.length - toAdd.length} skipped (limit: ${VOCAB_LIMIT})`
+        ? ui("{value1} skipped (limit: {value2})", { value1: newTerms.length - toAdd.length, value2: VOCAB_LIMIT })
         : undefined,
     });
     setBulkText("");
@@ -1321,14 +1325,14 @@ function TranscriptionDictionary({
           <div className="flex-1 min-w-0">
             <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
               Custom Vocabulary
-              <HelpTooltip text="Add custom words (names, brands, jargon) to improve transcription accuracy. You can also add replacements to auto-correct common mistranscriptions." />
+              <HelpTooltip text={ui("Add custom words (names, brands, jargon) to improve transcription accuracy. You can also add replacements to auto-correct common mistranscriptions.")} />
               {vocabularyWords.length > 0 && (
                 <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
                   {vocabularyWords.length} / {VOCAB_LIMIT}
                 </Badge>
               )}
             </h3>
-            <p className="text-xs text-muted-foreground">teach names, brands & jargon to your transcription</p>
+            <p className="text-xs text-muted-foreground">Teach names, brands & jargon to your transcription</p>
           </div>
           <div className="flex items-center gap-1 shrink-0">
             <Button
@@ -1338,7 +1342,7 @@ function TranscriptionDictionary({
               onClick={() => setShowBulk(!showBulk)}
             >
               <Download className="h-3 w-3" />
-              bulk import
+              Bulk import
             </Button>
             {vocabularyWords.length > 0 && (
               <Button
@@ -1346,7 +1350,7 @@ function TranscriptionDictionary({
                 variant="outline"
                 className="h-7 text-xs px-2 text-muted-foreground hover:text-destructive"
                 onClick={() => {
-                  if (confirm(`remove all ${vocabularyWords.length} terms?`)) {
+                  if (confirm(ui("remove all {value1} terms?", { value1: vocabularyWords.length }))) {
                     onChange([]);
                   }
                 }}
@@ -1360,8 +1364,8 @@ function TranscriptionDictionary({
         {/* Engine limits info */}
         {vocabularyWords.length > 0 && (
           <div className="text-[10px] text-muted-foreground/60 font-mono mb-2 px-1 flex gap-3">
-            <span>offline: {Math.min(vocabularyWords.reduce((n, e) => n + (e.replacement || e.word).length + 2, 0), WHISPER_CHAR_LIMIT)}/{WHISPER_CHAR_LIMIT} chars</span>
-            <span>cloud: {Math.min(vocabularyWords.length, DEEPGRAM_LIMIT)}/{DEEPGRAM_LIMIT} keywords</span>
+            <span>Offline: {Math.min(vocabularyWords.reduce((n, e) => n + (e.replacement || e.word).length + 2, 0), WHISPER_CHAR_LIMIT)}/{WHISPER_CHAR_LIMIT} chars</span>
+            <span>Cloud: {Math.min(vocabularyWords.length, DEEPGRAM_LIMIT)}/{DEEPGRAM_LIMIT} keywords</span>
           </div>
         )}
 
@@ -1371,7 +1375,7 @@ function TranscriptionDictionary({
             <Textarea
               value={bulkText}
               onChange={(e) => setBulkText(e.target.value)}
-              placeholder={"paste terms separated by commas, newlines, semicolons, or tabs\n\ne.g. kubernetes, posthog, screenpipe, terraform"}
+              placeholder={ui("Paste terms separated by commas, newlines, semicolons, or tabs\n\ne.g. kubernetes, posthog, screenpipe, terraform")}
               className="text-xs font-mono min-h-[80px] resize-y"
               spellCheck={false}
               autoCorrect="off"
@@ -1388,7 +1392,7 @@ function TranscriptionDictionary({
                     )}
                   </>
                 ) : (
-                  "paste or type terms above"
+                  ui("Paste or type terms above")
                 )}
               </span>
               <div className="flex gap-1">
@@ -1398,7 +1402,7 @@ function TranscriptionDictionary({
                   className="h-7 text-xs px-2"
                   onClick={() => { setBulkText(""); setShowBulk(false); }}
                 >
-                  cancel
+                  Cancel
                 </Button>
                 <Button
                   size="sm"
@@ -1406,7 +1410,7 @@ function TranscriptionDictionary({
                   disabled={parsed.length === 0}
                   onClick={handleBulkImport}
                 >
-                  add {Math.min(parsed.length, VOCAB_LIMIT - vocabularyWords.length)} terms
+                  Add {Math.min(parsed.length, VOCAB_LIMIT - vocabularyWords.length)} terms
                 </Button>
               </div>
             </div>
@@ -1420,7 +1424,7 @@ function TranscriptionDictionary({
             <Input
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="filter terms..."
+              placeholder={ui("Filter terms...")}
               className="h-7 text-xs pl-7"
               spellCheck={false}
             />
@@ -1456,7 +1460,7 @@ function TranscriptionDictionary({
             })}
             {filter && filtered.length < vocabularyWords.length && (
               <p className="text-[10px] text-muted-foreground px-2 pt-1">
-                showing {filtered.length} of {vocabularyWords.length}
+                Showing {filtered.length} of {vocabularyWords.length}
               </p>
             )}
           </div>
@@ -1473,7 +1477,7 @@ function TranscriptionDictionary({
             const word = wordInput.value.trim();
             if (!word) return;
             if (vocabularyWords.length >= VOCAB_LIMIT) {
-              toast({ title: "limit reached", description: `maximum ${VOCAB_LIMIT} terms allowed` });
+              toast({ title: ui("Limit reached"), description: ui("Maximum {value1} terms allowed", { value1: VOCAB_LIMIT }) });
               return;
             }
             const replacement = replacementInput.value.trim() || undefined;
@@ -1487,7 +1491,7 @@ function TranscriptionDictionary({
               const toAdd = newTerms.slice(0, available);
               if (toAdd.length > 0) {
                 onChange([...vocabularyWords, ...toAdd.map((w) => ({ word: w }))]);
-                toast({ title: `added ${toAdd.length} terms` });
+                toast({ title: ui("Added {value1} terms", { value1: toAdd.length }) });
               }
               wordInput.value = "";
               replacementInput.value = "";
@@ -1499,10 +1503,10 @@ function TranscriptionDictionary({
             replacementInput.value = "";
           }}
         >
-          <Input name="vocab-word" placeholder="e.g. screenpipe" className="h-7 text-xs flex-1" spellCheck={false} autoCorrect="off" autoCapitalize="off" />
-          <Input name="vocab-replacement" placeholder="replacement (optional)" className="h-7 text-xs flex-1" spellCheck={false} autoCorrect="off" autoCapitalize="off" />
+          <Input name="vocab-word" placeholder={ui("E.g. screenpipe")} className="h-7 text-xs flex-1" spellCheck={false} autoCorrect="off" autoCapitalize="off" />
+          <Input name="vocab-replacement" placeholder={ui("Replacement (optional)")} className="h-7 text-xs flex-1" spellCheck={false} autoCorrect="off" autoCapitalize="off" />
           <Button type="submit" size="sm" variant="outline" className="h-7 text-xs px-2">
-            add
+            Add
           </Button>
         </form>
       </CardContent>
@@ -1544,6 +1548,9 @@ function HighFpsCard({
   settings: any;
   onSettingsChange: (patch: Record<string, any>) => void;
 }) {
+  const uiLanguage = useLocale();
+
+  const ui = useGT();
   const [live, setLive] = React.useState<HdState | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [lastError, setLastError] = React.useState<string | null>(null);
@@ -1615,15 +1622,15 @@ function HighFpsCard({
       const outcome = await pushSettings(runtimePatch);
       if (outcome.kind === "engine-down") {
         setLastError(
-          `${label} saved — but the engine isn't reachable, so it'll only take effect on next start.`,
+          ui("{setting} saved — but the engine isn't reachable, so it'll only take effect on next start.", { setting: label }),
         );
       } else if (outcome.kind === "engine-rejected") {
         setLastError(
-          `${label} saved — but the engine rejected the live update (HTTP ${outcome.status}). Restart to apply.`,
+          ui("{setting} saved — but the engine rejected the live update (HTTP {status}). Restart to apply.", { setting: label, status: outcome.status }),
         );
       }
     },
-    [onSettingsChange, pushSettings],
+    [onSettingsChange, pushSettings, uiLanguage],
   );
 
   // Guard against intervalMs ever leaking through as 0 (engine clamps to
@@ -1641,9 +1648,9 @@ function HighFpsCard({
 
   const statusBadge = active
     ? sessionKind === "meeting"
-      ? `Recording at ~${fps} fps — stops when call ends`
-      : `Recording at ~${fps} fps — ${fmtRemaining(remaining)} left`
-    : "Idle";
+      ? ui("Recording at ~{fps} fps — stops when call ends", { fps })
+      : ui("Recording at ~{fps} fps — {time} left", { fps, time: fmtRemaining(remaining) })
+    : ui("Idle");
 
   return (
     <Card className="border-border bg-card">
@@ -1690,9 +1697,9 @@ function HighFpsCard({
             <div className="flex flex-col gap-1">
               {(
                 [
-                  { v: "ask" as const, label: "Ask me", hint: "Adds an “open note + HD” action to the meeting-start notification — one click opens the note and starts HD (recommended)" },
-                  { v: "always" as const, label: "Always record at HD", hint: "Auto-start every detected meeting — more disk + CPU per call" },
-                  { v: "never" as const, label: "Never", hint: "No prompt; only the tray timer can start a session" },
+                  { v: "ask" as const, label: ui("Ask me"), hint: ui("Adds an “open note + HD” action to the meeting-start notification — one click opens the note and starts HD (recommended)") },
+                  { v: "always" as const, label: ui("Always record at HD"), hint: ui("Auto-start every detected meeting — more disk + CPU per call") },
+                  { v: "never" as const, label: ui("Never"), hint: ui("No prompt; only the tray timer can start a session") },
                 ] satisfies Array<{ v: HdDefaultMode; label: string; hint: string }>
               ).map(({ v, label, hint }) => (
                 <label key={v} className="flex items-start gap-2 cursor-pointer">
@@ -1705,7 +1712,7 @@ function HighFpsCard({
                       persistAndPush(
                         { hdRecordingDefault: v },
                         { defaultMode: v },
-                        "Meeting default",
+                        ui("Meeting default"),
                       )
                     }
                   />
@@ -1732,7 +1739,7 @@ function HighFpsCard({
                 persistAndPush(
                   { hdRecordingIntervalMs: ms },
                   { intervalMs: ms },
-                  "Capture interval",
+                  ui("Capture interval"),
                 );
               }}
             >
@@ -1756,13 +1763,17 @@ function HighFpsCard({
 type RecordingSettingsSection = "audio" | "screen";
 
 export function RecordingSettings({ section }: { section: RecordingSettingsSection }) {
+  const uiLanguage = useLocale();
+
+  const uiMessages = useMessages();
+  const ui = useGT();
   const { settings, updateSettings, getDataDir, loadUser } = useSettings();
   const [openLanguages, setOpenLanguages] = React.useState(false);
   // Dev-only: warn if searchIndex drifts from rendered headings. State-gated
   // fields are marked `conditional: true` in the index above, so no false
   // positives while they're hidden — no hardcoded allowlist here.
   const sectionRootRef = React.useRef<HTMLDivElement | null>(null);
-  const activeSearchIndex = section === "audio" ? audioSearchIndex : screenSearchIndex;
+  const activeSearchIndex = section === "audio" ? localizeDefinitions(audioSearchIndex, uiMessages) : localizeDefinitions(screenSearchIndex, uiMessages);
   useSettingsIndexDriftCheck(
     section === "audio" ? "Audio & meetings" : "Screen",
     activeSearchIndex,
@@ -1826,12 +1837,12 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
     } catch (e) {
       console.error("read_audio_exclusions failed", e);
       toast({
-        title: "Couldn't load audio exclusions",
+        title: ui("Couldn't load audio exclusions"),
         description: String(e),
         variant: "destructive",
       });
     }
-  }, [toast]);
+  }, [toast, uiLanguage]);
 
   useEffect(() => {
     if ((!isMacOS && !isWindows) || !processTapAvailable) return;
@@ -1878,12 +1889,12 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
       addAudioExclusion(meta);
     } catch (e) {
       toast({
-        title: "Couldn't read application",
+        title: ui("Couldn't read application"),
         description: String(e),
         variant: "destructive",
       });
     }
-  }, [addAudioExclusion, isWindows, toast]);
+  }, [addAudioExclusion, isWindows, toast, uiLanguage]);
 
   useEventListener(
     "keydown",
@@ -2023,7 +2034,7 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
   const debouncedValidateSettings = useMemo(
     () => debounce((newSettings: Partial<SettingsStore>) => {
       const errors: Record<string, string> = {};
-      
+
       // Validate numeric fields
       if (newSettings.port !== undefined) {
         const portValidation = validateField("port", newSettings.port);
@@ -2031,20 +2042,20 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
           errors.port = portValidation.error;
         }
       }
-      
+
       if (newSettings.dataDir !== undefined) {
         const dataDirValidation = validateField("dataDir", newSettings.dataDir);
         if (!dataDirValidation.isValid && dataDirValidation.error) {
           errors.dataDir = dataDirValidation.error;
         }
       }
-      
+
       if (newSettings.deepgramApiKey !== undefined && newSettings.deepgramApiKey.trim()) {
         if (newSettings.deepgramApiKey.length < 10) {
           errors.deepgramApiKey = "API key seems too short";
         }
       }
-      
+
       setValidationErrors(errors);
     }, 300),
     []
@@ -2060,19 +2071,19 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
     for (const [key, value] of Object.entries(newSettings)) {
       sanitizedSettings[key as keyof Settings] = sanitizeValue(key as keyof SettingsStore, value);
     }
-    
+
     // Update pending changes
     setPendingChanges(prev => ({ ...prev, ...sanitizedSettings }));
-    
+
     // Validate new settings
     debouncedValidateSettings({ ...settings, ...sanitizedSettings });
-    
+
     // Persist settings in order. Apply waits for this queue before restarting
     // capture so the engine cannot read the previous value from disk.
     enqueueSettingsWrite(settingsWriteQueueRef.current, () =>
       updateSettings(sanitizedSettings)
     );
-    
+
     if (restart) {
       setHasUnsavedChanges(true);
     }
@@ -2082,15 +2093,6 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
   const aecMode = normalizeAecModeForPlatform(
     settings.aecMode ?? "off",
     currentPlatform,
-  );
-  const remoteControlPreferences = normalizeDesktopRemotePreferences(settings);
-  const semanticContextRemotePolicy = getRemoteBooleanPolicy(
-    settings,
-    "semanticContext",
-  );
-  const smartRecordingRemotePolicy = getRemoteBooleanPolicy(
-    settings,
-    "smartRecording",
   );
   const aecModeRemotePolicy = getRemoteAecModePolicy(settings);
   const screenContextEnabled = !settings.disableVision;
@@ -2201,9 +2203,9 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
   // Listen for data-dir-fallback event (custom dir unavailable, fell back to default)
   useTauriEvent("data-dir-fallback", () => {
     toast({
-      title: "custom data directory unavailable",
+      title: ui("Custom data directory unavailable"),
       description:
-        "the configured data directory could not be accessed. recordings are using the default directory (~/.screenpipe).",
+        ui("The configured data directory could not be accessed. Recordings are using the default directory (~/.screenpipe)."),
       variant: "destructive",
       duration: 10000,
     });
@@ -2329,8 +2331,8 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
     // Check for validation errors
     if (Object.keys(validationErrors).length > 0) {
       toast({
-        title: "Validation errors",
-        description: "Please fix all validation errors before applying changes",
+        title: ui("Validation errors"),
+        description: ui("Please fix all validation errors before applying changes"),
         variant: "destructive",
       });
       return;
@@ -2338,10 +2340,10 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
 
     setIsUpdating(true);
     setHasUnsavedChanges(false);
-    
+
     toast({
-      title: "Updating recording settings",
-      description: "This may take a few moments...",
+      title: ui("Updating recording settings"),
+      description: ui("This may take a few moments..."),
     });
 
     try {
@@ -2390,16 +2392,16 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
       setPendingChanges({});
 
       toast({
-        title: "Settings updated successfully",
+        title: ui("Settings updated successfully"),
         description: needsServerRestart
-          ? "Screenpipe server restarted with new settings"
-          : "Recording restarted with new settings",
+          ? ui("Screenpipe server restarted with new settings")
+          : ui("Recording restarted with new settings"),
       });
     } catch (error) {
       console.error("Failed to update settings:", error);
       toast({
-        title: "Error updating settings",
-        description: "Please try again or check the logs for more information",
+        title: ui("Error updating settings"),
+        description: ui("Please try again or check the logs for more information"),
         variant: "destructive",
       });
       setHasUnsavedChanges(true);
@@ -2527,8 +2529,8 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
       await handleAudioTranscriptionModelChange("openai-compatible", false, true);
       setIsOpenAICompatibleSetupOpen(false);
       toast({
-        title: "OpenAI Compatible enabled",
-        description: "The endpoint accepted a real transcription request.",
+        title: ui("OpenAI Compatible enabled"),
+        description: ui("The endpoint accepted a real transcription request."),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2685,39 +2687,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
     }
   };
 
-  const handleIgnoredUrlsChange = (values: string[]) => {
-    const currentUrls = settings.ignoredUrls || [];
-    const lowerCaseValues = values.map((v) => v.toLowerCase());
-    const currentLowerCase = currentUrls.map((v) => v.toLowerCase());
-
-    // Find added values
-    const addedValues = values.filter(
-      (v) => !currentLowerCase.includes(v.toLowerCase())
-    );
-    // Find removed values
-    const removedValues = currentUrls.filter(
-      (v) => !lowerCaseValues.includes(v.toLowerCase())
-    );
-
-    if (addedValues.length > 0) {
-      const newValue = addedValues[0];
-      handleSettingsChange(
-        {
-          ignoredUrls: [...currentUrls, newValue],
-        },
-        true
-      );
-    } else if (removedValues.length > 0) {
-      const removedValue = removedValues[0];
-      handleSettingsChange(
-        {
-          ignoredUrls: currentUrls.filter((u) => u !== removedValue),
-        },
-        true
-      );
-    }
-  };
-
   // Toggle one app in/out of the meeting-detection ignore list (used by the
   // MeetingAppsPicker rows and chips). Case-insensitive; stores the trimmed
   // label the user picked.
@@ -2741,8 +2710,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
     >
       <p className="text-muted-foreground text-sm mb-4">
         {section === "audio"
-          ? "Audio capture, transcription, and meeting notes"
-          : "Screen capture quality, monitors, and power"}
+          ? ui("Audio capture, transcription, and meeting notes")
+          : ui("Screen capture quality, monitors, and power")}
       </p>
 
       <div className="flex items-center justify-end">
@@ -2768,7 +2737,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       <>
       {/* Audio */}
       <div className="space-y-2 pt-2">
-        <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Audio &amp; meetings</h2>
+        <h2 className="text-xs font-semibold text-muted-foreground normal-case tracking-wider px-1">Audio &amp; meetings</h2>
 
         <LockedSetting settingKey="audio_recording">
         <div className="space-y-2">
@@ -2780,11 +2749,14 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
                   <h3 className="text-sm font-medium text-foreground">Audio Recording</h3>
-                  <p className="text-xs text-muted-foreground">Capture audio from microphone and system</p>
+                  <p className="text-xs text-muted-foreground">Record microphone and system audio. Turning this off keeps existing recordings and meeting history.</p>
                 </div>
               </div>
-              <ManagedSwitch settingKey="disableAudio" id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
+              <ManagedSwitch aria-label={ui("Audio Recording")} settingKey="disableAudio" id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
             </div>
+            <p className="ml-[26px] mt-2 text-xs text-muted-foreground">
+              Right-click Meetings to hide it. Restore it from Sidebar options. This does not change audio recording.
+            </p>
           </CardContent>
         </Card>
 
@@ -2797,7 +2769,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
                 <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                   Capture audio
-                  <HelpTooltip text="“During meetings only” records and transcribes audio just while a meeting is detected — saving battery, disk, and cloud transcription cost. “Always” captures continuously, 24/7. Requires meeting detection to be on." />
+                  <HelpTooltip text={ui("“During meetings only” records and transcribes audio just while a meeting is detected — saving battery, disk, and cloud transcription cost. “Always” captures continuously, 24/7. Requires meeting detection to be on.")} />
                 </h3>
               </div>
               <Select
@@ -2805,7 +2777,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 onValueChange={(value) => handleSettingsChange({ audioCaptureMode: value as "always" | "meetings-only" | "disabled" }, true)}
               >
                 <SelectTrigger className="w-[200px] h-7 text-xs">
-                  <SelectValue placeholder="Select mode" />
+                  <SelectValue placeholder={ui("Select mode")} />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="always">Always (continuous)</SelectItem>
@@ -2820,7 +2792,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
         {!settings.disableAudio && (
           <div className="flex items-center gap-2 px-1 pt-1.5">
-            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">transcription</span>
+            <span className="text-[11px] font-medium normal-case tracking-wider text-muted-foreground/70">Transcription</span>
             <div className="h-px flex-1 bg-border/60" />
           </div>
         )}
@@ -2834,7 +2806,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
                 <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                   Transcription engine
-                  <HelpTooltip text="Cloud engines send audio to a server for fast, accurate transcription. Offline engines run on your device — fully private but use more CPU/RAM." />
+                  <HelpTooltip text={ui("Cloud engines send audio to a server for fast, accurate transcription. Offline engines run on your device — fully private but use more CPU/RAM.")} />
                 </h3>
               </div>
               <div className="flex items-center gap-2">
@@ -2846,27 +2818,27 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   onValueChange={(value) => handleAudioTranscriptionModelChange(value)}
                 >
                   <SelectTrigger className="w-[200px] h-7 text-xs">
-                    <SelectValue placeholder="Select engine" />
+                    <SelectValue placeholder={ui("Select engine")} />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
-                      <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">cloud</SelectLabel>
+                      <SelectLabel className="text-[10px] text-muted-foreground/70 normal-case tracking-wider">Cloud</SelectLabel>
                       <SelectItem value="screenpipe-cloud">
                         Screenpipe Cloud{hwCapability?.recommendedEngine === "screenpipe-cloud" && " ★"}
                       </SelectItem>
                       <SelectItem value="deepgram">Deepgram</SelectItem>
                     </SelectGroup>
                     <SelectGroup>
-                      <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">offline</SelectLabel>
+                      <SelectLabel className="text-[10px] text-muted-foreground/70 normal-case tracking-wider">Offline</SelectLabel>
                       <SelectItem value="whisper-large-v3-turbo">Whisper Turbo</SelectItem>
                       <SelectItem value="whisper-large-v3-turbo-quantized">Whisper Turbo (fast)</SelectItem>
                       <SelectItem value="whisper-tiny">Whisper Tiny</SelectItem>
                       <SelectItem value="whisper-tiny-quantized">Whisper Tiny (fast)</SelectItem>
                       {!isMacOS && <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>}
-                      <SelectItem value="parakeet">Parakeet{isMacOS ? " (experimental)" : ""}</SelectItem>
+                      <SelectItem value="parakeet">Parakeet{isMacOS ? ui(" (experimental)") : ""}</SelectItem>
                     </SelectGroup>
                     <SelectGroup>
-                      <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">other</SelectLabel>
+                      <SelectLabel className="text-[10px] text-muted-foreground/70 normal-case tracking-wider">Other</SelectLabel>
                       <SelectItem value="openai-compatible">OpenAI Compatible</SelectItem>
                       <SelectItem value="disabled">Disabled (capture only)</SelectItem>
                     </SelectGroup>
@@ -2940,7 +2912,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   value={settings.deepgramApiKey || ""}
                   onChange={handleDeepgramApiKeyChange}
                   validation={validateDeepgramApiKey}
-                  placeholder="Deepgram API key"
+                  placeholder={ui("Deepgram API key")}
                   required={true}
                   className="pr-8 h-7 text-xs"
                 />
@@ -2972,10 +2944,10 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                       fetchOpenAIModels(openAICompatibleDraft.endpoint, openAICompatibleDraft.apiKey);
                     }
                   }}
-                  placeholder="API Endpoint (e.g., http://127.0.0.1:8080)"
+                  placeholder={ui("API Endpoint (e.g., http://127.0.0.1:8080)")}
                   className="h-7 text-xs"
                 />
-                
+
                 {/* API Key Input */}
                 <div className="relative">
                   <ValidatedInput
@@ -2984,21 +2956,21 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     type={showOpenAIApiKey ? "text" : "password"}
                     value={openAICompatibleDraft.apiKey}
                     onChange={(value: string) => updateOpenAICompatibleDraft({ apiKey: value })}
-                    placeholder="API Key (optional)"
+                    placeholder={ui("API Key (optional)")}
                     className="pr-8 h-7 text-xs"
                   />
                   <Button type="button" variant="ghost" size="icon" className="absolute right-0 top-0 h-7 w-7" onClick={() => setShowOpenAIApiKey(!showOpenAIApiKey)}>
                     {showOpenAIApiKey ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
                   </Button>
                 </div>
-                
+
                 {/* Model Input — editable with dropdown suggestions */}
                 <div className="space-y-1.5">
                   <div className="relative">
                     <Input
                       value={openAICompatibleDraft.model}
                       onChange={(e) => updateOpenAICompatibleDraft({ model: e.target.value })}
-                      placeholder={isLoadingModels ? "Loading models..." : "Model name (e.g., whisper-large-v3-turbo)"}
+                      placeholder={isLoadingModels ? ui("Loading models...") : ui("Model name (e.g., whisper-large-v3-turbo)")}
                       className="h-7 text-xs pr-8"
                     />
                     {isLoadingModels && (
@@ -3017,7 +2989,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                             className="text-xs text-muted-foreground hover:text-foreground transition-colors"
                             onClick={() => setFilterTranscriptionModels(!filterTranscriptionModels)}
                           >
-                            {filterTranscriptionModels ? "show all" : "filter STT only"}
+                            {filterTranscriptionModels ? ui("Show all") : ui("Filter STT only")}
                           </button>
                         )}
                       </div>
@@ -3056,12 +3028,12 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     onChange={(e) => updateOpenAICompatibleDraft({ rawAudio: e.target.checked })}
                     className="rounded border-border"
                   />
-                  <span>send raw WAV audio (instead of MP3)</span>
+                  <span>Send raw WAV audio (instead of MP3)</span>
                 </label>
 
                 {/* Custom Headers */}
                 <div className="space-y-1">
-                  <label className="text-xs text-muted-foreground">custom headers (JSON)</label>
+                  <label className="text-xs text-muted-foreground">Custom headers (JSON)</label>
                   <Input
                     defaultValue={openAICompatibleDraft.headers ? JSON.stringify(openAICompatibleDraft.headers) : ""}
                     onBlur={(e) => {
@@ -3079,7 +3051,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                         // Invalid JSON — don't save
                       }
                     }}
-                    placeholder='{"X-Custom-Header": "value"}'
+                    placeholder={"{\"X-Custom-Header\": \"value\"}"}
                     className="h-7 text-xs font-mono"
                   />
                 </div>
@@ -3097,7 +3069,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     ) : (
                       <Zap className="mr-1.5 h-3 w-3" />
                     )}
-                    {isTestingOpenAICompatible ? "Testing endpoint..." : "Test and enable"}
+                    {isTestingOpenAICompatible ? ui("Testing endpoint...") : ui("Test and enable")}
                   </Button>
                   <span className="text-xs text-muted-foreground">
                     Sends a short silent sample using the configured model and audio format.
@@ -3107,6 +3079,37 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <p className="text-xs text-destructive" role="alert">
                     {openAICompatibleTestError}
                   </p>
+                )}
+
+                {settings.audioTranscriptionEngine === "openai-compatible" && (
+                  <div className="space-y-1">
+                    <label htmlFor="batchMaxDurationSecs" className="text-xs text-muted-foreground">
+                      Max batch duration (seconds)
+                    </label>
+                    <Input
+                      id="batchMaxDurationSecs"
+                      type="number"
+                      min={0}
+                      step={1}
+                      key={settings.batchMaxDurationSecs ?? 0}
+                      defaultValue={settings.batchMaxDurationSecs || ""}
+                      placeholder={ui("Auto")}
+                      onBlur={(e) => {
+                        const seconds = Number(e.target.value);
+                        if (!e.target.validity.valid || !Number.isSafeInteger(seconds) || seconds < 0) {
+                          e.target.value = String(settings.batchMaxDurationSecs || "");
+                          return;
+                        }
+                        if (seconds !== (settings.batchMaxDurationSecs ?? 0)) {
+                          handleSettingsChange({ batchMaxDurationSecs: seconds }, true);
+                        }
+                      }}
+                      className="h-7 text-xs"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Applies to background batches and meeting retranscription. Lower this if your server or gateway times out. Leave blank or set 0 for automatic sizing.
+                    </p>
+                  </div>
                 )}
 
                 {/* Connection Test Panel */}
@@ -3122,15 +3125,15 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                       {txTestStatus === "done" && (
                         <span className="text-xs text-muted-foreground">
                           {txTestResults.transcribe.status === "pass"
-                            ? "All checks passed"
+                            ? ui("All checks passed")
                             : txTestResults.endpoint.status === "fail"
-                            ? "Connection failed"
+                            ? ui("Connection failed")
                             : txTestResults.auth.status === "fail"
-                            ? "Auth failed"
+                            ? ui("Auth failed")
                             : txTestResults.models.status === "fail"
-                            ? "Models failed"
+                            ? ui("Models failed")
                             : txTestResults.transcribe.status === "fail"
-                            ? "Transcription failed"
+                            ? ui("Transcription failed")
                             : ""}
                         </span>
                       )}
@@ -3161,7 +3164,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                         ) : (
                           <Zap className="h-3 w-3" />
                         )}
-                        {txTestStatus === "testing" ? "Testing..." : "Run diagnostics"}
+                        {txTestStatus === "testing" ? ui("Testing...") : ui("Run diagnostics")}
                       </Button>
 
                       <div className="space-y-1.5 text-xs">
@@ -3236,7 +3239,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     </PopoverTrigger>
                     <PopoverContent className="w-[250px] p-0">
                       <Command>
-                        <CommandInput placeholder="Search languages..." />
+                        <CommandInput placeholder={ui("Search languages...")} />
                         <CommandList>
                           <CommandEmpty>No languages found.</CommandEmpty>
                           <CommandGroup>
@@ -3266,7 +3269,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     <Mic className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                     <span className="text-xs text-muted-foreground flex items-center gap-1">
                       Reduce echo in calls
-                      <HelpTooltip text="Reduces speaker audio leaking into microphone transcripts during calls. Auto-selects the best engine for your platform." />
+                      <HelpTooltip text={ui("Reduces speaker audio leaking into microphone transcripts during calls. Auto-selects the best engine for your platform.")} />
                     </span>
                   </div>
                   <Switch
@@ -3305,7 +3308,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 </h3>
                 <p className="text-xs text-muted-foreground">
                   Audio from these apps will be filtered out of system-audio capture.
-                  {isWindows && " Windows supports one excluded app at a time."}
+                  {isWindows && ui(" Windows supports one excluded app at a time.")}
                 </p>
               </div>
             </div>
@@ -3344,7 +3347,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <button
                     type="button"
                     className="inline-flex rounded-sm focus:outline-none focus:ring-1 focus:ring-ring"
-                    aria-label={`Remove ${app.name ?? app.bundleId} from audio exclusions`}
+                    aria-label={ui("Remove {value1} from audio exclusions", { value1: app.name ?? app.bundleId })}
                     onClick={(e) => {
                       e.stopPropagation();
                       removeAudioExclusion(app.bundleId);
@@ -3377,7 +3380,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
         {!settings.disableAudio && (
           <div className="flex items-center gap-2 px-1 pt-1.5">
-            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">meetings</span>
+            <span className="text-[11px] font-medium normal-case tracking-wider text-muted-foreground/70">Meetings</span>
             <div className="h-px flex-1 bg-border/60" />
           </div>
         )}
@@ -3392,7 +3395,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div className="min-w-0">
                   <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                     Live meeting notes
-                    <HelpTooltip text="Streams only the active meeting into the live note. This is separate from background 24/7 recording and can use your selected transcription engine, screenpipe cloud, or a direct provider." />
+                    <HelpTooltip text={ui("Streams only the active meeting into the live note. This is separate from background 24/7 recording and can use your selected transcription engine, screenpipe cloud, or a direct provider.")} />
                   </h3>
                   <p className="text-xs text-muted-foreground">Meeting-only live captions, separate from background transcription</p>
                 </div>
@@ -3412,7 +3415,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="selected-engine">Current transcription engine</SelectItem>
-                      <SelectItem value="screenpipe-cloud">screenpipe cloud live</SelectItem>
+                      <SelectItem value="screenpipe-cloud">Screenpipe cloud live</SelectItem>
                       <SelectItem value="deepgram-live">Direct Deepgram live</SelectItem>
                     </SelectContent>
                   </Select>
@@ -3450,7 +3453,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             <div className="mt-2 pt-2 border-t border-border/50 flex items-center justify-between">
               <span className="text-xs text-muted-foreground flex items-center gap-1.5">
                 Append typed text + edited files to note
-                <HelpTooltip text="When the meeting stops, screenpipe appends what you typed (and the files you edited) during the meeting to the meeting note. Turn off to keep notes clean." />
+                <HelpTooltip text={ui("When the meeting stops, screenpipe appends what you typed (and the files you edited) during the meeting to the meeting note. Turn off to keep notes clean.")} />
               </span>
               <Switch
                 id="appendTypedTextToMeetingNote"
@@ -3474,7 +3477,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div>
                   <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                     Automatic meeting detection
-                    <HelpTooltip text="Detects meeting apps (Zoom, Teams, Meet, Discord calls, etc.) to start and stop meetings and live notes automatically. Turn off if it starts meetings when it shouldn't, and start them yourself instead." />
+                    <HelpTooltip text={ui("Detects meeting apps (Zoom, Teams, Meet, Discord calls, etc.) to start and stop meetings and live notes automatically. Turn off if it starts meetings when it shouldn't, and start them yourself instead.")} />
                   </h3>
                   <p className="text-xs text-muted-foreground">Auto-start meetings when a call app is detected</p>
                 </div>
@@ -3486,11 +3489,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     size="sm"
                     className="h-7 text-[11px] gap-1.5"
                     onClick={() => setMeetingAppsPickerOpen(true)}
-                    title="Choose apps that should never auto-start a meeting"
+                    title={ui("Choose apps that should never auto-start a meeting")}
                     data-testid="settings-ignore-meeting-apps-button"
                   >
                     <UserX className="h-3.5 w-3.5" />
-                    ignore apps
+                    Ignore apps
                     {(settings.ignoredMeetingApps?.length ?? 0) > 0 && (
                       <span
                         className="rounded bg-muted px-1.5 py-0.5 text-[10px] tabular-nums"
@@ -3511,7 +3514,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             </div>
             {settings.disableMeetingDetector && (
               <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
-                disabling this also stops live meeting notes, smart recording, and &quot;during meetings only&quot; capture mode.
+                Disabling this also stops live meeting notes, smart recording, and &quot;during meetings only&quot; capture mode.
               </p>
             )}
           </CardContent>
@@ -3525,67 +3528,9 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           onToggle={handleToggleIgnoredMeetingApp}
         />
 
-        {/* Smart recording — in the meetings section where it belongs */}
-        {!settings.disableAudio && (isMacOS || isWindows) && processTapAvailable && (
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    Smart recording
-                    <Badge variant="secondary" aria-label="beta" className="px-1.5 py-0 text-[10px] font-medium uppercase tracking-wide">
-                      beta
-                    </Badge>
-                  </h3>
-                  <p className="text-xs text-muted-foreground">
-                    during meetings, records your meeting&apos;s audio and whichever microphone you pick in the meeting app — taking precedence over your other audio settings. falls back to your configured capture automatically if unavailable.
-                  </p>
-                  {settings.disableMeetingDetector && (
-                    <p className="text-xs text-amber-600 dark:text-amber-500">
-                      requires automatic meeting detection — turn it back on above to use this.
-                    </p>
-                  )}
-                </div>
-              </div>
-              <Switch
-                id="experimentalMeetingPiggyback"
-                checked={Boolean(settings.experimentalMeetingPiggyback ?? false)}
-                disabled={
-                  Boolean(settings.disableMeetingDetector) ||
-                  smartRecordingRemotePolicy.forceDisabled
-                }
-                onCheckedChange={(checked) =>
-                  handleSettingsChange(
-                    {
-                      remoteControlPreferences: {
-                        ...remoteControlPreferences,
-                        smartRecording: checked,
-                      },
-                      experimentalMeetingPiggyback: resolveBooleanRemoteValue(
-                        checked,
-                        smartRecordingRemotePolicy,
-                      ),
-                    },
-                    true,
-                  )
-                }
-              />
-            </div>
-            {smartRecordingRemotePolicy.forceDisabled && (
-              <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
-                Temporarily disabled by the remote safety control. Your
-                preference is preserved.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-        )}
-
         {!settings.disableAudio && (
           <div className="flex items-center gap-2 px-1 pt-1.5">
-            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">devices & capture</span>
+            <span className="text-[11px] font-medium normal-case tracking-wider text-muted-foreground/70">Devices & capture</span>
             <div className="h-px flex-1 bg-border/60" />
           </div>
         )}
@@ -3599,7 +3544,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
                   <h3 className="text-sm font-medium text-foreground">Auto-select audio devices</h3>
-                  <p className="text-xs text-muted-foreground">Records all default devices. Turn off to exclude bluetooth headphones or pick specific devices.</p>
+                  <p className="text-xs text-muted-foreground">Follows your system defaults. Bluetooth headset microphones are used during meetings unless you enable continuous recording.</p>
                 </div>
               </div>
               <Switch
@@ -3623,10 +3568,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             const displayName = getAudioDeviceDisplayName(device.name);
             // Use per-device level if available, fall back to global speechRatio
             const deviceLevel = overlayData.deviceLevels[device.name] ?? overlayData.speechRatio;
-            // Backend-computed: exactly mirrors AudioManager::start_device's
-            // real gate (Bluetooth input + combo headset), so this hint
-            // never mismatches actual recording behavior.
-            const isBluetoothMicGated = device.isComboBluetoothMic && !settings.alwaysRecordBluetoothMic;
+            // Explicit selection permits continuous Bluetooth mic capture.
+            const isBluetoothMic = device.isComboBluetoothMic;
             return (
               <div
                 key={device.name}
@@ -3645,13 +3588,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     {device.isDefault && (
                       <Badge variant="secondary" className="text-[9px] h-3.5 px-1 shrink-0">Default</Badge>
                     )}
-                    {isBluetoothMicGated && (
+                    {isBluetoothMic && (
                       <Badge
                         variant="outline"
                         className="text-[9px] h-3.5 px-1 shrink-0"
-                        title="only recorded during a detected meeting — turn on &quot;always record bluetooth mic&quot; to change this"
+                        title={ui("Selecting this microphone allows continuous recording and may reduce Bluetooth headphone audio quality.")}
                       >
-                        meetings only
+                        Bluetooth
                       </Badge>
                     )}
                   </div>
@@ -3713,7 +3656,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div>
                   <h3 className="text-sm font-medium text-foreground">Always record bluetooth mic</h3>
                   <p className="text-xs text-muted-foreground">
-                    by default bluetooth mics are only recorded during meetings to avoid degrading headphone audio quality. turn on to record always.
+                    By default bluetooth mics are only recorded during meetings to avoid degrading headphone audio quality. Turn on to record always.
                   </p>
                 </div>
               </div>
@@ -3729,7 +3672,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
         {!settings.disableAudio && (
           <div className="flex items-center gap-2 px-1 pt-1.5">
-            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">voice & vocabulary</span>
+            <span className="text-[11px] font-medium normal-case tracking-wider text-muted-foreground/70">Voice & vocabulary</span>
             <div className="h-px flex-1 bg-border/60" />
           </div>
         )}
@@ -3743,13 +3686,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <User className="h-4 w-4 text-muted-foreground shrink-0" />
                 <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                   Your name
-                  <HelpTooltip text="Your name in transcripts. Click 'train' and speak for 30 seconds to teach screenpipe your voice — it will recognize you across all devices using voice matching." />
+                  <HelpTooltip text={ui("Your name in transcripts. Click 'train' and speak for 30 seconds to teach screenpipe your voice — it will recognize you across all devices using voice matching.")} />
                 </h3>
               </div>
               <div className="flex items-center gap-1.5">
                 <div className="relative">
                   <Input
-                    placeholder="e.g. Louis"
+                    placeholder={ui("E.g. Louis")}
                     value={settings.userName || ""}
                     onChange={(e) => handleSettingsChange({ userName: e.target.value }, false)}
                     onFocus={() => setSpeakerInputFocused(true)}
@@ -3782,7 +3725,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   onClick={handleStartTraining}
                   disabled={voiceTraining.active || !settings.userName?.trim()}
                 >
-                  train
+                  Train
                 </Button>
               </div>
             </div>
@@ -3809,7 +3752,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       {/* Screen */}
       <LockedSetting settingKey="screen_recording">
       <div className="space-y-2 pt-2">
-        <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Screen</h2>
+        <h2 className="text-xs font-semibold text-muted-foreground normal-case tracking-wider px-1">Screen</h2>
 
         {/* Screen context capture toggle */}
         <Card className="border-border bg-card">
@@ -3830,112 +3773,25 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         {!settings.disableVision && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
-              <div className="space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center space-x-2.5 min-w-0">
-                    <AppWindowMac className="h-4 w-4 text-muted-foreground shrink-0" />
-                    <div className="min-w-0">
-                      <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                        Structured app context
-                        <Badge variant="secondary" aria-label="Experimental" className="px-1.5 py-0 text-[10px] font-medium">
-                          Experimental
-                        </Badge>
-                      </h3>
-                      <p className="text-xs text-muted-foreground">
-                        Turn what Screenpipe already captures into a clearer view for AI. Nothing is recorded twice.
-                      </p>
-                    </div>
-                  </div>
-                  {semanticContextRemotePolicy.forceDisabled ? (
-                    <Switch id="enableSemanticContext" checked={false} disabled />
-                  ) : (
-                    <ManagedSwitch
-                      settingKey="enableSemanticContext"
-                      id="enableSemanticContext"
-                      checked={Boolean(settings.enableSemanticContext ?? false)}
-                      onCheckedChange={(checked) =>
-                        handleSettingsChange(
-                          {
-                            remoteControlPreferences: {
-                              ...remoteControlPreferences,
-                              semanticContext: checked,
-                            },
-                            enableSemanticContext: resolveBooleanRemoteValue(
-                              checked,
-                              semanticContextRemotePolicy,
-                            ),
-                          },
-                          true,
-                        )
-                      }
-                    />
-                  )}
-                </div>
-
-                {semanticContextRemotePolicy.forceDisabled && (
-                  <p className="border-t border-border pt-3 text-xs text-muted-foreground">
-                    Temporarily disabled by the remote safety control. Your
-                    preference is preserved.
-                  </p>
-                )}
-
-                {settings.enableSemanticContext &&
-                  !semanticContextRemotePolicy.forceDisabled && (
-                  <LockedSetting settingKey="semanticContextMode">
-                    <div className="flex flex-col gap-3 border-t border-border pt-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-                      <div className="min-w-0">
-                        <label htmlFor="semanticContextMode" className="text-xs font-medium text-foreground">
-                          Use it for
-                        </label>
-                        <p className="text-xs text-muted-foreground mt-0.5">
-                          {
-                            SEMANTIC_CONTEXT_MODE_COPY[
-                              (settings.semanticContextMode ?? "memory") as SemanticContextMode
-                            ].description
-                          }
-                        </p>
-                      </div>
-                      <Select
-                        value={settings.semanticContextMode ?? "memory"}
-                        onValueChange={(value: SemanticContextMode) =>
-                          handleSettingsChange({ semanticContextMode: value }, true)
-                        }
-                      >
-                        <SelectTrigger id="semanticContextMode" className="h-8 w-full shrink-0 text-xs sm:w-[220px]">
-                          <SelectValue className="min-w-0 flex-1 truncate text-left" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="memory">{SEMANTIC_CONTEXT_MODE_COPY.memory.label}</SelectItem>
-                          <SelectItem value="computerUse">{SEMANTIC_CONTEXT_MODE_COPY.computerUse.label}</SelectItem>
-                          <SelectItem value="both">{SEMANTIC_CONTEXT_MODE_COPY.both.label}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </LockedSetting>
-                  )}
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
-        {!settings.disableVision && (
-          <Card className="border-border bg-card">
-            <CardContent className="px-3 py-2.5">
               <div className="flex items-center justify-between">
                 <div className="flex items-center space-x-2.5">
                   <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
-                    <h3 className="text-sm font-medium text-foreground">Screen recording</h3>
-                    <p className="text-xs text-muted-foreground">Record screen pixels for the timeline and image-only text. Turn this off to stop screen recording; accessibility text stays searchable.</p>
+                    <h3 className="text-sm font-medium text-foreground">Screenshots</h3>
+                    <p className="text-xs text-muted-foreground">Record screen images for the timeline and image-only text. Turning this off keeps existing history and searchable app text.</p>
                   </div>
                 </div>
                 <ManagedSwitch
+                  aria-label={ui("Screenshots")}
                   settingKey="disableScreenshots"
                   id="disableScreenshots"
                   checked={!(settings.disableScreenshots ?? false)}
                   onCheckedChange={(checked) => handleSettingsChange({ disableScreenshots: !checked }, true)}
                 />
               </div>
+              <p className="ml-[26px] mt-2 text-xs text-muted-foreground">
+                Right-click Timeline to hide it. Restore it from Sidebar options. This does not change screenshot capture.
+              </p>
             </CardContent>
           </Card>
         )}
@@ -4018,7 +3874,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                       </svg>
                       <div className="text-center">
                         <span className={cn("text-[11px] font-medium block", isSelected ? "text-foreground" : "text-muted-foreground")}>
-                          {monitor.name || `Monitor ${monitor.id}`}
+                          {monitor.name || ui("Monitor {value1}", { value1: monitor.id })}
                         </span>
                         <p className="text-[10px] text-muted-foreground">{monitor.width}x{monitor.height}</p>
                       </div>
@@ -4028,6 +3884,15 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               </div>
             </CardContent>
           </Card>
+        )}
+
+        {!settings.disableVision && (
+          <LockedSetting settingKey="recordingDetail">
+            <RecordingDetailCard
+              value={settings.recordingDetail ?? "auto"}
+              onChange={(recordingDetail) => handleSettingsChange({ recordingDetail }, true)}
+            />
+          </LockedSetting>
         )}
 
         {/* Recording quality — single knob for crispness + disk cost */}
@@ -4052,10 +3917,10 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="low">low — 1280px, smallest</SelectItem>
-                    <SelectItem value="balanced">balanced — 1920px (default)</SelectItem>
-                    <SelectItem value="high">high — 3840px, ultrawide-safe</SelectItem>
-                    <SelectItem value="max">max — native, no downscale</SelectItem>
+                    <SelectItem value="low">Low — 1280px, smallest</SelectItem>
+                    <SelectItem value="balanced">Balanced — 1920px (default)</SelectItem>
+                    <SelectItem value="high">High — 3840px, ultrawide-safe</SelectItem>
+                    <SelectItem value="max">Max — native, no downscale</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -4090,7 +3955,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-xs text-muted-foreground">Minimum interval</span>
                   <span className="text-xs font-mono text-foreground">
-                    {seconds === 0 ? "auto (power profile)" : `every ${seconds}s`}
+                    {seconds === 0 ? ui("Auto (power profile)") : ui("Every {value1}s", { value1: seconds })}
                   </span>
                 </div>
                 <Slider
@@ -4111,8 +3976,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   className="w-full"
                 />
                 <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
-                  <span>auto</span>
-                  <span>every 10s</span>
+                  <span>Auto</span>
+                  <span>Every 10s</span>
                 </div>
                 <CaptureFrequencyPreview seconds={seconds} />
               </CardContent>
@@ -4138,7 +4003,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
       {/* System */}
       <div className="space-y-2 pt-2">
-        <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">System</h2>
+        <h2 className="text-xs font-semibold text-muted-foreground normal-case tracking-wider px-1">System</h2>
 
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
@@ -4185,7 +4050,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         <DialogContent className="max-w-lg">
           <DialogTitle className="text-sm font-medium">Read this aloud</DialogTitle>
           <DialogDescription className="text-xs text-muted-foreground">
-            speak naturally at your normal pace — this helps screenpipe learn your voice
+            Speak naturally at your normal pace — this helps screenpipe learn your voice
           </DialogDescription>
           <div className="space-y-4">
 
@@ -4197,7 +4062,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>{voiceTraining.secondsLeft > 0 ? `${voiceTraining.secondsLeft}s remaining` : "done — click finish"}</span>
+                <span>{voiceTraining.secondsLeft > 0 ? ui("{value1}s remaining", { value1: voiceTraining.secondsLeft }) : ui("Done — click finish")}</span>
                 <span>{Math.round(((30 - voiceTraining.secondsLeft) / 30) * 100)}%</span>
               </div>
               <Progress value={((30 - voiceTraining.secondsLeft) / 30) * 100} className="h-1.5" />
@@ -4209,7 +4074,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 onClick={handleFinishTraining}
                 disabled={voiceTraining.secondsLeft > 25}
               >
-                {voiceTraining.secondsLeft > 25 ? "keep reading..." : voiceTraining.secondsLeft > 0 ? "finish early" : "done"}
+                {voiceTraining.secondsLeft > 25 ? ui("Keep reading...") : voiceTraining.secondsLeft > 0 ? ui("Finish early") : ui("Done")}
               </Button>
             </div>
           </div>

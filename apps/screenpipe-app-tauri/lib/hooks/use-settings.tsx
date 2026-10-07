@@ -5,6 +5,7 @@
 import { homeDir } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
 import { commands } from "@/lib/utils/tauri";
+import { saveWithPresetReassignment } from "@/lib/ai-preset-deletion";
 import { platform } from "@tauri-apps/plugin-os";
 import { Store } from "@tauri-apps/plugin-store";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -37,7 +38,10 @@ import {
 	applyManagedOverrides,
 	type ManagedSettingValue,
 } from "./managed-settings";
-import { isResolvedConsumerBuild } from "./use-is-enterprise-build";
+import {
+	isResolvedConsumerBuild,
+	resolveEnterpriseBuild,
+} from "./use-is-enterprise-build";
 import {
 	clearLegacyUserGoalCategory,
 	DEFAULT_USER_GOAL_CATEGORY,
@@ -47,6 +51,7 @@ import {
 } from "@/lib/live-views/onboarding-activation";
 import {
 	cloneLocalDesktopRemotePolicy,
+	LOCAL_DESKTOP_REMOTE_POLICY,
 	NEW_INSTALL_REMOTE_CONTROL_PREFERENCES,
 	normalizeDesktopRemotePolicySnapshot,
 	normalizeDesktopRemotePreferences,
@@ -78,6 +83,14 @@ export type AcpAgentPresetConfig = {
 	args?: string[];
 	/** Empty values mean "inherit this variable from the app environment". */
 	env?: Record<string, string>;
+	/** Session option defaults advertised by the selected adapter. */
+	config?: Record<string, string>;
+	/** Session mode default advertised by the selected adapter. */
+	modeId?: string | null;
+	/** Screenpipe-owned ACP permission response policy. */
+	approvalMode?: "ask" | "allow-all" | null;
+	/** True when this ACP agent's model calls use Screenpipe Cloud allowance. */
+	useScreenpipeCloud?: boolean | null;
 };
 
 export type EmbeddedLLMConfig = {
@@ -131,13 +144,15 @@ export type AIPreset = {
 	  }
 );
 
-export type UpdateChannel = "stable" | "beta";
+export type UpdateChannel = "stable" | "pre-release";
 
 // Chat history types
 export interface ChatMessage {
 	id: string;
 	role: "user" | "assistant";
 	content: string;
+	/** Local history source for messages copied from another agent client. */
+	importedFrom?: "claude-code" | "codex";
 	intent?: "steer";
 	turnIntentId?: string;
 	timestamp: number;
@@ -185,6 +200,9 @@ export interface ChatMessage {
  *                    rather than "Recents". */
 export type ConversationKind = "chat" | "pipe-watch" | "pipe-run";
 
+/** The client surface that hosted an imported agent conversation. */
+export type AgentHarness = "terminal" | "cursor" | "github-copilot" | "screenpipe";
+
 /** Pipe-specific context attached to `pipe-watch` / `pipe-run`
  *  conversations. Drives the in-panel banner and the sidebar
  *  grouping. */
@@ -200,6 +218,14 @@ export interface ChatConversation {
 	messages: ChatMessage[];
 	createdAt: number;
 	updatedAt: number;
+	/** Provenance for an explicitly imported local agent conversation. */
+	importedFrom?: {
+		source: "claude-code" | "codex";
+		sourceId: string;
+		importedAt: number;
+		/** Optional when the transcript exposes which client hosted the run. */
+		harness?: AgentHarness;
+	};
 	/** User pinned this conversation in the chat sidebar — keeps it at the top.
 	 *  Persists across app restarts via the on-disk conversation file. */
 	pinned?: boolean;
@@ -272,6 +298,30 @@ export interface ChatHistoryStore {
 
 // Extend SettingsStore with fields added before Rust types are regenerated
 export type Settings = SettingsStore & {
+	/** Explicit consent on this device. Content is never stored in this field. */
+	workflowSource?: "device" | "cloud";
+	/** One-time local workflow processing choice when opening the cloud view. */
+	cloudWorkflowProcessingPromptSeen?: boolean;
+	workflowSharingPromptSeen?: Record<string, string>;
+	workflowSharing?: { accountId: string; epoch: string; enabledAt: number; priorBackend: "local" | "tinfoil" } | null;
+	/** Enable account data sync for this device. Default false. */
+	dataSyncEnabled?: boolean;
+	/** Friendly name used to partition this device's synced data. */
+	dataSyncDeviceName?: string;
+	/** Start boundary for this device's current explicit opt-in. */
+	dataSyncEnabledAt?: string;
+	/** Account that explicitly enabled Data Sync on this device. */
+	dataSyncAccountId?: string;
+	/** Enable automatic Activities generation. Default false. */
+	activitiesEnabled?: boolean;
+	/** Native Activity generation cadence in minutes. Default 15. */
+	activitiesIntervalMinutes?: number;
+	/** AI preset used by native Activity generation. */
+	activitiesAiPresetId?: string;
+	/** Next native Activity generation run as an ISO timestamp. */
+	activitiesNextRunAt?: string;
+	/** Native account allowance backoff; null clears it for an explicit retry. */
+	activitiesQuotaPause?: { context: string; code: string; retry_at: string | null } | null;
 	/** Goal used to prioritize the Home cards. Persisted in store.bin. */
 	userGoalCategory?: UserGoalCategory;
 	/** Where the user says they found screenpipe, answered once during setup.
@@ -289,7 +339,6 @@ export type Settings = SettingsStore & {
 	remoteControlPolicy?: DesktopRemotePolicySnapshot;
 	updateChannel?: UpdateChannel;
 	chatHistory?: ChatHistoryStore;
-	ignoredUrls?: string[];
 	/**
 	 * Entries the capture-category switches created, so turning a category off
 	 * removes only those and never a rule the user wrote by hand.
@@ -297,6 +346,7 @@ export type Settings = SettingsStore & {
 	categoryOwnedFilters?: { apps: string[]; domains: string[] };
 	searchShortcut?: string;
 	lockVaultShortcut?: string;
+	starSessionShortcut?: string;
 	/** When true, audio devices follow system default and auto-switch on changes */
 	useSystemDefaultAudio?: boolean;
 	/** Enable AI workflow event detection (cloud, triggers event-based pipes) */
@@ -372,9 +422,9 @@ export type Settings = SettingsStore & {
 	hideAppInScreenShare?: boolean;
 	/** Pause all screen capture when a DRM-protected streaming app (Netflix, Disney+, etc.) or a remote-desktop client (Omnissa/VMware Horizon) is focused — they blank their windows during screen recording */
 	pauseOnDrmContent?: boolean;
-	/** Skip clipboard capture in the UI recorder (events + content). Defaults to true (clipboard capture OFF) — passwords / API keys often pass through the clipboard, so it's opt-in. */
+	/** Skip clipboard capture in the UI recorder (events + content). Defaults to false in enterprise builds and true in consumer builds. */
 	disableClipboardCapture?: boolean;
-	/** Skip keyboard / typed-text capture in the UI recorder. Defaults to true (keyboard capture OFF) — the a11y tree + OCR still capture on-screen text, this only drops the raw keystroke stream where secrets get typed. */
+	/** Skip keyboard / typed-text capture in the UI recorder. Defaults to false in enterprise builds and true in consumer builds. */
 	disableKeyboardCapture?: boolean;
 	/** Skip mouse-click rows in the UI recorder. Defaults to false (click capture ON) — clicks carry no text payload and drive workflow/task mining. Clicks still wake event-driven capture when disabled. */
 	disableClickCapture?: boolean;
@@ -422,11 +472,6 @@ export type Settings = SettingsStore & {
 	 *  Meetings ships hidden, which is what puts its compact icon in the
 	 *  top-left chrome strip instead. See `lib/utils/sidebar-nav-layout`. */
 	sidebarNavLayout?: SidebarNavLayout;
-	/** Rollout gate for right-click + drag sidebar customization. Owned by the
-	 *  typed PostHog registry (`sidebar-customization-control`); a persisted
-	 *  layout is still honored when the gate is off, so turning the flag off
-	 *  removes the editing affordances without resetting anyone's sidebar. */
-	enableSidebarCustomization?: boolean;
 	/** Show the chat suggestion chips above the input — the "follow up"
 	 *  questions and the connection-aware suggested prompts. The single inline
 	 *  X on the chips flips this to false; re-enable from Settings → Display.
@@ -456,10 +501,17 @@ export type Settings = SettingsStore & {
 		captureStalls: boolean;
 		appUpdates: boolean;
 		pipeNotifications: boolean;
+		/** In-app /notify before background scheduled tasks burn most of hosted-AI allowance.
+		 *  Default true; still gated by master notifications and pipe notifications. */
+		pipeAllowanceWarnings?: boolean;
 		/** Toast when a monitor is plugged, unplugged, or switched (clamshell, dock). Default true. */
 		displayChanges?: boolean;
 		/** Live-note prompt when a meeting is detected. Default true. */
 		meetingLiveNotes?: boolean;
+		/** Calendar join reminders; missing inherits meetingLiveNotes. */
+		meetingReminders?: boolean;
+		/** Seconds before start, clamped to 1–1800 by the scheduler. Default 30. */
+		meetingReminderLeadSeconds?: number;
 		/** OS notification when a meeting starts but no audio frames arrive within 60s. Default true. */
 		audioCaptureStalled?: boolean;
 		/** In-app /notify when audio is captured but no live transcript arrives within 60s. Default true. */
@@ -633,10 +685,6 @@ export function makeDefaultPresets(isPro: boolean): AIPreset[] {
 	];
 }
 
-// Seed value — module load can't know pro status yet, so fall back to non-pro.
-// ensureDefaultPreset() re-seeds with pro status once settings.user is loaded.
-const DEFAULT_CLOUD_PRESET: AIPreset = makeDefaultPresets(false)[0];
-
 const DEFAULT_AUDIO_ENGINE = "whisper-large-v3-turbo-quantized";
 
 // "Paid" = any active app entitlement (Basic / Business / Enterprise / Lifetime)
@@ -677,9 +725,17 @@ const applyProCloudAudioDefaults = (settings: Settings): Settings => {
 };
 
 let DEFAULT_SETTINGS: Settings = {
+            uiLocale: "system",
+            uiLocalizationEnabled: process.env.NEXT_PUBLIC_SCREENPIPE_WEB_DEV === "mock"
+              && typeof window !== "undefined"
+              && new URLSearchParams(window.location.search).get("mockLocalization") === "true",
+			dataSyncEnabled: false,
+			activitiesEnabled: false,
+			activitiesIntervalMinutes: 15,
 			aiPresets: makeDefaultPresets(false) as any,
 			userGoalCategory: DEFAULT_USER_GOAL_CATEGORY,
-			deviceId: crypto.randomUUID(),
+			// Native startup persists the device identity before opening a webview.
+			deviceId: "",
 			deepgramApiKey: "",
 			isLoading: false,
 			userId: "",
@@ -693,11 +749,8 @@ let DEFAULT_SETTINGS: Settings = {
 			monitorIds: ["default"],
 			audioDevices: ["default"],
 			useSystemDefaultAudio: true,
-			// Default ON (#3819): this is the lightweight hot-path regex redaction
-			// in screenpipe-core (emails, phone numbers, SSNs, card numbers, API
-			// keys, etc.) — NOT the heavy async AI model (asyncPiiRedaction stays
-			// off, so no ~2.8GB model download). Privacy-by-default for new installs;
-			// existing users keep whatever they already chose.
+			// Basic regex redaction stays on for new desktop installs.
+			// Enterprise AI defaults are selected in createDefaultSettingsObject.
 			usePiiRemoval: true,
 			port: 3030,
 			dataDir: "default",
@@ -711,11 +764,12 @@ let DEFAULT_SETTINGS: Settings = {
 			],
 			includedWindows: [],
 			ignoredUrls: [],
+			includedUrls: [],
 			ignoredMeetingApps: [],
 			teamFilters: { ignoredWindows: [], includedWindows: [], ignoredUrls: [] },
 
 			analyticsEnabled: true,
-			remoteLogCollectionEnabled: false,
+			remoteLogCollectionEnabled: true,
 			remoteLogCollectionUserId: null,
 			audioChunkDuration: 30,
 			useChineseMirror: false,
@@ -761,9 +815,10 @@ let DEFAULT_SETTINGS: Settings = {
 			showChatShortcut: "Control+Super+L",
 			searchShortcut: "Control+Super+K",
 			lockVaultShortcut: "Super+Shift+L",
+			starSessionShortcut: "Control+Super+B",
 			disableVision: false,
 			disableScreenshots: false,
-			enableSemanticContext: false,
+			enableSemanticContext: true,
 			remoteControlPreferences: {
 				...NEW_INSTALL_REMOTE_CONTROL_PREFERENCES,
 			},
@@ -782,13 +837,13 @@ let DEFAULT_SETTINGS: Settings = {
 			disableTimeline: false,
 			firstRunGuideDone: false,
 			videoQuality: "balanced",
+			recordingDetail: "auto",
 			transcriptionMode: "batch",
 			cloudArchiveEnabled: false,
 			cloudArchiveRetentionDays: 7,
 			meetingSummaryPipeSlug: "meeting-summary",
 			filterMusic: true,
 			prioritizeInputLatency: false,
-			enableSidebarCustomization: false,
 			allowHidingShortcutOverlay: false,
 			showShortcutOverlay: true,
 			shortcutOverlaySnoozedUntil: null,
@@ -802,7 +857,7 @@ let DEFAULT_SETTINGS: Settings = {
 			keepComputerAwake: false,
 			showRestartNotifications: false,
 			experimentalCoreaudioSystemAudio: true,
-			experimentalMeetingPiggyback: false,
+			experimentalMeetingPiggyback: LOCAL_DESKTOP_REMOTE_POLICY.boolean.smartRecording.defaultEnabled,
 			alwaysRecordBluetoothMic: false,
 			windowsInputAecEnabled: false,
 			macosInputVpioEnabled: false,
@@ -817,10 +872,11 @@ let DEFAULT_SETTINGS: Settings = {
 			hdRecordingIntervalMs: 100,
 			headless: false,
 			headlessRecordOnly: false,
+			keepSearchAvailableAfterQuit: true,
 			fontSize: "16px",
 		};
 
-export function createDefaultSettingsObject(): Settings {
+export function createDefaultSettingsObject(isEnterprise = false): Settings {
 	try {
 		const p = platform();
 		DEFAULT_SETTINGS.platform = p;
@@ -832,6 +888,7 @@ export function createDefaultSettingsObject(): Settings {
 		DEFAULT_SETTINGS.searchShortcut = p === "windows" ? "Alt+K" : "Control+Super+K";
 		DEFAULT_SETTINGS.startAudioShortcut = p === "windows" ? "Alt+Shift+A" : "Control+Super+A";
 		DEFAULT_SETTINGS.stopAudioShortcut = p === "windows" ? "Alt+Shift+Z" : "Control+Super+Z";
+		DEFAULT_SETTINGS.starSessionShortcut = p === "windows" ? "Alt+Shift+B" : "Control+Super+B";
 		DEFAULT_SETTINGS.lockVaultShortcut = p === "windows" ? "Ctrl+Shift+L" : "Super+Shift+L";
 
 		if (p === "windows") {
@@ -841,12 +898,16 @@ export function createDefaultSettingsObject(): Settings {
 		if (p === "linux") {
 			DEFAULT_SETTINGS.overlayMode = "window";
 		}
-
-		return DEFAULT_SETTINGS;
 	} catch (e) {
-		// Fallback if platform detection fails
-		return DEFAULT_SETTINGS;
+		// Keep platform-independent defaults if platform detection fails.
 	}
+	return Object.assign({}, DEFAULT_SETTINGS, {
+		disableClipboardCapture: !isEnterprise,
+		disableKeyboardCapture: !isEnterprise,
+		asyncPiiRedaction: isEnterprise,
+		asyncImagePiiRedaction: isEnterprise,
+		piiBackend: isEnterprise ? "tinfoil" : "local",
+	});
 }
 
 export function normalizeSettingsArrays(settings: Settings): boolean {
@@ -855,14 +916,29 @@ export function normalizeSettingsArrays(settings: Settings): boolean {
 		aiPresets: makeDefaultPresets(settings.user?.cloud_subscribed === true),
 	};
 	let changed = false;
+	const presets = settings.aiPresets;
+	if (!Array.isArray(presets) || presets.length === 0) {
+		settings.aiPresets = [defaults.aiPresets[0]] as any;
+		changed = true;
+	}
 
 	for (const [key, fallback] of Object.entries(defaults)) {
+		if (key === "aiPresets") continue;
 		if (!Array.isArray(fallback) || Array.isArray(settings[key])) continue;
 		settings[key] = [...fallback];
 		changed = true;
 	}
 
 	return changed;
+}
+
+export function assertValidAiPresetUpdate(value: Partial<Settings>): void {
+	if (
+		"aiPresets" in value &&
+		(!Array.isArray(value.aiPresets) || value.aiPresets.length === 0)
+	) {
+		throw new Error("At least one AI preset is required");
+	}
 }
 
 // Store singleton
@@ -914,9 +990,9 @@ export const getStore = async () => {
 	if (!_store) {
 		_store = (async () => {
 			// Resolve the base dir via the backend so the webview opens the same
-			// store.bin as Rust (get_base_dir honors SCREENPIPE_DATA_DIR); a
-			// hardcoded ~/.screenpipe here splits the settings store in two
-			// whenever that override is set.
+			// store.bin as Rust. The backend pins this to the launch directory,
+			// even when recordings use another folder or SCREENPIPE_DATA_DIR
+			// was supplied to isolate the entire app at launch.
 			let baseDir: string | null = null;
 			try {
 				const res = await commands.getScreenpipeBaseDir();
@@ -1036,14 +1112,35 @@ function createSettingsStore() {
 	const get = async (): Promise<Settings> => {
 		const store = await getStore();
 		const settings = await store.get<Settings>("settings");
+		// Existing explicit choices do not need a build-identity lookup.
+		const needsBuildDefaults = !settings
+			|| settings.disableClipboardCapture === undefined
+			|| settings.disableKeyboardCapture === undefined
+			|| settings.asyncPiiRedaction === undefined
+			|| settings.asyncImagePiiRedaction === undefined
+			|| settings.piiBackend === undefined;
+		const defaults = createDefaultSettingsObject(
+			needsBuildDefaults ? await resolveEnterpriseBuild() : false,
+		);
 		if (!settings) {
-			return createDefaultSettingsObject();
+			return defaults;
 		}
 
 		// #3943: re-hydrate the cloud token that no longer persists in store.bin.
 		await hydrateCloudToken(settings);
 
 		let needsUpdate = normalizeSettingsArrays(settings);
+		for (const key of ["disableClipboardCapture", "disableKeyboardCapture", "asyncPiiRedaction", "asyncImagePiiRedaction"] as const) {
+			if (settings[key] === undefined) {
+				settings[key] = defaults[key];
+				needsUpdate = true;
+			}
+		}
+
+		if (settings.piiBackend === undefined) {
+			settings.piiBackend = defaults.piiBackend;
+			needsUpdate = true;
+		}
 
 		// Migration: Ensure existing users have deviceId for free tier tracking
 		const existingUserGoal = normalizeUserGoalCategory(
@@ -1167,13 +1264,6 @@ function createSettingsStore() {
 		// installs default to "meetings-only" (via createDefaultSettingsObject, which
 		// get() returns directly when there are no stored settings).
 
-		// Migration: Add default presets if user has none
-		if (!Array.isArray(settings.aiPresets) || settings.aiPresets.length === 0) {
-			const isPro = settings.user?.cloud_subscribed === true;
-			settings.aiPresets = makeDefaultPresets(isPro) as any;
-			needsUpdate = true;
-		}
-
 		// b2 seed: the first time we see a logged-in user, replace the anonymous
 		// "screenpipe" placeholder with the pro pair (chat + pipes) IF they're pro.
 		// Anonymous users keep the placeholder forever (which is correct — non-pro
@@ -1209,18 +1299,6 @@ function createSettingsStore() {
 			needsUpdate = true;
 		}
 
-		// Migration: Add screenpipe-cloud preset for existing users (without touching their existing presets)
-		const hasCloudPreset = settings.aiPresets?.some(
-			(p: any) => p.id === "screenpipe-cloud" || p.provider === "screenpipe-cloud"
-		);
-		if (settings.aiPresets && settings.aiPresets.length > 0 && !hasCloudPreset) {
-			// Only set as default if no other preset is already default
-			const hasDefault = settings.aiPresets.some((p: any) => p.defaultPreset);
-			const cloudPreset = { ...DEFAULT_CLOUD_PRESET, defaultPreset: !hasDefault };
-			settings.aiPresets = [cloudPreset as any, ...settings.aiPresets];
-			needsUpdate = true;
-		}
-
 		// Migration: Add chat history for existing users
 		if (!settings.chatHistory) {
 			settings.chatHistory = {
@@ -1228,6 +1306,11 @@ function createSettingsStore() {
 				activeConversationId: null,
 				historyEnabled: true,
 			};
+			needsUpdate = true;
+		}
+
+		if (!settings.starSessionShortcut?.trim()) {
+			settings.starSessionShortcut = platform() === "windows" ? "Alt+Shift+B" : "Control+Super+B";
 			needsUpdate = true;
 		}
 
@@ -1392,9 +1475,13 @@ function createSettingsStore() {
 
 	const set = (value: Partial<Settings>) =>
 		enqueueSettingsStoreWrite(async () => {
+			assertValidAiPresetUpdate(value);
 			const store = await getStore();
 			const current = await get();
 			const managedValues = await activeManagedValues(current);
+			if (current.workflowSharing && value.workflowSharing !== null && value.piiBackend !== undefined && value.piiBackend !== "tinfoil") {
+				throw new Error("Turn off Workflows sharing before changing cloud redaction.");
+			}
 			let newSettings = { ...current, ...value } as Settings;
 			if ("user" in value) {
 				// On logout / Pro→non-Pro transition, clear the V2 marker so a future
@@ -1410,8 +1497,10 @@ function createSettingsStore() {
 			) as Settings;
 			if (managedValues) newSettings.enterpriseManagedSettings = managedValues;
 			else delete newSettings.enterpriseManagedSettings;
-			await setSettingsStripped(store, newSettings);
-			await saveAndEncrypt(store);
+			await saveWithPresetReassignment(current, newSettings, async (reassigned) => {
+				await setSettingsStripped(store, reassigned);
+				await saveAndEncrypt(store);
+			});
 		});
 
 	const reset = () =>
@@ -1420,7 +1509,7 @@ function createSettingsStore() {
 			const current = await get();
 			const managedValues = await activeManagedValues(current);
 			const defaults = applyManagedOverrides(
-				createDefaultSettingsObject() as Record<string, unknown>,
+				{ ...createDefaultSettingsObject(await resolveEnterpriseBuild()), deviceId: current.deviceId } as Record<string, unknown>,
 				managedValues
 			) as Settings;
 			if (managedValues) defaults.enterpriseManagedSettings = managedValues;
@@ -1429,8 +1518,9 @@ function createSettingsStore() {
 		});
 
 	const resetSetting = async <K extends keyof Settings>(key: K) => {
+		if (key === "deviceId") return;
 		const current = await get();
-		const defaultValue = createDefaultSettingsObject()[key];
+		const defaultValue = createDefaultSettingsObject(await resolveEnterpriseBuild())[key];
 		await set({ [key]: defaultValue } as Partial<Settings>);
 	};
 
@@ -1443,7 +1533,7 @@ function createSettingsStore() {
 			let seq = 0;
 			return store.onKeyChange("settings", async (newValue: Settings | null | undefined) => {
 				const mySeq = ++seq;
-				const next = await hydrateCloudToken(newValue || createDefaultSettingsObject());
+				const next = await hydrateCloudToken(newValue || createDefaultSettingsObject(await resolveEnterpriseBuild()));
 				normalizeSettingsArrays(next);
 				if (mySeq === seq) callback(next);
 			});
@@ -1460,6 +1550,40 @@ function createSettingsStore() {
 }
 
 const settingsStore = createSettingsStore();
+const E2E_ACCOUNT_FIXTURE_ACTIVE_KEY =
+	"screenpipe_e2e_account_fixture_active";
+
+const hasActiveE2EAccountFixture = (): boolean => {
+	if (process.env.NEXT_PUBLIC_SCREENPIPE_E2E !== "true") return false;
+	try {
+		return (
+			typeof window !== "undefined" &&
+			window.localStorage?.getItem(E2E_ACCOUNT_FIXTURE_ACTIVE_KEY) === "1"
+		);
+	} catch {
+		return false;
+	}
+};
+
+/**
+ * E2E account fixtures carry complete user and plan truth in the shared store.
+ * Read that authoritative state instead of a particular webview's React copy:
+ * Home and Onboarding can mount at different times, while either may initiate
+ * a background account verification.
+ */
+const hasPersistedE2EAccountFixture = async (): Promise<boolean> => {
+	if (process.env.NEXT_PUBLIC_SCREENPIPE_E2E !== "true") return false;
+	// The fixture owner writes this sentinel before its asynchronous store
+	// update. localStorage is shared by the app's same-origin webviews, so stale
+	// Home/Onboarding copies can reject an old 401 without waiting for a store
+	// broadcast or racing the queued write.
+	if (hasActiveE2EAccountFixture()) return true;
+	const persisted = await settingsStore.get();
+	return (
+		(persisted.user as User & { __e2eSkipAccountRefresh?: boolean })
+			?.__e2eSkipAccountRefresh === true
+	);
+};
 
 // Context for React
 interface SettingsContextType {
@@ -1539,6 +1663,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	// Install global fetch interceptor to catch 401s from screenpipe.com
 	const settingsRef = useRef(settings);
 	settingsRef.current = settings;
+	const settingsUpdateGenerationRef = useRef(0);
 
 	// Monotonic auth generation, bumped on every explicit sign-out. A
 	// loadUser() call snapshots this at entry; if a sign-out bumps it while the
@@ -1550,8 +1675,29 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
 	useEffect(() => {
 		installAuthInterceptor(
-			() => settingsRef.current.user?.token ?? undefined,
+			() => {
+				const user = settingsRef.current.user as
+					| (User & { __e2eSkipAccountRefresh?: boolean })
+					| null
+					| undefined;
+				// Synthetic E2E sessions intentionally use tokens the production web
+				// service cannot verify. A background cloud request may still return
+				// 401 while the native onboarding flow is under test; do not let that
+				// unrelated response erase the fixture from every app window.
+				if (
+					process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true" &&
+					(hasActiveE2EAccountFixture() ||
+						user?.__e2eSkipAccountRefresh === true)
+				) {
+					return undefined;
+				}
+				return user?.token ?? undefined;
+			},
 			async () => {
+				// Any webview can observe a 401 from an unrelated cloud request. An
+				// E2E fixture is intentionally synthetic, so consult the shared store
+				// before allowing that response to erase the account across windows.
+				if (await hasPersistedE2EAccountFixture()) return;
 				// A response from the website auth surface definitively rejected the
 				// credential. Clear the account so it cannot be confused with a
 				// transient secret-store hydration miss.
@@ -1590,6 +1736,18 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		if (!isSettingsLoaded) return;
 		const token = settings.user?.token;
 		if (!token) return;
+		// E2E account seeds already contain the exact server response that their
+		// scenario is exercising. Sending their synthetic token to the production
+		// account API immediately converts a deterministic native-app test into a
+		// real-network 401. This branch is compiled into E2E bundles only; normal
+		// app authentication and refresh behavior are unchanged.
+		if (
+			process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true" &&
+			(settings.user as User & { __e2eSkipAccountRefresh?: boolean })
+				.__e2eSkipAccountRefresh === true
+		) {
+			return;
+		}
 
 		let cancelled = false;
 		const MAX_RETRIES = 3;
@@ -1753,6 +1911,20 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	}, [settings.fontSize]);
 
 	const updateSettings = async (updates: Partial<Settings>) => {
+		if (settingsRef.current.workflowSharing && updates.workflowSharing !== null &&
+			updates.piiBackend !== undefined && updates.piiBackend !== "tinfoil") {
+			throw new Error("Turn off Workflows sharing before changing cloud redaction.");
+		}
+		assertValidAiPresetUpdate(updates);
+		const updateGeneration = ++settingsUpdateGenerationRef.current;
+		const settingsBeforeUpdate = settingsRef.current;
+
+		// Controlled switches and checkboxes must reflect the click immediately.
+		// Waiting for the asynchronous store listener makes React render the old
+		// value again, so the first click appears to undo itself. Persistence stays
+		// authoritative: a failed latest write is rolled back below.
+		setSettings((current) => ({ ...current, ...updates }) as Settings);
+
 		// Every settings mutation funnels through here, which makes this the one
 		// place that can answer "which controls do people actually change" without
 		// wiring ~40 call sites. The payload is redacted to booleans and numbers
@@ -1776,7 +1948,20 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			// session. Fire-and-forget; the listener above bumps each window's ref.
 			emit("screenpipe-auth-signout").catch(() => {});
 		}
-		await settingsStore.set(updates);
+		try {
+			await settingsStore.set(updates);
+		} catch (error) {
+			// Do not let an older failed write overwrite a newer optimistic click.
+			// The queued newer write (and its store event) owns reconciliation.
+			if (settingsUpdateGenerationRef.current === updateGeneration) {
+				try {
+					setSettings(await settingsStore.get());
+				} catch {
+					setSettings(settingsBeforeUpdate);
+				}
+			}
+			throw error;
+		}
 		// Settings will be updated via the listener
 		if (clearsAccount) {
 			// Account changes must not alter the user's local retention policy.
@@ -1829,6 +2014,23 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	};
 
 	const loadUser = async (token: string, verify = false) => {
+		// Every background verifier funnels through loadUser. E2E account fixtures
+		// already contain their scenario's exact server response, and their tokens
+		// must never be sent to the production account API. Check this webview's
+		// optimistic React state first: updateSettings publishes it before the
+		// queued durable write, so consulting only the store leaves a brief window
+		// where the auto-refresh effect can race the fixture persistence.
+		// Keep the environment check outside the await: production loadUser must
+		// snapshot authGeneration synchronously so a same-tick logout cannot race it.
+		if (
+			process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true" &&
+			((settingsRef.current.user as User & {
+				__e2eSkipAccountRefresh?: boolean;
+			})?.__e2eSkipAccountRefresh === true ||
+				(await hasPersistedE2EAccountFixture()))
+		) {
+			return;
+		}
 		// Snapshot the auth generation at the start of the request. If the user
 		// signs out while this fetch is in flight, the generation changes and we
 		// abort the write below instead of resurrecting the cleared session.
@@ -1867,6 +2069,16 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			if (!response.ok) {
 				const body = await response.text().catch(() => "<no body>");
 				if (response.status === 401 || response.status === 403) {
+					// A peer webview can finish a request for the preceding CI seed
+					// after the shared store has installed a new E2E account. Its
+					// React ref may still name the old token, so recheck the durable
+					// fixture before clearing or surfacing a stale auth failure.
+					if (
+						process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true" &&
+						(await hasPersistedE2EAccountFixture())
+					) {
+						return;
+					}
 					await clearRejectedSession();
 				}
 				throw new Error(
@@ -1972,4 +2184,9 @@ export function useSettings(): SettingsContextType {
 		throw new Error("useSettings must be used within a SettingsProvider");
 	}
 	return context;
+}
+
+/** Optional access for reusable shortcut menus rendered outside the app shell. */
+export function useOptionalSettings(): SettingsContextType | undefined {
+  return useContext(SettingsContext);
 }

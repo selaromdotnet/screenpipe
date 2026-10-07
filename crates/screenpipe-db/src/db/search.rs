@@ -232,7 +232,7 @@ impl DatabaseManager {
     async fn search_with_tags_ordered_projection(
         &self,
         query: &str,
-        mut content_type: ContentType,
+        content_type: ContentType,
         limit: u32,
         offset: u32,
         start_time: Option<DateTime<Utc>>,
@@ -258,40 +258,190 @@ impl DatabaseManager {
         order: Order,
         include_text_json: bool,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
-        let mut results = Vec::new();
+        self.consistent_read(|| {
+            let speaker_ids = speaker_ids.clone();
+            let content_type = content_type.clone();
+            async move {
+                let mut content_type = content_type;
+                let mut results = Vec::new();
 
-        // if focused or browser_url is present, we run only on OCR
-        if focused.is_some() || browser_url.is_some() {
-            content_type = ContentType::OCR;
-        }
+                // if focused or browser_url is present, we run only on OCR
+                if focused.is_some() || browser_url.is_some() {
+                    content_type = ContentType::OCR;
+                }
 
-        // Input events and accessibility-only hits have no tag table, so a
-        // tag filter can never match them — short-circuit to empty. Screen
-        // (OCR), audio, and memories all carry tags and are filtered below.
-        if !tags.is_empty()
-            && matches!(
-                content_type,
-                ContentType::Input | ContentType::Accessibility
-            )
-        {
-            return Ok(results);
-        }
+                // Input events and accessibility-only hits have no tag table, so a
+                // tag filter can never match them — short-circuit to empty. Screen
+                // (OCR), audio, and memories all carry tags and are filtered below.
+                if !tags.is_empty()
+                    && matches!(
+                        content_type,
+                        ContentType::Input | ContentType::Accessibility
+                    )
+                {
+                    return Ok(results);
+                }
 
-        match content_type {
-            ContentType::All => {
-                // For All: each sub-function must fetch enough rows to cover the
-                // global pagination window. We pass limit+offset with offset=0 to
-                // each, then apply skip(offset).take(limit) once on the merged set.
-                let fetch_limit = limit.saturating_add(offset);
+                match content_type {
+                    ContentType::All => {
+                        // For All: each sub-function must fetch enough rows to cover the
+                        // global pagination window. We pass limit+offset with offset=0 to
+                        // each, then apply skip(offset).take(limit) once on the merged set.
+                        let fetch_limit = limit.saturating_add(offset);
 
-                let (ocr_results, audio_results, ui_results) =
-                    if app_name.is_none() && window_name.is_none() && frame_name.is_none() {
-                        // Run all three queries in parallel
-                        let (ocr, audio, ui) = tokio::try_join!(
-                            self.search_ocr(
+                        let (ocr_results, audio_results, ui_results) = if app_name.is_none()
+                            && window_name.is_none()
+                            && frame_name.is_none()
+                        {
+                            // Run all three queries in parallel
+                            let (ocr, audio, ui) = tokio::try_join!(
+                                self.search_ocr(
+                                    query,
+                                    fetch_limit,
+                                    0,
+                                    start_time,
+                                    end_time,
+                                    app_name,
+                                    window_name,
+                                    min_length,
+                                    max_length,
+                                    frame_name,
+                                    browser_url,
+                                    focused,
+                                    device_name,
+                                    machine_id,
+                                    tags,
+                                    order,
+                                    include_text_json,
+                                ),
+                                self.search_audio_ordered(
+                                    query,
+                                    fetch_limit,
+                                    0,
+                                    start_time,
+                                    end_time,
+                                    min_length,
+                                    max_length,
+                                    speaker_ids,
+                                    speaker_name,
+                                    device_name,
+                                    machine_id,
+                                    tags,
+                                    order,
+                                ),
+                                // Issue #2436: branch the accessibility plan
+                                // on the on_screen filter — see the dispatch
+                                // in ContentType::Accessibility above.
+                                // Accessibility frames have no tag table, so a
+                                // tag filter yields nothing for the UI leg.
+                                async {
+                                    if !tags.is_empty() {
+                                        return Ok(Vec::new());
+                                    }
+                                    match on_screen {
+                                        Some(v) => {
+                                            self.search_accessibility_visible_ordered(
+                                                query,
+                                                v,
+                                                app_name,
+                                                window_name,
+                                                start_time,
+                                                end_time,
+                                                fetch_limit,
+                                                0,
+                                                order,
+                                            )
+                                            .await
+                                        }
+                                        None => {
+                                            self.search_accessibility_ordered(
+                                                query,
+                                                app_name,
+                                                window_name,
+                                                start_time,
+                                                end_time,
+                                                fetch_limit,
+                                                0,
+                                                order,
+                                            )
+                                            .await
+                                        }
+                                    }
+                                }
+                            )?;
+                            (ocr, Some(audio), ui)
+                        } else {
+                            // Run only OCR and UI queries in parallel when app/window filters are present
+                            let (ocr, ui) = tokio::try_join!(
+                                self.search_ocr(
+                                    query,
+                                    fetch_limit,
+                                    0,
+                                    start_time,
+                                    end_time,
+                                    app_name,
+                                    window_name,
+                                    min_length,
+                                    max_length,
+                                    frame_name,
+                                    browser_url,
+                                    focused,
+                                    device_name,
+                                    machine_id,
+                                    tags,
+                                    order,
+                                    include_text_json,
+                                ),
+                                async {
+                                    if !tags.is_empty() {
+                                        return Ok(Vec::new());
+                                    }
+                                    match on_screen {
+                                        Some(v) => {
+                                            self.search_accessibility_visible_ordered(
+                                                query,
+                                                v,
+                                                app_name,
+                                                window_name,
+                                                start_time,
+                                                end_time,
+                                                fetch_limit,
+                                                0,
+                                                order,
+                                            )
+                                            .await
+                                        }
+                                        None => {
+                                            self.search_accessibility_ordered(
+                                                query,
+                                                app_name,
+                                                window_name,
+                                                start_time,
+                                                end_time,
+                                                fetch_limit,
+                                                0,
+                                                order,
+                                            )
+                                            .await
+                                        }
+                                    }
+                                }
+                            )?;
+                            (ocr, None, ui)
+                        };
+
+                        results.extend(ocr_results.into_iter().map(SearchResult::OCR));
+                        if let Some(audio) = audio_results {
+                            results.extend(audio.into_iter().map(SearchResult::Audio));
+                        }
+                        results.extend(ui_results.into_iter().map(SearchResult::UI));
+                    }
+                    ContentType::OCR => {
+                        let ocr_results = self
+                            .search_ocr(
                                 query,
-                                fetch_limit,
-                                0,
+                                limit,
+                                offset,
                                 start_time,
                                 end_time,
                                 app_name,
@@ -306,290 +456,152 @@ impl DatabaseManager {
                                 tags,
                                 order,
                                 include_text_json,
-                            ),
-                            self.search_audio_ordered(
-                                query,
-                                fetch_limit,
-                                0,
-                                start_time,
-                                end_time,
-                                min_length,
-                                max_length,
-                                speaker_ids,
-                                speaker_name,
-                                device_name,
-                                machine_id,
-                                tags,
-                                order,
-                            ),
-                            // Issue #2436: branch the accessibility plan
-                            // on the on_screen filter — see the dispatch
-                            // in ContentType::Accessibility above.
-                            // Accessibility frames have no tag table, so a
-                            // tag filter yields nothing for the UI leg.
-                            async {
-                                if !tags.is_empty() {
-                                    return Ok(Vec::new());
-                                }
-                                match on_screen {
-                                    Some(v) => {
-                                        self.search_accessibility_visible_ordered(
-                                            query,
-                                            v,
-                                            app_name,
-                                            window_name,
-                                            start_time,
-                                            end_time,
-                                            fetch_limit,
-                                            0,
-                                            order,
-                                        )
-                                        .await
-                                    }
-                                    None => {
-                                        self.search_accessibility_ordered(
-                                            query,
-                                            app_name,
-                                            window_name,
-                                            start_time,
-                                            end_time,
-                                            fetch_limit,
-                                            0,
-                                            order,
-                                        )
-                                        .await
-                                    }
-                                }
+                            )
+                            .await?;
+                        results.extend(ocr_results.into_iter().map(SearchResult::OCR));
+                    }
+                    ContentType::Audio => {
+                        if app_name.is_none() && window_name.is_none() {
+                            let audio_results = self
+                                .search_audio_ordered(
+                                    query,
+                                    limit,
+                                    offset,
+                                    start_time,
+                                    end_time,
+                                    min_length,
+                                    max_length,
+                                    speaker_ids,
+                                    speaker_name,
+                                    device_name,
+                                    machine_id,
+                                    tags,
+                                    order,
+                                )
+                                .await?;
+                            results.extend(audio_results.into_iter().map(SearchResult::Audio));
+                        }
+                    }
+                    ContentType::Accessibility => {
+                        // Issue #2436: when on_screen is set, the agent wants
+                        // pixel-actually-visible matches only — switch to the
+                        // per-element index path. Otherwise stick with the
+                        // existing per-frame plan (faster, broader recall).
+                        let ui_results = match on_screen {
+                            Some(visible) => {
+                                self.search_accessibility_visible_ordered(
+                                    query,
+                                    visible,
+                                    app_name,
+                                    window_name,
+                                    start_time,
+                                    end_time,
+                                    limit,
+                                    offset,
+                                    order,
+                                )
+                                .await?
                             }
-                        )?;
-                        (ocr, Some(audio), ui)
-                    } else {
-                        // Run only OCR and UI queries in parallel when app/window filters are present
-                        let (ocr, ui) = tokio::try_join!(
-                            self.search_ocr(
-                                query,
-                                fetch_limit,
-                                0,
-                                start_time,
-                                end_time,
+                            None => {
+                                self.search_accessibility_ordered(
+                                    query,
+                                    app_name,
+                                    window_name,
+                                    start_time,
+                                    end_time,
+                                    limit,
+                                    offset,
+                                    order,
+                                )
+                                .await?
+                            }
+                        };
+                        results.extend(ui_results.into_iter().map(SearchResult::UI));
+                    }
+                    ContentType::Input => {
+                        let input_results = self
+                            .search_ui_events_ordered(
+                                Some(query),
+                                None,
                                 app_name,
                                 window_name,
-                                min_length,
-                                max_length,
-                                frame_name,
-                                browser_url,
-                                focused,
-                                device_name,
-                                machine_id,
-                                tags,
+                                start_time,
+                                end_time,
+                                limit,
+                                offset,
                                 order,
-                                include_text_json,
-                            ),
-                            async {
-                                if !tags.is_empty() {
-                                    return Ok(Vec::new());
-                                }
-                                match on_screen {
-                                    Some(v) => {
-                                        self.search_accessibility_visible_ordered(
-                                            query,
-                                            v,
-                                            app_name,
-                                            window_name,
-                                            start_time,
-                                            end_time,
-                                            fetch_limit,
-                                            0,
-                                            order,
-                                        )
-                                        .await
-                                    }
-                                    None => {
-                                        self.search_accessibility_ordered(
-                                            query,
-                                            app_name,
-                                            window_name,
-                                            start_time,
-                                            end_time,
-                                            fetch_limit,
-                                            0,
-                                            order,
-                                        )
-                                        .await
-                                    }
-                                }
-                            }
-                        )?;
-                        (ocr, None, ui)
+                                input_context_only,
+                            )
+                            .await?;
+                        results.extend(input_results.into_iter().map(SearchResult::Input));
+                    }
+                    ContentType::Memory => {
+                        let start_str =
+                            start_time.map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
+                        let end_str =
+                            end_time.map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
+                        let memory_results = self
+                            .list_memories_for_search(
+                                Some(query).filter(|q| !q.is_empty()),
+                                None,
+                                None,
+                                None,
+                                start_str.as_deref(),
+                                end_str.as_deref(),
+                                limit,
+                                offset,
+                                Some("created_at"),
+                                Some(match order {
+                                    Order::Ascending => "asc",
+                                    Order::Descending => "desc",
+                                }),
+                                tags,
+                            )
+                            .await?;
+                        results.extend(memory_results.into_iter().map(SearchResult::Memory));
+                    }
+                }
+
+                // Keep merged content types consistent with the database page order.
+                results.sort_by(|a, b| {
+                    let timestamp_a = match a {
+                        SearchResult::OCR(ocr) => ocr.timestamp,
+                        SearchResult::Audio(audio) => audio.timestamp,
+                        SearchResult::UI(ui) => ui.timestamp,
+                        SearchResult::Input(input) => input.timestamp,
+                        SearchResult::Memory(m) => {
+                            m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
+                        }
                     };
-
-                results.extend(ocr_results.into_iter().map(SearchResult::OCR));
-                if let Some(audio) = audio_results {
-                    results.extend(audio.into_iter().map(SearchResult::Audio));
-                }
-                results.extend(ui_results.into_iter().map(SearchResult::UI));
-            }
-            ContentType::OCR => {
-                let ocr_results = self
-                    .search_ocr(
-                        query,
-                        limit,
-                        offset,
-                        start_time,
-                        end_time,
-                        app_name,
-                        window_name,
-                        min_length,
-                        max_length,
-                        frame_name,
-                        browser_url,
-                        focused,
-                        device_name,
-                        machine_id,
-                        tags,
-                        order,
-                        include_text_json,
-                    )
-                    .await?;
-                results.extend(ocr_results.into_iter().map(SearchResult::OCR));
-            }
-            ContentType::Audio => {
-                if app_name.is_none() && window_name.is_none() {
-                    let audio_results = self
-                        .search_audio_ordered(
-                            query,
-                            limit,
-                            offset,
-                            start_time,
-                            end_time,
-                            min_length,
-                            max_length,
-                            speaker_ids,
-                            speaker_name,
-                            device_name,
-                            machine_id,
-                            tags,
-                            order,
-                        )
-                        .await?;
-                    results.extend(audio_results.into_iter().map(SearchResult::Audio));
-                }
-            }
-            ContentType::Accessibility => {
-                // Issue #2436: when on_screen is set, the agent wants
-                // pixel-actually-visible matches only — switch to the
-                // per-element index path. Otherwise stick with the
-                // existing per-frame plan (faster, broader recall).
-                let ui_results = match on_screen {
-                    Some(visible) => {
-                        self.search_accessibility_visible_ordered(
-                            query,
-                            visible,
-                            app_name,
-                            window_name,
-                            start_time,
-                            end_time,
-                            limit,
-                            offset,
-                            order,
-                        )
-                        .await?
+                    let timestamp_b = match b {
+                        SearchResult::OCR(ocr) => ocr.timestamp,
+                        SearchResult::Audio(audio) => audio.timestamp,
+                        SearchResult::UI(ui) => ui.timestamp,
+                        SearchResult::Input(input) => input.timestamp,
+                        SearchResult::Memory(m) => {
+                            m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
+                        }
+                    };
+                    match order {
+                        Order::Ascending => timestamp_a.cmp(&timestamp_b),
+                        Order::Descending => timestamp_b.cmp(&timestamp_a),
                     }
-                    None => {
-                        self.search_accessibility_ordered(
-                            query,
-                            app_name,
-                            window_name,
-                            start_time,
-                            end_time,
-                            limit,
-                            offset,
-                            order,
-                        )
-                        .await?
-                    }
-                };
-                results.extend(ui_results.into_iter().map(SearchResult::UI));
-            }
-            ContentType::Input => {
-                let input_results = self
-                    .search_ui_events_ordered(
-                        Some(query),
-                        None,
-                        app_name,
-                        window_name,
-                        start_time,
-                        end_time,
-                        limit,
-                        offset,
-                        order,
-                        input_context_only,
-                    )
-                    .await?;
-                results.extend(input_results.into_iter().map(SearchResult::Input));
-            }
-            ContentType::Memory => {
-                let start_str = start_time.map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
-                let end_str = end_time.map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
-                let memory_results = self
-                    .list_memories_for_search(
-                        Some(query).filter(|q| !q.is_empty()),
-                        None,
-                        None,
-                        None,
-                        start_str.as_deref(),
-                        end_str.as_deref(),
-                        limit,
-                        offset,
-                        Some("created_at"),
-                        Some(match order {
-                            Order::Ascending => "asc",
-                            Order::Descending => "desc",
-                        }),
-                        tags,
-                    )
-                    .await?;
-                results.extend(memory_results.into_iter().map(SearchResult::Memory));
-            }
-        }
+                });
 
-        // Keep merged content types consistent with the database page order.
-        results.sort_by(|a, b| {
-            let timestamp_a = match a {
-                SearchResult::OCR(ocr) => ocr.timestamp,
-                SearchResult::Audio(audio) => audio.timestamp,
-                SearchResult::UI(ui) => ui.timestamp,
-                SearchResult::Input(input) => input.timestamp,
-                SearchResult::Memory(m) => {
-                    m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
+                // For ContentType::All, sub-functions each fetched limit+offset rows
+                // with offset=0. Now apply pagination once on the globally-sorted set.
+                if matches!(content_type, ContentType::All) {
+                    results = results
+                        .into_iter()
+                        .skip(offset as usize)
+                        .take(limit as usize)
+                        .collect();
                 }
-            };
-            let timestamp_b = match b {
-                SearchResult::OCR(ocr) => ocr.timestamp,
-                SearchResult::Audio(audio) => audio.timestamp,
-                SearchResult::UI(ui) => ui.timestamp,
-                SearchResult::Input(input) => input.timestamp,
-                SearchResult::Memory(m) => {
-                    m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
-                }
-            };
-            match order {
-                Order::Ascending => timestamp_a.cmp(&timestamp_b),
-                Order::Descending => timestamp_b.cmp(&timestamp_a),
+
+                Ok(results)
             }
-        });
-
-        // For ContentType::All, sub-functions each fetched limit+offset rows
-        // with offset=0. Now apply pagination once on the globally-sorted set.
-        if matches!(content_type, ContentType::All) {
-            results = results
-                .into_iter()
-                .skip(offset as usize)
-                .take(limit as usize)
-                .collect();
-        }
-
-        Ok(results)
+        })
+        .await
     }
 
     async fn search_ocr_browse_page(
@@ -672,12 +684,13 @@ impl DatabaseManager {
             query = query.bind(end);
         }
         let mut connection = self.acquire_search_read().await?;
-        let rows = query
+        let mut rows = query
             .bind(limit)
             .bind(offset)
             .fetch_all(&mut *connection)
             .await?;
         drop(connection);
+        self.hydrate_ocr_rows(&mut rows, include_text_json).await?;
         Ok(rows)
     }
 
@@ -731,6 +744,11 @@ impl DatabaseManager {
         order: Order,
         include_text_json: bool,
     ) -> Result<Vec<OCRResult>, sqlx::Error> {
+        let full_text_length = if self.storage.is_some() {
+            "frames.payload_full_text_length"
+        } else {
+            "LENGTH(COALESCE(frames.full_text, ''))"
+        };
         // Acquire a heavy-read permit (max 2 concurrent). OCR searches can
         // return massive text blobs and hold connections for seconds, starving
         // the pool for writes (audio, vision, UI capture).
@@ -829,8 +847,8 @@ impl DatabaseManager {
                 {fts_condition}
                 {start_condition}
                 {end_condition}
-                AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) >= ?4)
-                AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
+                AND (?4 IS NULL OR {full_text_length} >= ?4)
+                AND (?5 IS NULL OR {full_text_length} <= ?5)
                 AND (?6 IS NULL OR COALESCE(video_chunks.device_name, frames.device_name) LIKE '%' || ?6 || '%')
                 AND (?7 IS NULL OR frames.machine_id = ?7)
                 AND (?8 IS NULL OR frames.focused = ?8)
@@ -895,7 +913,7 @@ impl DatabaseManager {
         let query_builder = sqlx::query_as(sqlx::AssertSqlSafe(sql));
 
         let mut connection = self.acquire_search_read().await?;
-        let raw_results: Vec<OCRResultRaw> = query_builder
+        let mut raw_results: Vec<OCRResultRaw> = query_builder
             .bind(if has_fts { Some(&fts_query) } else { None })
             .bind(start_time)
             .bind(end_time)
@@ -912,6 +930,8 @@ impl DatabaseManager {
             .await?;
         drop(connection);
 
+        self.hydrate_ocr_rows(&mut raw_results, include_text_json)
+            .await?;
         Ok(Self::into_ocr_results(raw_results))
     }
 
@@ -1182,9 +1202,10 @@ impl DatabaseManager {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        // complete sql with group, order, limit and offset
+        // Group only tag-join duplicates. Distinct speech segments can share a
+        // chunk and offset_index, so grouping by those loses recorded speech.
         let sql = format!(
-            "{} {} GROUP BY audio_transcriptions.audio_chunk_id, audio_transcriptions.offset_index ORDER BY audio_transcriptions.timestamp {order_dir}, audio_transcriptions.audio_chunk_id {order_dir}, audio_transcriptions.offset_index {order_dir} LIMIT ? OFFSET ?",
+            "{} {} GROUP BY audio_transcriptions.id ORDER BY audio_transcriptions.timestamp {order_dir}, audio_transcriptions.audio_chunk_id {order_dir}, audio_transcriptions.offset_index {order_dir}, audio_transcriptions.id {order_dir} LIMIT ? OFFSET ?",
             base_sql,
             where_clause,
             order_dir = match order {
@@ -1495,7 +1516,7 @@ impl DatabaseManager {
         let snapshot: Option<(Option<String>,)> =
             sqlx::query_as("SELECT snapshot_path FROM frames WHERE id = ?1")
                 .bind(frame_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *self.acquire_read().await?)
                 .await?;
 
         match snapshot {
@@ -1516,7 +1537,7 @@ impl DatabaseManager {
                     "#,
                 )
                 .bind(frame_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *self.acquire_read().await?)
                 .await?;
                 Ok(result.map(|(path, offset)| (path, offset, false)))
             }
@@ -1533,7 +1554,7 @@ impl DatabaseManager {
             "SELECT timestamp FROM frames WHERE id = ?1",
         )
         .bind(frame_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *self.acquire_read().await?)
         .await?
         .flatten())
     }
@@ -1549,9 +1570,145 @@ impl DatabaseManager {
         )
         .bind(start)
         .bind(end)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *self.acquire_read().await?)
         .await?;
         Ok(ids)
+    }
+
+    /// Return existing-media candidates reduced into ten-second buckets for an
+    /// app period. A candidate points at either a direct JPEG snapshot or the
+    /// already-compacted MP4 plus its frame time. The HTTP layer never decodes
+    /// video; clients can let the platform media stack seek the existing file.
+    ///
+    /// Domain-filtered queries retain one candidate per URL so exact host
+    /// validation cannot discard another URL from the same bucket.
+    /// Frame attribution remains authoritative; blank frame attribution falls
+    /// back to the latest named UI event directly linked to that frame.
+    pub async fn get_frame_preview_candidates(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        app_name: &str,
+        browser_domain: Option<&str>,
+    ) -> Result<
+        Vec<(
+            i64,
+            DateTime<Utc>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<f64>,
+        )>,
+        SqlxError,
+    > {
+        let mut connection = self.acquire_search_read().await?;
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                DateTime<Utc>,
+                Option<String>,
+                String,
+                Option<i64>,
+                Option<f64>,
+            ),
+        >(
+            r#"
+            WITH candidates AS (
+                SELECT
+                    f.id,
+                    f.timestamp,
+                    f.browser_url,
+                    COALESCE(NULLIF(f.snapshot_path, ''), vc.file_path) AS source_path,
+                    CASE WHEN NULLIF(f.snapshot_path, '') IS NULL THEN vc.id END AS video_chunk_id,
+                    CASE
+                        WHEN NULLIF(f.snapshot_path, '') IS NULL
+                        THEN CAST(f.offset_index AS REAL) / MAX(COALESCE(vc.fps, 0.5), 0.001)
+                    END AS video_offset_seconds
+                FROM frames f
+                LEFT JOIN video_chunks vc ON f.video_chunk_id = vc.id
+                WHERE f.app_name = ?1
+                  AND f.timestamp >= ?2
+                  AND f.timestamp <= ?3
+                  AND f.focused = 1
+                  AND COALESCE(NULLIF(f.snapshot_path, ''), vc.file_path) IS NOT NULL
+                  AND COALESCE(NULLIF(f.snapshot_path, ''), vc.file_path) NOT LIKE 'cloud://%'
+                UNION ALL
+                SELECT
+                    f.id,
+                    f.timestamp,
+                    u.browser_url,
+                    COALESCE(NULLIF(f.snapshot_path, ''), vc.file_path) AS source_path,
+                    CASE WHEN NULLIF(f.snapshot_path, '') IS NULL THEN vc.id END AS video_chunk_id,
+                    CASE
+                        WHEN NULLIF(f.snapshot_path, '') IS NULL
+                        THEN CAST(f.offset_index AS REAL) / MAX(COALESCE(vc.fps, 0.5), 0.001)
+                    END AS video_offset_seconds
+                FROM ui_events u
+                JOIN frames f ON f.id = u.frame_id
+                LEFT JOIN video_chunks vc ON f.video_chunk_id = vc.id
+                WHERE u.app_name = ?1
+                  AND f.timestamp >= ?2
+                  AND f.timestamp <= ?3
+                  AND (f.app_name IS NULL OR f.app_name = '')
+                  AND u.id = (
+                      SELECT latest.id
+                      FROM ui_events latest
+                      WHERE latest.frame_id = f.id
+                        AND latest.app_name IS NOT NULL
+                        AND latest.app_name != ''
+                      ORDER BY latest.timestamp DESC, latest.id DESC
+                      LIMIT 1
+                  )
+                  AND COALESCE(NULLIF(f.snapshot_path, ''), vc.file_path) IS NOT NULL
+                  AND COALESCE(NULLIF(f.snapshot_path, ''), vc.file_path) NOT LIKE 'cloud://%'
+            ), bucketed AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY
+                        CAST(unixepoch(timestamp) / 10 AS INTEGER),
+                        CASE WHEN ?4 IS NULL THEN '' ELSE COALESCE(browser_url, '') END
+                    ORDER BY timestamp, id
+                ) AS bucket_rank
+                FROM candidates
+                WHERE ?4 IS NULL
+                   OR instr(lower(COALESCE(browser_url, '')), lower(?4)) > 0
+            )
+            SELECT id, timestamp, browser_url, source_path, video_chunk_id, video_offset_seconds
+            FROM bucketed
+            WHERE bucket_rank = 1
+            ORDER BY timestamp, id
+            "#,
+        )
+        .bind(app_name)
+        .bind(start)
+        .bind(end)
+        .bind(browser_domain)
+        .fetch_all(&mut *connection)
+        .await?;
+        drop(connection);
+        Ok(rows)
+    }
+
+    pub async fn get_video_chunk_path(&self, chunk_id: i64) -> Result<Option<String>, SqlxError> {
+        sqlx::query_scalar(
+            "SELECT file_path FROM video_chunks WHERE id = ?1 AND file_path NOT LIKE 'cloud://%'",
+        )
+        .bind(chunk_id)
+        .fetch_optional(&mut *self.acquire_read().await?)
+        .await
+    }
+
+    pub async fn get_video_chunk_time_range(
+        &self,
+        chunk_id: i64,
+    ) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>, SqlxError> {
+        let range: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT MIN(timestamp), MAX(timestamp) FROM frames WHERE video_chunk_id = ?1",
+        )
+        .bind(chunk_id)
+        .fetch_optional(&mut *self.acquire_read().await?)
+        .await?;
+        Ok(range.and_then(|(start, end)| start.zip(end)))
     }
 
     /// Get all frames within a time range for meeting/video export.
@@ -1584,7 +1741,7 @@ impl DatabaseManager {
         )
         .bind(start)
         .bind(end)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *self.acquire_read().await?)
         .await?;
         Ok(rows)
     }
@@ -1632,7 +1789,7 @@ impl DatabaseManager {
         sqlx::query_as::<_, (i64, String, i64, DateTime<Utc>, bool)>(query)
             .bind(frame_id)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.acquire_read().await?)
             .await
     }
 
@@ -1642,19 +1799,29 @@ impl DatabaseManager {
         &self,
         frame_id: i64,
     ) -> Result<Option<String>, sqlx::Error> {
-        let result = sqlx::query_scalar::<_, Option<String>>(
-            r#"
+        self.consistent_read(|| async {
+            if self.storage.is_some() {
+                return Ok(self
+                    .frame_payloads(&[frame_id], crate::storage::Projection::Detail)
+                    .await?
+                    .remove(&frame_id)
+                    .and_then(|p| p.text_json));
+            }
+            let result = sqlx::query_scalar::<_, Option<String>>(
+                r#"
             SELECT text_json
             FROM frames
             WHERE id = ?1
             LIMIT 1
             "#,
-        )
-        .bind(frame_id)
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(frame_id)
+            .fetch_optional(&mut *self.acquire_read().await?)
+            .await?;
 
-        Ok(result.flatten())
+            Ok(result.flatten())
+        })
+        .await
     }
 
     /// Get accessibility data for a frame (accessibility_text, accessibility_tree_json).
@@ -1663,14 +1830,25 @@ impl DatabaseManager {
         &self,
         frame_id: i64,
     ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
-        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT accessibility_text, accessibility_tree_json FROM frames WHERE id = ?1",
-        )
-        .bind(frame_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        self.consistent_read(|| async {
+            if self.storage.is_some() {
+                return Ok(self
+                    .frame_payloads(&[frame_id], crate::storage::Projection::All)
+                    .await?
+                    .remove(&frame_id)
+                    .map(|p| (p.accessibility_text, p.accessibility_tree_json))
+                    .unwrap_or_default());
+            }
+            let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT accessibility_text, accessibility_tree_json FROM frames WHERE id = ?1",
+            )
+            .bind(frame_id)
+            .fetch_optional(&mut *self.acquire_read().await?)
+            .await?;
 
-        Ok(row.unwrap_or((None, None)))
+            Ok(row.unwrap_or((None, None)))
+        })
+        .await
     }
 
     /// Get all OCR text positions with bounding boxes for a specific frame.
@@ -1776,7 +1954,7 @@ impl DatabaseManager {
     pub async fn count_search_results_with_tags_filtered(
         &self,
         query: &str,
-        mut content_type: ContentType,
+        content_type: ContentType,
         start_time: Option<DateTime<Utc>>,
         end_time: Option<DateTime<Utc>>,
         app_name: Option<&str>,
@@ -1794,6 +1972,12 @@ impl DatabaseManager {
         input_context_only: bool,
         tags: &[String],
     ) -> Result<usize, sqlx::Error> {
+        self.consistent_read(|| {
+        let speaker_ids = speaker_ids.clone();
+        let content_type = content_type.clone();
+        async move {
+        let mut content_type = content_type;
+        let full_text_length = if self.storage.is_some() { "frames.payload_full_text_length" } else { "LENGTH(COALESCE(frames.full_text, ''))" };
         // if focused or browser_url is present, we run only on OCR
         if focused.is_some() || browser_url.is_some() {
             content_type = ContentType::OCR;
@@ -1986,8 +2170,8 @@ impl DatabaseManager {
                        {fts_condition}
                        {frame_start_condition}
                        {frame_end_condition}
-                       AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) >= ?4)
-                       AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
+                       AND (?4 IS NULL OR {full_text_length} >= ?4)
+                       AND (?5 IS NULL OR {full_text_length} <= ?5)
                        AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
                        AND (?7 IS NULL OR frames.focused = ?7)
                        AND (json_array_length(?8) = 0 OR frames.id IN (
@@ -2010,7 +2194,7 @@ impl DatabaseManager {
                     ""
                 },
                 a11y_filter = if content_type == ContentType::Accessibility {
-                    "AND frames.accessibility_text IS NOT NULL AND frames.accessibility_text != ''"
+                    if self.storage.is_some() { "AND frames.payload_accessibility_length > 0" } else { "AND frames.accessibility_text IS NOT NULL AND frames.accessibility_text != ''" }
                 } else {
                     ""
                 }
@@ -2206,6 +2390,7 @@ impl DatabaseManager {
         };
 
         Ok(count as usize)
+        }}).await
     }
 
     pub async fn get_latest_timestamps(
@@ -2220,12 +2405,12 @@ impl DatabaseManager {
     > {
         let latest_frame: Option<(DateTime<Utc>,)> =
             sqlx::query_as("SELECT timestamp FROM frames WHERE timestamp IS NOT NULL AND timestamp != '' ORDER BY timestamp DESC LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *self.acquire_read().await?)
                 .await?;
 
         let latest_audio: Option<(DateTime<Utc>,)> =
             sqlx::query_as("SELECT timestamp FROM audio_chunks WHERE timestamp IS NOT NULL AND timestamp != '' ORDER BY timestamp DESC LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *self.acquire_read().await?)
                 .await?;
 
         Ok((latest_frame.map(|f| f.0), latest_audio.map(|a| a.0), None))

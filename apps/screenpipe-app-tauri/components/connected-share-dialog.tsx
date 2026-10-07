@@ -26,6 +26,7 @@ import {
 import posthog from "posthog-js";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Button } from "@/components/ui/button";
+import { ConnectedShareAppIcon } from "@/components/connected-share-app-icon";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
@@ -59,7 +60,9 @@ import {
   renderConnectedShareArtifact,
   renderSlackMessage,
   shareConnectionAvailability,
+  type ConnectedShareApp,
   type ConnectedShareArtifact,
+  type ConnectedShareDestination,
   type ShareConnectionAvailability,
 } from "@/lib/connected-share";
 import {
@@ -76,6 +79,9 @@ import {
   DEFAULT_SLACK_INSTANCE,
   SELF_SLACK_TARGET,
 } from "@/lib/connected-share-send";
+import { useGT } from "gt-react";
+import { useUiLocale } from "@/lib/i18n/provider";
+
 
 /**
  * Where a reviewed snapshot can go.
@@ -89,10 +95,11 @@ import {
  * a glyph that promises a destination. Destinations are now only things this
  * dialog can send to, and `null` means nothing is connected yet.
  */
-type Destination = "slack" | "linear" | "chat-linear" | "chat-notion";
 type ShareMode = "unchanged" | "chat";
 
-function shareModeForDestination(destination: Destination): ShareMode {
+function shareModeForDestination(
+  destination: ConnectedShareDestination,
+): ShareMode {
   return destination.startsWith("chat-") ? "chat" : "unchanged";
 }
 
@@ -121,7 +128,7 @@ type Receipt = {
 
 const EMPTY_AVAILABILITY: ShareConnectionAvailability = {
   direct: { slack: false, linear: false },
-  chat: { linear: false, notion: false },
+  chat: { linear: false, notion: false, obsidian: false },
 };
 
 function slackChannelErrorMessage(error: string): string {
@@ -131,34 +138,12 @@ function slackChannelErrorMessage(error: string): string {
   return `${error} You can still send to your own Slack messages.`;
 }
 
-const CONNECTION_NAME: Record<"slack" | "linear" | "notion", string> = {
+const CONNECTION_NAME: Record<ConnectedShareApp, string> = {
   slack: "Slack",
   linear: "Linear",
   notion: "Notion",
+  obsidian: "Obsidian",
 };
-
-function SlackMark() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
-      <path
-        fill="#E01E5A"
-        d="M5.04 15.16a2.18 2.18 0 01-2.18 2.18A2.18 2.18 0 01.68 15.16a2.18 2.18 0 012.18-2.18h2.18v2.18zm1.09 0a2.18 2.18 0 012.18-2.18 2.18 2.18 0 012.18 2.18v5.45a2.18 2.18 0 01-2.18 2.18 2.18 2.18 0 01-2.18-2.18v-5.45z"
-      />
-      <path
-        fill="#36C5F0"
-        d="M8.31 5.04a2.18 2.18 0 01-2.18-2.18A2.18 2.18 0 018.31.68a2.18 2.18 0 012.18 2.18v2.18H8.31zm0 1.1a2.18 2.18 0 012.18 2.17 2.18 2.18 0 01-2.18 2.18H2.86A2.18 2.18 0 01.68 8.31a2.18 2.18 0 012.18-2.18h5.45z"
-      />
-      <path
-        fill="#2EB67D"
-        d="M18.96 8.31a2.18 2.18 0 012.18-2.18 2.18 2.18 0 012.18 2.18 2.18 2.18 0 01-2.18 2.18h-2.18V8.31zm-1.09 0a2.18 2.18 0 01-2.18 2.18 2.18 2.18 0 01-2.18-2.18V2.86A2.18 2.18 0 0115.69.68a2.18 2.18 0 012.18 2.18v5.45z"
-      />
-      <path
-        fill="#ECB22E"
-        d="M15.69 18.96a2.18 2.18 0 012.18 2.18 2.18 2.18 0 01-2.18 2.18 2.18 2.18 0 01-2.18-2.18v-2.18h2.18zm0-1.09a2.18 2.18 0 01-2.18-2.18 2.18 2.18 0 012.18-2.18h5.45a2.18 2.18 0 012.18 2.18 2.18 2.18 0 01-2.18 2.18h-5.45z"
-      />
-    </svg>
-  );
-}
 
 /**
  * A settled decision, stated in one line, openable when it is wrong.
@@ -224,11 +209,21 @@ export function ConnectedShareDialog({
   open,
   onOpenChange,
   artifact,
+  initialDestination = null,
+  onConnect,
+  connectionsRevision = 0,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   artifact: ConnectedShareArtifact;
+  /** A deliberate app-icon click. Still checked against live availability. */
+  initialDestination?: ConnectedShareDestination | null;
+  /** Host setup can stay over the current workspace without discarding this draft. */
+  onConnect?: (connectionId: ConnectedShareApp) => void;
+  connectionsRevision?: number;
 }) {
+  const uiLocale = useUiLocale();
+  const ui = useGT();
   const { toast } = useToast();
   const allSectionIds = useMemo(
     () => artifact.sections.map((section) => section.id),
@@ -237,7 +232,8 @@ export function ConnectedShareDialog({
   const [selectedSectionIds, setSelectedSectionIds] = useState<string[]>([]);
   const [message, setMessage] = useState("");
   const [slackMessage, setSlackMessage] = useState("");
-  const [destination, setDestination] = useState<Destination | null>(null);
+  const [destination, setDestination] =
+    useState<ConnectedShareDestination | null>(null);
   const [shareMode, setShareMode] = useState<ShareMode | null>(null);
   const [availability, setAvailability] = useState(EMPTY_AVAILABILITY);
   const [connectionsLoading, setConnectionsLoading] = useState(true);
@@ -283,6 +279,28 @@ export function ConnectedShareDialog({
   const pendingRecallRef = useRef<RememberedShare | null>(null);
 
   /**
+   * The last destination each mode held, so the toggle is not destructive.
+   *
+   * Switching mode used to blank the destination whenever the chosen app had
+   * no counterpart on the other side — Obsidian can only be prepared in Chat —
+   * and switching back did not bring it back. Two clicks on a toggle that
+   * describes *how* a snapshot is processed silently discarded *where* it was
+   * going, so the send button fell back to "choose a destination".
+   */
+  const modeDestinationRef = useRef<
+    Record<ShareMode, ConnectedShareDestination | null>
+  >({ unchanged: null, chat: null });
+
+  /** Record a destination against its own mode, for a later switch back. */
+  const rememberModeDestination = useCallback(
+    (next: ConnectedShareDestination | null) => {
+      if (!next) return;
+      modeDestinationRef.current[shareModeForDestination(next)] = next;
+    },
+    [],
+  );
+
+  /**
    * Claim the remembered target for a destination, once.
    *
    * Gated on the destination matching because `target` holds a Slack channel or
@@ -291,7 +309,7 @@ export function ConnectedShareDialog({
    * a failed match is not retried on the next reload.
    */
   const claimRecalledTarget = useCallback(
-    (forDestination: Destination): string | null => {
+    (forDestination: ConnectedShareDestination): string | null => {
       const pending = pendingRecallRef.current;
       if (!pending?.target || pending.destination !== forDestination) {
         return null;
@@ -328,6 +346,7 @@ export function ConnectedShareDialog({
   useEffect(() => {
     if (!open) return;
     pendingRecallRef.current = null;
+    modeDestinationRef.current = { unchanged: null, chat: null };
     resetPreview(allSectionIds);
     setLinearTitle(artifact.title);
     // Stays null until the connection check says what is actually reachable.
@@ -394,12 +413,21 @@ export function ConnectedShareDialog({
           ...(ready.direct.linear ? ["linear"] : []),
           ...(ready.chat.linear ? ["chat-linear"] : []),
           ...(ready.chat.notion ? ["chat-notion"] : []),
+          ...(ready.chat.obsidian ? ["chat-obsidian"] : []),
         ];
-        const nextDestination = preferredShareDestination(
-          remembered,
-          connected,
-        ) as Destination | null;
+        // An icon click is an explicit destination choice. If that connection
+        // disappeared between the header check and this fresh check, leave the
+        // choice blank rather than quietly redirecting the snapshot elsewhere.
+        const nextDestination = initialDestination
+          ? connected.includes(initialDestination)
+            ? initialDestination
+            : null
+          : (preferredShareDestination(
+              remembered,
+              connected,
+            ) as ConnectedShareDestination | null);
         setDestination(nextDestination);
+        rememberModeDestination(nextDestination);
         // Make the data-processing choice visible before the destination menu.
         // When both are possible, unchanged is the lower-authority default;
         // the destination remains unanswered until the person chooses one.
@@ -408,7 +436,7 @@ export function ConnectedShareDialog({
             ? shareModeForDestination(nextDestination)
             : ready.direct.slack || ready.direct.linear
               ? "unchanged"
-              : ready.chat.linear || ready.chat.notion
+              : ready.chat.linear || ready.chat.notion || ready.chat.obsidian
                 ? "chat"
                 : null,
         );
@@ -417,7 +445,9 @@ export function ConnectedShareDialog({
         // the destination is gone, so a revoked Slack connection cannot leave a
         // channel selected under a destination the user has to re-pick anyway.
         pendingRecallRef.current =
-          remembered && nextDestination === remembered.destination
+          !initialDestination &&
+          remembered &&
+          nextDestination === remembered.destination
             ? remembered
             : null;
         // The workspace is safe to apply now: it decides which channel list is
@@ -447,7 +477,14 @@ export function ConnectedShareDialog({
       clearTimeout(timeoutId);
       controller.abort();
     };
-  }, [connectionsRefresh, open]);
+  }, [
+    artifact.surface,
+    connectionsRefresh,
+    connectionsRevision,
+    initialDestination,
+    open,
+    rememberModeDestination,
+  ]);
 
   useEffect(() => {
     if (!open || !availability.direct.slack) return;
@@ -629,7 +666,7 @@ export function ConnectedShareDialog({
     resetPreview(next);
   };
 
-  const destinationLabel = (value: Destination) => {
+  const destinationLabel = (value: ConnectedShareDestination) => {
     if (value === "slack") {
       const channel = slackChannels.find((item) => item.id === slackTarget);
       return channel ? `send to #${channel.name}` : "send to my Slack messages";
@@ -638,9 +675,10 @@ export function ConnectedShareDialog({
       const team = linearTeams.find((item) => item.id === linearTeamId);
       return team ? `create issue in ${team.key}` : "choose a Linear team";
     }
-    if (value === "chat-linear") return "prepare Linear in Chat";
-    if (value === "chat-notion") return "prepare Notion in Chat";
-    return "copy snapshot";
+    if (value === "chat-linear") return "Prepare Linear in Chat";
+    if (value === "chat-notion") return "Prepare Notion in Chat";
+    if (value === "chat-obsidian") return "Prepare Obsidian in Chat";
+    return "Copy snapshot";
   };
 
   /**
@@ -649,7 +687,9 @@ export function ConnectedShareDialog({
    * Only the two direct destinations get one: a `chat-*` handoff has no target
    * until the agent picks one, so naming it here would be a guess.
    */
-  const rememberedTargetLabel = (value: Destination): string | undefined => {
+  const rememberedTargetLabel = (
+    value: ConnectedShareDestination,
+  ): string | undefined => {
     if (value === "slack") {
       const channel = slackChannels.find((item) => item.id === slackTarget);
       return channel ? `#${channel.name}` : "my Slack messages";
@@ -660,8 +700,9 @@ export function ConnectedShareDialog({
     return undefined;
   };
 
-  const selectDestination = (next: Destination) => {
+  const selectDestination = (next: ConnectedShareDestination) => {
     setDestination(next);
+    rememberModeDestination(next);
     setShareMode(shareModeForDestination(next));
     setReceipt(null);
     setActionError(null);
@@ -669,11 +710,15 @@ export function ConnectedShareDialog({
 
   const outgoingMessage = destination === "slack" ? slackMessage : message;
 
-  const openConnection = (connectionId: "slack" | "linear" | "notion") => {
+  const openConnection = (connectionId: ConnectedShareApp) => {
     posthog.capture("connected_share_connection_requested", {
       surface: artifact.surface,
       connection: connectionId,
     });
+    if (onConnect) {
+      onConnect(connectionId);
+      return;
+    }
     onOpenChange(false);
     window.dispatchEvent(
       new CustomEvent("open-settings", {
@@ -694,7 +739,7 @@ export function ConnectedShareDialog({
       instance: slackInstance,
     });
     setReceipt({
-      title: "sent to Slack",
+      title: ui("Sent to Slack"),
       detail: `${result.team || "Slack"} · ${channel ? `#${channel.name}` : "your messages"} · ${result.ts || "delivered"}`,
     });
   };
@@ -708,13 +753,16 @@ export function ConnectedShareDialog({
       description: message,
     });
     setReceipt({
-      title: `created ${issue.identifier || "Linear issue"}`,
+      title: ui("Created {value1}", { value1: issue.identifier || "Linear issue" }),
       detail: `${team.name} · ${issue.title || linearTitle}`,
       url: issue.url,
     });
   };
 
-  const prepareInChat = async (provider: "linear" | "notion") => {
+  const prepareInChat = async (
+    provider: "linear" | "notion" | "obsidian",
+  ) => {
+    const providerName = CONNECTION_NAME[provider];
     await showChatWithPrefill({
       context: JSON.stringify({
         kind: "screenpipe_share_context",
@@ -723,7 +771,7 @@ export function ConnectedShareDialog({
         snapshot: message,
       }),
       prompt: buildConnectedShareChatPrompt(provider),
-      displayLabel: `Share “${artifact.title}” to ${provider === "linear" ? "Linear" : "Notion"}`,
+      displayLabel: `Share “${artifact.title}” to ${providerName}`,
       autoSend: false,
       source: `connected-share-${artifact.surface}`,
       useHomeChat: true,
@@ -751,11 +799,13 @@ export function ConnectedShareDialog({
       if (destination === "linear") await sendToLinear();
       if (destination === "chat-linear") await prepareInChat("linear");
       if (destination === "chat-notion") await prepareInChat("notion");
+      if (destination === "chat-obsidian") await prepareInChat("obsidian");
       // Remember only what landed. A failed send must not train the dialog to
       // reopen on a destination that does not work.
       writeRememberedShare(artifact.surface, {
         destination,
-        target: destination === "slack" ? slackTarget : linearTeamId || undefined,
+        target:
+          destination === "slack" ? slackTarget : linearTeamId || undefined,
         // Recorded here because this is the only place that has both the id and
         // the name. A control offering to send here again can then say exactly
         // where without a lookup.
@@ -770,7 +820,7 @@ export function ConnectedShareDialog({
         });
         toast({
           title:
-            destination === "slack" ? "sent to Slack" : "Linear issue created",
+            destination === "slack" ? ui("Sent to Slack") : ui("Linear issue created"),
         });
       }
     } catch (error) {
@@ -783,7 +833,7 @@ export function ConnectedShareDialog({
         error instanceof Error ? error.message : "The action did not complete.";
       setActionError(message);
       toast({
-        title: "couldn't complete sharing",
+        title: ui("Couldn't complete sharing"),
         description: message,
         variant: "destructive",
       });
@@ -804,17 +854,9 @@ export function ConnectedShareDialog({
     !availability.direct.slack ? "slack" : null,
     !availability.direct.linear && !availability.chat.linear ? "linear" : null,
     !availability.chat.notion ? "notion" : null,
-  ].filter((id): id is "slack" | "linear" | "notion" => id !== null);
-  const noConnectedShareApps = missingConnectionIds.length === 3;
-
-  const LinearMark = () => (
-    // eslint-disable-next-line @next/next/no-img-element
-    <img src="/images/linear.svg" alt="" className="h-4 w-4" />
-  );
-  const NotionMark = () => (
-    // eslint-disable-next-line @next/next/no-img-element
-    <img src="/images/notion.svg" alt="" className="h-4 w-4 dark:invert" />
-  );
+    !availability.chat.obsidian ? "obsidian" : null,
+  ].filter((id): id is ConnectedShareApp => id !== null);
+  const noConnectedShareApps = missingConnectionIds.length === 4;
 
   /**
    * Destinations, grouped by the only distinction that changes what happens.
@@ -825,43 +867,58 @@ export function ConnectedShareDialog({
    * without reading which kind it is.
    */
   const directOptions: Array<{
-    value: Destination;
+    value: ConnectedShareDestination;
     name: string;
     icon: React.ReactNode;
   }> = [
     ...(availability.direct.slack
-      ? [{ value: "slack" as Destination, name: "Slack", icon: <SlackMark /> }]
+      ? [
+          {
+            value: "slack" as const,
+            name: "Slack",
+            icon: <ConnectedShareAppIcon app="slack" />,
+          },
+        ]
       : []),
     ...(availability.direct.linear
       ? [
           {
-            value: "linear" as Destination,
+            value: "linear" as const,
             name: "Linear",
-            icon: <LinearMark />,
+            icon: <ConnectedShareAppIcon app="linear" />,
           },
         ]
       : []),
   ];
   const chatOptions: Array<{
-    value: Destination;
+    value: ConnectedShareDestination;
     name: string;
     icon: React.ReactNode;
   }> = [
     ...(availability.chat.linear
       ? [
           {
-            value: "chat-linear" as Destination,
+            value: "chat-linear" as const,
             name: "Linear",
-            icon: <LinearMark />,
+            icon: <ConnectedShareAppIcon app="linear" />,
           },
         ]
       : []),
     ...(availability.chat.notion
       ? [
           {
-            value: "chat-notion" as Destination,
+            value: "chat-notion" as const,
             name: "Notion",
-            icon: <NotionMark />,
+            icon: <ConnectedShareAppIcon app="notion" />,
+          },
+        ]
+      : []),
+    ...(availability.chat.obsidian
+      ? [
+          {
+            value: "chat-obsidian" as const,
+            name: "Obsidian",
+            icon: <ConnectedShareAppIcon app="obsidian" />,
           },
         ]
       : []),
@@ -875,16 +932,26 @@ export function ConnectedShareDialog({
 
   const selectShareMode = (nextMode: ShareMode) => {
     const nextOptions = nextMode === "chat" ? chatOptions : directOptions;
-    const currentStillFits =
-      destination !== null &&
-      shareModeForDestination(destination) === nextMode &&
-      nextOptions.some((option) => option.value === destination);
+    // Hold the connection this mode is leaving, so coming back is a switch and
+    // not a re-pick. Every app belongs to exactly one mode — Slack only sends
+    // unchanged, Obsidian and Notion only prepare in Chat, and Linear is one
+    // or the other depending on whether it arrived over MCP — so the toggle
+    // cannot carry an app across. What it can do is stop destroying the choice
+    // on the side it left.
+    rememberModeDestination(destination);
+    const remembered = modeDestinationRef.current[nextMode];
+    const rememberedStillFits =
+      remembered && nextOptions.some((option) => option.value === remembered)
+        ? remembered
+        : null;
+    // Choosing a mode is not permission to choose among several external
+    // targets. Auto-select only when the mode has exactly one possible app.
+    const nextDestination =
+      rememberedStillFits ??
+      (nextOptions.length === 1 ? nextOptions[0].value : null);
     setShareMode(nextMode);
-    if (!currentStillFits) {
-      // Choosing a mode is not permission to choose among several external
-      // targets. Auto-select only when the mode has exactly one possible app.
-      setDestination(nextOptions.length === 1 ? nextOptions[0].value : null);
-    }
+    setDestination(nextDestination);
+    rememberModeDestination(nextDestination);
     setReceipt(null);
     setActionError(null);
     posthog.capture("connected_share_mode_selected", {
@@ -901,9 +968,9 @@ export function ConnectedShareDialog({
   // The second line of the destination row: which channel, team, or nothing.
   const currentTarget =
     destination === "slack"
-      ? (slackChannels.find((item) => item.id === slackTarget)?.name
-          ? `#${slackChannels.find((item) => item.id === slackTarget)?.name}`
-          : "my messages")
+      ? slackChannels.find((item) => item.id === slackTarget)?.name
+        ? `#${slackChannels.find((item) => item.id === slackTarget)?.name}`
+        : "my messages"
       : destination === "linear"
         ? (linearTeams.find((item) => item.id === linearTeamId)?.name ??
           "choose a team")
@@ -924,24 +991,26 @@ export function ConnectedShareDialog({
           ? "prepare Linear in Chat"
           : destination === "chat-notion"
             ? "prepare Notion in Chat"
-            : hasAnyDestination
-              ? "choose a destination"
-              : "connect an app to send";
+            : destination === "chat-obsidian"
+              ? "prepare Obsidian in Chat"
+              : hasAnyDestination
+                ? "choose a destination"
+                : "connect an app to send";
 
   const contentsSummary = `${
     selectedSectionIds.length === artifact.sections.length
       ? `all ${artifact.sections.length} blocks`
       : `${selectedSectionIds.length} of ${artifact.sections.length} blocks`
-  } · ${outgoingMessage.length.toLocaleString()} characters`;
+  } · ${outgoingMessage.length.toLocaleString(uiLocale)} characters`;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-h-[calc(100vh-2rem)] max-w-lg gap-4 overflow-y-auto rounded-none [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/40 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/60"
+        className="max-h-[calc(100vh-2rem)] max-w-lg gap-4 overflow-y-auto rounded-lg [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/40 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/60"
         data-testid="connected-share-dialog"
       >
         <DialogHeader>
-          <DialogTitle>send snapshot</DialogTitle>
+          <DialogTitle>Send snapshot</DialogTitle>
           <DialogDescription>
             A frozen copy of “{artifact.title}”.
           </DialogDescription>
@@ -952,7 +1021,7 @@ export function ConnectedShareDialog({
             className="flex items-center gap-1.5 text-xs text-muted-foreground"
             role="status"
           >
-            <Loader2 className="h-3.5 w-3.5 animate-spin" /> checking connected
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking connected
             apps
           </p>
         )}
@@ -967,7 +1036,7 @@ export function ConnectedShareDialog({
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
               <div>
                 <p className="font-medium">
-                  connected apps could not be checked
+                  Connected apps could not be checked
                 </p>
                 <p className="mt-0.5 text-muted-foreground">
                   {connectionsError} Retry, or use copy on the rule above.
@@ -978,10 +1047,10 @@ export function ConnectedShareDialog({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 rounded-none px-2"
+              className="h-7 rounded-md px-2"
               onClick={() => setConnectionsRefresh((value) => value + 1)}
             >
-              <RefreshCw className="mr-1 h-3 w-3" /> retry
+              <RefreshCw className="mr-1 h-3 w-3" /> Retry
             </Button>
           </div>
         )}
@@ -997,7 +1066,7 @@ export function ConnectedShareDialog({
               <div
                 className="grid grid-cols-2 border border-border"
                 data-testid="connected-share-mode"
-                aria-label="how to send"
+                aria-label={ui("How to send")}
               >
                 <button
                   type="button"
@@ -1011,7 +1080,7 @@ export function ConnectedShareDialog({
                   }`}
                 >
                   <span className="block text-xs font-medium">
-                    send unchanged
+                    Send unchanged
                   </span>
                   <span
                     className={`mt-0.5 block text-[10px] leading-snug ${
@@ -1020,7 +1089,7 @@ export function ConnectedShareDialog({
                         : "text-muted-foreground"
                     }`}
                   >
-                    exact frozen copy · no new AI processing
+                    Exact frozen copy · no new AI processing
                   </span>
                 </button>
                 <button
@@ -1035,7 +1104,7 @@ export function ConnectedShareDialog({
                   }`}
                 >
                   <span className="flex items-center gap-1 text-xs font-medium">
-                    <Sparkles className="h-3 w-3" /> review in Chat
+                    <Sparkles className="h-3 w-3" /> Review in Chat
                   </span>
                   <span
                     className={`mt-0.5 block text-[10px] leading-snug ${
@@ -1059,7 +1128,7 @@ export function ConnectedShareDialog({
                   <span className="flex min-w-0 items-center gap-2">
                     {currentOption?.icon}
                     <span className="shrink-0 text-sm">
-                      {currentOption?.name ?? "no destination"}
+                      {currentOption?.name ?? ui("No destination")}
                     </span>
                     <span className="shrink-0 text-muted-foreground">·</span>
                     <span className="truncate text-xs text-muted-foreground">
@@ -1067,7 +1136,7 @@ export function ConnectedShareDialog({
                     </span>
                   </span>
                   <span className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
-                    change
+                    Change
                     <ChevronDown className="h-3 w-3" />
                   </span>
                 </button>
@@ -1075,8 +1144,8 @@ export function ConnectedShareDialog({
               <DropdownMenuContent align="start" className="w-72">
                 {shareMode !== "chat" && directOptions.length > 0 && (
                   <>
-                    <DropdownMenuLabel className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                      send unchanged
+                    <DropdownMenuLabel className="font-mono text-[10px] normal-case tracking-[0.12em] text-muted-foreground">
+                      Send unchanged
                     </DropdownMenuLabel>
                     {directOptions.map((option) => (
                       <DropdownMenuItem
@@ -1096,8 +1165,8 @@ export function ConnectedShareDialog({
                 )}
                 {shareMode === "chat" && chatOptions.length > 0 && (
                   <>
-                    <DropdownMenuLabel className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                      review in Chat
+                    <DropdownMenuLabel className="font-mono text-[10px] normal-case tracking-[0.12em] text-muted-foreground">
+                      Review in Chat
                     </DropdownMenuLabel>
                     {chatOptions.map((option) => (
                       <DropdownMenuItem
@@ -1130,7 +1199,7 @@ export function ConnectedShareDialog({
                         className="gap-2 text-xs text-muted-foreground"
                       >
                         <Plus className="h-3.5 w-3.5" />
-                        connect {CONNECTION_NAME[id]}
+                        Connect {CONNECTION_NAME[id]}
                       </DropdownMenuItem>
                     ))}
                   </>
@@ -1172,7 +1241,7 @@ export function ConnectedShareDialog({
             {slackInstances.length > 1 && (
               <div className="space-y-1.5">
                 <label className="text-xs text-muted-foreground">
-                  workspace
+                  Workspace
                 </label>
                 <Select
                   value={slackInstance}
@@ -1182,7 +1251,7 @@ export function ConnectedShareDialog({
                     setActionError(null);
                   }}
                 >
-                  <SelectTrigger className="h-9 rounded-none text-xs">
+                  <SelectTrigger className="h-9 rounded-md text-xs">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1199,7 +1268,7 @@ export function ConnectedShareDialog({
               </div>
             )}
             <div className="space-y-1.5">
-              <label className="text-xs text-muted-foreground">channel</label>
+              <label className="text-xs text-muted-foreground">Channel</label>
               <Select
                 value={slackTarget}
                 onValueChange={(value) => {
@@ -1208,16 +1277,16 @@ export function ConnectedShareDialog({
                   setActionError(null);
                 }}
               >
-                <SelectTrigger className="h-9 rounded-none text-xs">
+                <SelectTrigger className="h-9 rounded-md text-xs">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={SELF_SLACK_TARGET}>
-                    my Slack messages
+                    My Slack messages
                   </SelectItem>
                   {slackChannels.map((channel) => (
                     <SelectItem key={channel.id} value={channel.id}>
-                      {channel.is_private ? "private · " : "#"}
+                      {channel.is_private ? ui("Private · ") : "#"}
                       {channel.name}
                     </SelectItem>
                   ))}
@@ -1225,7 +1294,7 @@ export function ConnectedShareDialog({
               </Select>
               {slackChannelsLoading && (
                 <p className="flex items-center gap-1 text-[10px] text-muted-foreground">
-                  <Loader2 className="h-3 w-3 animate-spin" /> loading channels
+                  <Loader2 className="h-3 w-3 animate-spin" /> Loading channels
                 </p>
               )}
               {slackChannelsError && (
@@ -1240,7 +1309,7 @@ export function ConnectedShareDialog({
                     className="underline underline-offset-2"
                     onClick={() => setSlackRefresh((value) => value + 1)}
                   >
-                    retry
+                    Retry
                   </button>
                 </p>
               )}
@@ -1251,7 +1320,7 @@ export function ConnectedShareDialog({
         {destination === "linear" && (
           <div className="grid gap-3 sm:grid-cols-[12rem_1fr]">
             <div className="space-y-1.5">
-              <label className="text-xs text-muted-foreground">team</label>
+              <label className="text-xs text-muted-foreground">Team</label>
               <Select
                 value={linearTeamId}
                 onValueChange={(value) => {
@@ -1260,10 +1329,10 @@ export function ConnectedShareDialog({
                   setActionError(null);
                 }}
               >
-                <SelectTrigger className="h-9 rounded-none text-xs">
+                <SelectTrigger className="h-9 rounded-md text-xs">
                   <SelectValue
                     placeholder={
-                      linearTeamsLoading ? "loading teams" : "choose team"
+                      linearTeamsLoading ? ui("Loading teams") : ui("Choose team")
                     }
                   />
                 </SelectTrigger>
@@ -1287,14 +1356,14 @@ export function ConnectedShareDialog({
                     className="shrink-0 underline"
                     onClick={() => setLinearRefresh((value) => value + 1)}
                   >
-                    retry
+                    Retry
                   </button>
                 </div>
               )}
             </div>
             <div className="space-y-1.5">
               <label className="text-xs text-muted-foreground">
-                issue title
+                Issue title
               </label>
               <Input
                 value={linearTitle}
@@ -1304,7 +1373,7 @@ export function ConnectedShareDialog({
                   setReceipt(null);
                   setActionError(null);
                 }}
-                className="h-9 rounded-none text-xs"
+                className="h-9 rounded-md text-xs"
               />
             </div>
           </div>
@@ -1317,7 +1386,7 @@ export function ConnectedShareDialog({
         <div className="border-y border-border/60">
           {artifact.sections.length > 1 && (
             <SummaryRow
-              label="contents"
+              label={ui("Contents")}
               value={contentsSummary}
               action="edit"
               open={contentsOpen}
@@ -1344,7 +1413,7 @@ export function ConnectedShareDialog({
           )}
 
           <SummaryRow
-            label="message"
+            label={ui("Message")}
             value={
               currentIsChat
                 ? "what Chat will review"
@@ -1364,13 +1433,13 @@ export function ConnectedShareDialog({
                   className="text-[11px] text-muted-foreground"
                 >
                   {destination === "slack"
-                    ? "edits here apply only to Slack"
-                    : "edit before sending"}
+                    ? ui("Edits here apply only to Slack")
+                    : ui("Edit before sending")}
                 </label>
                 <span
                   className={`text-[10px] tabular-nums ${outgoingMessage.length > 39_000 ? "text-destructive" : "text-muted-foreground"}`}
                 >
-                  {outgoingMessage.length.toLocaleString()} / 39,000
+                  {outgoingMessage.length.toLocaleString(uiLocale)} / 39,000
                 </span>
               </div>
               <Textarea
@@ -1433,7 +1502,7 @@ export function ConnectedShareDialog({
           >
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
             <div>
-              <p className="font-medium">the action did not complete</p>
+              <p className="font-medium">The action did not complete</p>
               <p className="mt-0.5 text-muted-foreground">{actionError}</p>
               <p className="mt-1 text-muted-foreground">
                 No success was recorded. Review the destination and try again.
@@ -1459,10 +1528,10 @@ export function ConnectedShareDialog({
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 rounded-none px-2"
+                className="h-7 rounded-md px-2"
                 onClick={() => void openExternal(receipt.url as string)}
               >
-                open <ExternalLink className="ml-1 h-3 w-3" />
+                Open <ExternalLink className="ml-1 h-3 w-3" />
               </Button>
             )}
           </div>
@@ -1472,14 +1541,14 @@ export function ConnectedShareDialog({
           <Button
             type="button"
             variant="ghost"
-            className="rounded-none"
+            className="rounded-md"
             onClick={() => onOpenChange(false)}
           >
-            close
+            Close
           </Button>
           <Button
             type="button"
-            className="rounded-none"
+            className="rounded-md"
             data-testid="connected-share-confirm"
             disabled={!canSubmit || sending}
             onClick={() => void submit()}

@@ -108,6 +108,34 @@ fn conversation_fixture_preserves_sender_relationships() {
 }
 
 #[test]
+fn nested_task_wrappers_keep_leaf_tasks_and_independent_siblings() {
+    let source = serde_json::json!({
+        "app": { "platform": "windows", "executable": "Todoist.exe", "display_name": "Todoist" },
+        "nodes": [
+            { "parent": null, "role": "Window" },
+            { "parent": 0, "role": "Group", "classes": ["task-row"] },
+            { "parent": 1, "role": "Text", "value": "Container label" },
+            { "parent": 1, "role": "Group" },
+            { "parent": 3, "role": "Group", "classes": ["task-row"] },
+            { "parent": 4, "role": "Text", "value": "First child" },
+            { "parent": 3, "role": "Group", "classes": ["task-row"] },
+            { "parent": 6, "role": "Text", "value": "Second child" },
+            { "parent": 0, "role": "Group", "classes": ["task-row"] },
+            { "parent": 8, "role": "Text", "value": "Independent sibling" }
+        ]
+    })
+    .to_string();
+    let items = handled(&source, "family.task");
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.title.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["First child", "Second child", "Independent sibling"]
+    );
+}
+
+#[test]
 fn mail_fixture_extracts_subject_sender_and_body() {
     let items = handled(
         include_str!("fixtures/families/gmail_thread.json"),
@@ -117,6 +145,116 @@ fn mail_fixture_extracts_subject_sender_and_body() {
     assert_eq!(items[0].title.as_deref(), Some("Release blocked"));
     assert_eq!(items[1].actor.as_deref(), Some("Alice"));
     assert_eq!(items[1].body.as_deref(), Some("Please retry signing."));
+}
+
+#[test]
+fn additional_mail_clients_use_the_structural_family_parser() {
+    let clients = [
+        (
+            "Thunderbird",
+            serde_json::json!({
+                "platform": "windows",
+                "app_id": null,
+                "executable": "thunderbird.exe",
+                "display_name": "Thunderbird",
+                "version": null,
+                "browser_url": null
+            }),
+        ),
+        (
+            "Proton Mail",
+            serde_json::json!({
+                "platform": "macos",
+                "app_id": "ch.protonmail.desktop",
+                "executable": "Proton Mail",
+                "display_name": "Proton Mail",
+                "version": null,
+                "browser_url": null
+            }),
+        ),
+        (
+            "Fastmail",
+            serde_json::json!({
+                "platform": "macos",
+                "app_id": null,
+                "executable": "Safari",
+                "display_name": "Safari",
+                "version": null,
+                "browser_url": "https://app.fastmail.com/mail/Inbox/example"
+            }),
+        ),
+        (
+            "HEY",
+            serde_json::json!({
+                "platform": "windows",
+                "app_id": null,
+                "executable": "chrome.exe",
+                "display_name": "Chrome",
+                "version": null,
+                "browser_url": "https://app.hey.com/topics/example"
+            }),
+        ),
+    ];
+
+    for (client, app) in clients {
+        let source = serde_json::json!({
+            "app": app,
+            "nodes": [
+                { "parent": null, "role": "Window", "title": format!("Parser update - {client}") },
+                { "parent": 0, "role": "Document" },
+                { "parent": 1, "role": "Heading", "classes": ["thread-title"], "title": "Parser update" },
+                { "parent": 1, "role": "Group", "classes": ["email-message"] },
+                { "parent": 3, "role": "Text", "classes": ["sender"], "value": "Dana" },
+                { "parent": 3, "role": "Group", "classes": ["message-body"] },
+                { "parent": 5, "role": "Text", "value": "Please review the mail parser." }
+            ]
+        })
+        .to_string();
+        let items = handled(&source, "family.mail");
+        assert_eq!(items[0].title.as_deref(), Some("Parser update"), "{client}");
+        assert_eq!(items[1].actor.as_deref(), Some("Dana"), "{client}");
+        assert_eq!(
+            items[1].body.as_deref(),
+            Some("Please review the mail parser."),
+            "{client}"
+        );
+    }
+}
+
+#[test]
+fn proton_mail_extracts_its_native_message_structure() {
+    let source = r#"{
+        "app": {
+            "platform": "macos",
+            "app_id": "ch.protonmail.desktop",
+            "executable": "Proton Mail",
+            "display_name": "Proton Mail",
+            "version": null,
+            "browser_url": null
+        },
+        "nodes": [
+            { "parent": null, "role": "AXWebArea" },
+            { "parent": 0, "role": "AXHeading", "text": "Parser update" },
+            { "parent": 0, "role": "AXGroup", "classes": ["message-container"] },
+            { "parent": 2, "role": "AXGroup", "classes": ["message-header", "message-header-collapsed"] },
+            { "parent": 3, "role": "AXGroup", "classes": ["message-header-recipient-labels"] },
+            { "parent": 4, "role": "AXStaticText", "text": "Dana" },
+            { "parent": 2, "role": "AXGroup", "classes": ["message-content"] },
+            { "parent": 6, "role": "AXStaticText", "text": "Please review the Proton parser." }
+        ]
+    }"#;
+    let items = handled(source, "family.mail");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].title.as_deref(), Some("Parser update"));
+    assert_eq!(
+        items[0].metadata.get("surface").map(String::as_str),
+        Some("proton_message")
+    );
+    assert_eq!(items[1].actor.as_deref(), Some("Dana"));
+    assert_eq!(
+        items[1].body.as_deref(),
+        Some("Please review the Proton parser.")
+    );
 }
 
 #[test]

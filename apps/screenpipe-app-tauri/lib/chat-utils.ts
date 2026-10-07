@@ -6,10 +6,19 @@
 // Shared chat utilities - mention parsing, shortcut formatting, app suggestions
 // ============================================================================
 
+import { msg } from "gt-react";
+import { englishUiMessage, type UiMessage } from "@/lib/i18n/message";
+
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { commands } from "@/lib/utils/tauri";
 import { useChatStore } from "@/lib/stores/chat-store";
+import {
+  BUILTIN_COMPOSER_COMMANDS,
+  type ComposerCommandId,
+} from "@/lib/composer-commands";
+
+export type { ComposerCommandId } from "@/lib/composer-commands";
 
 /**
  * Detect if content is app-injected metadata (not real user content).
@@ -104,7 +113,11 @@ export function extractInjectedUserText(value?: string | null): string | null {
  * render as "untitled" instead of leaking the raw blob into the sidebar.
  */
 export function isInjectedTitle(value?: string | null): value is string {
-  return isConversationHistorySyncPrompt(value) || isConnectionsContextPrompt(value);
+  if (typeof value !== "string") return false;
+  const trimmed = value.trimStart();
+  return trimmed.startsWith("<conversation_history>")
+    || trimmed.startsWith("<connections_context>")
+    || trimmed.startsWith("<screenpipe-system-context>");
 }
 
 // ============================================================================
@@ -123,6 +136,8 @@ export interface ChatPrefillData {
   source?: string;
   /** Open the Home window chat instead of the Chat overlay. */
   useHomeChat?: boolean;
+  /** Show this local artifact beside the editable composer. */
+  filePreviewPath?: string;
 }
 
 export type ChatTargetWindow = "home" | "chat";
@@ -520,7 +535,7 @@ function parseExplicitTimeRanges(input: string, now: Date): {
     return {
       start,
       end: new Date(startOfThisWeek.getTime() - 1),
-      label: "previous week",
+      label: "Previous week",
     };
   });
 
@@ -528,7 +543,7 @@ function parseExplicitTimeRanges(input: string, now: Date): {
     const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const end = new Date(now.getFullYear(), now.getMonth(), 1);
     end.setMilliseconds(-1);
-    return { start, end, label: "previous month" };
+    return { start, end, label: "Previous month" };
   });
 
   consume(new RegExp(`~(${MONTH_PATTERN})(\\d{4})\\b`, "gi"), (match) => {
@@ -767,7 +782,7 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
     timeRanges.push({
       start: options.selectionRange.start,
       end: options.selectionRange.end,
-      label: "selected range",
+      label: "Selected range",
       sourceToken: "@selection",
     });
     cleanedInput = cleanedInput.replace(selectionPattern, "").trim();
@@ -780,7 +795,7 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
       getRange: () => {
         const start = new Date(now);
         start.setHours(0, 0, 0, 0);
-        return { start, end: now, label: "today" };
+        return { start, end: now, label: "Today" };
       },
     },
     {
@@ -791,7 +806,7 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
         start.setHours(0, 0, 0, 0);
         const end = new Date(start);
         end.setHours(23, 59, 59, 999);
-        return { start, end, label: "yesterday" };
+        return { start, end, label: "Yesterday" };
       },
     },
     {
@@ -800,7 +815,7 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
         const start = new Date(now);
         start.setDate(start.getDate() - 7);
         start.setHours(0, 0, 0, 0);
-        return { start, end: now, label: "last week" };
+        return { start, end: now, label: "Last week" };
       },
     },
     {
@@ -810,14 +825,14 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
         start.setHours(6, 0, 0, 0);
         const end = new Date(now);
         end.setHours(12, 0, 0, 0);
-        return { start, end: now < end ? now : end, label: "this morning" };
+        return { start, end: now < end ? now : end, label: "This morning" };
       },
     },
     {
       pattern: /@last[- ]?hour\b/gi,
       getRange: () => {
         const start = new Date(now.getTime() - 60 * 60 * 1000);
-        return { start, end: now, label: "last hour" };
+        return { start, end: now, label: "Last hour" };
       },
     },
   ];
@@ -948,6 +963,8 @@ export interface MentionSuggestion {
   conversationId?: string;
   /** Present only on `/` entries. Picking one runs an action instead of inserting text. */
   commandId?: ComposerCommandId;
+  /** Extra registry terms, such as aliases and groups, used only for filtering. */
+  searchTerms?: readonly string[];
 }
 
 export function mentionSuggestionIdentity(suggestion: MentionSuggestion): string {
@@ -995,7 +1012,7 @@ export function buildChatMentionSuggestions(
     .map((item) => ({
       tag: `@chat:${item.id}`,
       label: item.title.trim() || "untitled",
-      description: "previous chat",
+      description: "Previous chat",
       category: "chat" as const,
       conversationId: item.id,
     }));
@@ -1037,15 +1054,15 @@ export function buildSkillMentionSuggestions(
 }
 
 export const TIME_RANGE_MENTION_SUGGESTIONS: MentionSuggestion[] = [
-  { tag: "~7days", description: "rolling past 7 days", category: "range" },
-  { tag: "~lastweek", description: "previous Monday–Sunday", category: "range" },
-  { tag: "~lastmonth", description: "previous calendar month", category: "range" },
-  { tag: "~april", description: "most recent April", category: "range" },
-  { tag: "~april2025", description: "April 2025", category: "range" },
-  { tag: "~(03/04/2025)", description: "one day (DD/MM/YYYY)", category: "range" },
+  { tag: "~7days", description: msg("Rolling past 7 days"), category: "range" },
+  { tag: "~lastweek", description: msg("Previous Monday–Sunday"), category: "range" },
+  { tag: "~lastmonth", description: msg("Previous calendar month"), category: "range" },
+  { tag: "~april", description: msg("Most recent April"), category: "range" },
+  { tag: "~april2025", description: msg("April 2025"), category: "range" },
+  { tag: "~(03/04/2025)", description: msg("One day (DD/MM/YYYY)"), category: "range" },
   {
     tag: "~(03/04/2025 - 06/07/2025)",
-    description: "inclusive range (DD/MM/YYYY)",
+    description: msg("Inclusive range (DD/MM/YYYY)"),
     category: "range",
   },
 ];
@@ -1080,66 +1097,40 @@ export function buildAppMentionSuggestions(
 
 export function buildTagMentionSuggestions(
   items: AppAutocompleteItem[],
-  limit: number
+  limit: number,
+  ui: UiMessage = englishUiMessage,
 ): MentionSuggestion[] {
   return items.slice(0, limit).map((item) => ({
     tag: `#${item.name}`,
-    description: formatTagAutocompleteDescription(item),
+    description: formatTagAutocompleteDescription(item, ui),
     category: "tag" as const,
   }));
 }
 
-function pluralize(count: number, singular: string, plural = `${singular}s`) {
-  return `${count} ${count === 1 ? singular : plural}`;
-}
-
-function formatTagAutocompleteDescription(item: AppAutocompleteItem) {
+function formatTagAutocompleteDescription(item: AppAutocompleteItem, ui: UiMessage) {
   const parts = [
-    item.frame_count ? pluralize(item.frame_count, "frame") : null,
-    item.audio_count ? pluralize(item.audio_count, "audio clip") : null,
-    item.memory_count ? pluralize(item.memory_count, "memory", "memories") : null,
+    item.frame_count ? ui(msg("{count, plural, one {# frame} other {# frames}}"), { count: item.frame_count }) : null,
+    item.audio_count ? ui(msg("{count, plural, one {# audio clip} other {# audio clips}}"), { count: item.audio_count }) : null,
+    item.memory_count ? ui(msg("{count, plural, one {# memory} other {# memories}}"), { count: item.memory_count }) : null,
   ].filter((part): part is string => Boolean(part));
 
   if (parts.length > 0) return parts.join(", ");
-  return pluralize(item.count, "use");
+  return ui(msg("{count, plural, one {# use} other {# uses}}"), { count: item.count });
 }
-
-export type ComposerCommandId = "new-chat" | "stop" | "inspector" | "pipes";
 
 /**
  * `/` entries run an action rather than inserting a token. Ordered the way they
  * are offered, so the first row is the one a bare `/` most likely wants.
  */
-export const COMPOSER_COMMAND_SUGGESTIONS: MentionSuggestion[] = [
-  {
-    tag: "/new",
-    label: "/new",
-    description: "start a new chat",
-    category: "command",
-    commandId: "new-chat",
-  },
-  {
-    tag: "/stop",
-    label: "/stop",
-    description: "stop the current response",
-    category: "command",
-    commandId: "stop",
-  },
-  {
-    tag: "/inspector",
-    label: "/inspector",
-    description: "toggle the inspector panel",
-    category: "command",
-    commandId: "inspector",
-  },
-  {
-    tag: "/pipes",
-    label: "/pipes",
-    description: "open scheduled tasks",
-    category: "command",
-    commandId: "pipes",
-  },
-];
+export const COMPOSER_COMMAND_SUGGESTIONS: MentionSuggestion[] =
+  BUILTIN_COMPOSER_COMMANDS.map((command) => ({
+    tag: command.invocation,
+    label: command.invocation,
+    description: command.description,
+    category: "command" as const,
+    commandId: command.id,
+    searchTerms: [command.title, command.group, ...command.aliases],
+  }));
 
 export type MentionTrigger = "@" | "#" | "$" | "~" | "/";
 
@@ -1149,7 +1140,7 @@ export function findComposerMention(
   // Anchored to position 0 on purpose: a slash only opens the palette when the
   // message starts with it. Otherwise `03/04` and `src/lib` would open a menu
   // mid-sentence.
-  const commandMatch = textBeforeCursor.match(/^\/([\w-]*)$/);
+  const commandMatch = textBeforeCursor.match(/^\/([\w.-]*)$/);
   if (commandMatch) {
     return { trigger: "/", filter: commandMatch[1] };
   }
@@ -1164,6 +1155,33 @@ export function findComposerMention(
   };
 }
 
+export function replaceComposerMentionAtCursor({
+  input,
+  cursorPos,
+  trigger,
+  replacement,
+}: {
+  input: string;
+  cursorPos: number;
+  trigger: MentionTrigger;
+  replacement: string;
+}): string {
+  const safeCursorPos = Math.max(0, Math.min(cursorPos, input.length));
+  const textBeforeCursor = input.slice(0, safeCursorPos);
+  const textAfterCursor = input.slice(safeCursorPos);
+  const mentionIndex =
+    trigger === "/"
+      ? 0
+      : Math.max(
+          textBeforeCursor.lastIndexOf("@"),
+          textBeforeCursor.lastIndexOf("#"),
+          textBeforeCursor.lastIndexOf("$"),
+          textBeforeCursor.lastIndexOf("~"),
+        );
+  if (mentionIndex === -1) return input;
+  return `${textBeforeCursor.slice(0, mentionIndex)}${replacement} ${textAfterCursor}`;
+}
+
 export interface FilterMentionSuggestionsOptions {
   mentionTrigger: MentionTrigger;
   mentionFilter: string;
@@ -1171,6 +1189,7 @@ export interface FilterMentionSuggestionsOptions {
   recentChatSuggestions?: MentionSuggestion[];
   skillMentionSuggestions?: MentionSuggestion[];
   timeRangeMentionSuggestions?: MentionSuggestion[];
+  commandSuggestions?: MentionSuggestion[];
   tagMentionSuggestions: MentionSuggestion[];
   allTagMentionSuggestions: MentionSuggestion[];
   tagSearchSuggestions: MentionSuggestion[];
@@ -1185,6 +1204,7 @@ export function filterMentionSuggestions({
   recentChatSuggestions = [],
   skillMentionSuggestions = [],
   timeRangeMentionSuggestions = [],
+  commandSuggestions = COMPOSER_COMMAND_SUGGESTIONS,
   tagMentionSuggestions,
   allTagMentionSuggestions,
   tagSearchSuggestions,
@@ -1195,10 +1215,14 @@ export function filterMentionSuggestions({
   const matchesFilter = (suggestion: MentionSuggestion) =>
     suggestion.tag.toLowerCase().includes(filter) ||
     suggestion.label?.toLowerCase().includes(filter) ||
-    suggestion.description.toLowerCase().includes(filter);
+    suggestion.description.toLowerCase().includes(filter) ||
+    suggestion.searchTerms?.some((term) => term.toLowerCase().includes(filter));
 
   if (mentionTrigger === "/") {
-    return COMPOSER_COMMAND_SUGGESTIONS.filter(matchesFilter);
+    return [
+      ...commandSuggestions,
+      ...skillMentionSuggestions,
+    ].filter(matchesFilter);
   }
 
   if (mentionTrigger === "#") {

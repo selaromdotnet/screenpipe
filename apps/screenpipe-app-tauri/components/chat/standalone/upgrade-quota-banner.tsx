@@ -11,13 +11,16 @@ import {
   formatAllowanceReset,
   formatResetTime,
   formatUsagePercent,
-  useUsageStatus,
+  useUsageStatusQuery,
 } from "@/lib/hooks/use-usage-status";
 import { useModelUpsellGating } from "@/lib/hooks/use-model-upsell-gating";
 import { clearQuotaUpgrade, useQuotaUpgrade } from "@/lib/chat/quota-upgrade";
+import { presetUsesHostedAllowance } from "@/lib/chat/model-allowance-cost";
 import { openExternalUrl } from "@/lib/open-external-url";
 import { openBusinessUpgradeSurface } from "@/lib/upgrade-flow";
 import { quotaPlanLabel } from "@/lib/chat/quota-errors";
+import type { AIPreset } from "@/lib/utils/tauri";
+import { useGT } from "gt-react";
 
 
 /**
@@ -33,8 +36,15 @@ import { quotaPlanLabel } from "@/lib/chat/quota-errors";
  * To reproduce the exhausted state on demand without burning real quota, see
  * the dev force-flag in use-usage-status.tsx.
  */
-export function UpgradeQuotaBanner() {
-  const usage = useUsageStatus();
+export function UpgradeQuotaBanner({
+  activePreset,
+}: {
+  activePreset: AIPreset | null | undefined;
+}) {
+
+  const ui = useGT();
+  const usesHostedAllowance = presetUsesHostedAllowance(activePreset);
+  const usage = useUsageStatusQuery(usesHostedAllowance).usage;
   const upsellEnabled = useModelUpsellGating(usage?.upgrade_eligible);
   const blockedUpgrade = useQuotaUpgrade();
   const [dismissed, setDismissed] = useState(false);
@@ -55,6 +65,10 @@ export function UpgradeQuotaBanner() {
     ? usage?.hosted_ai?.upgrade ?? null
     : null;
   const serverBlocked = cloudflareBlocked || legacyCostBlocked;
+
+  // Account allowance state is irrelevant when the current preset bypasses
+  // Screenpipe Cloud. That includes Cursor and other own-account ACP routes.
+  if (!usesHostedAllowance) return null;
 
   if (!blockedUpgrade) {
     if (dismissed) return null;
@@ -95,8 +109,6 @@ export function UpgradeQuotaBanner() {
         ? "hosted-ai-cost-limit-banner"
         : "ai-quota-banner";
   const activeUpgrade = blockedUpgrade ?? polledUpgrade;
-  const showUpgradeAction =
-    activeUpgrade !== null || (!blockedUpgrade && !serverBlocked);
 
   const onUpgrade = async () => {
     if (busy) return;
@@ -155,15 +167,17 @@ export function UpgradeQuotaBanner() {
             <div className="font-medium">
               {blockedUpgrade || serverBlocked
                 ? blockedTitle
-                : "You're out of premium AI for today."}
+                : ui("You're out of premium AI for today.")}
             </div>
             <div className="mt-0.5 text-muted-foreground">
               {cloudflareBlocked ? (
                 <>
                   {formatUsagePercent(cloudflareAllowance.used_percent)} used
-                  {weeklyAllowance ? " this week." : "."}
-                  {resets ? ` Resets ${resets}.` : " Usage falls as the window moves."}{" "}
-                  {activeUpgrade ? "Switch to Auto or upgrade." : "Switch to Auto."}
+                  {weeklyAllowance ? ui(" this week.") : "."}
+                  {resets ? ui(" Resets {value1}.", { value1: resets }) : ui(" Usage falls as the window moves.")}{" "}
+                  {activeUpgrade
+                    ? ui("Switch to Auto or upgrade.")
+                    : ui("Switch to Auto or view plans.")}
                 </>
               ) : legacyCostBlocked ? (
                 activeUpgrade ? (
@@ -176,35 +190,35 @@ export function UpgradeQuotaBanner() {
                 )
               ) : blockedUpgrade ? (
                 <>
-                  {resets ? `Resets ${resets}. ` : ""}
+                  {resets ? ui("Resets {value1}. ", { value1: resets }) : ""}
                   Upgrade to {requiredPlanProse} for a higher limit, or switch to a
                   local or own-key AI preset.
                 </>
               ) : (
-                <>Free models still work{resets ? ` · resets ${resets}` : ""}.</>
+                <>Free models still work{resets ? ui(" · resets {value1}", { value1: resets }) : ""}.</>
               )}
             </div>
           </div>
           <span className="flex shrink-0 items-center gap-1.5">
-            {showUpgradeAction && (
-              <Button
-                type="button"
-                size="sm"
-                variant="default"
-                className="h-7 border-[#4A6B00] bg-[#C7FF3E] text-[12px] text-black hover:border-black hover:bg-black hover:text-[#C7FF3E]"
-                onClick={onUpgrade}
-                disabled={busy}
-              >
-                {/* Name where the click actually goes. With no server upgrade
-                    this opens the Business offer, so it says so; only an
-                    upgrade to a plan this build cannot name is generic. */}
-                {requiredPlanLabel
-                  ? `Upgrade to ${requiredPlanLabel}`
-                  : activeUpgrade
-                    ? "See plans"
-                    : "View Business"}
-              </Button>
-            )}
+            <Button
+              type="button"
+              size="sm"
+              variant="default"
+              className="h-7 border-foreground bg-foreground text-[12px] text-background hover:bg-background hover:text-foreground"
+              onClick={onUpgrade}
+              disabled={busy}
+            >
+              {/* Name where the click actually goes. A server-provided target
+                  stays exact; a terminal or older response opens Account
+                  without inventing a higher plan. */}
+              {requiredPlanLabel
+                ? ui("Upgrade to {value1}", { value1: requiredPlanLabel })
+                : activeUpgrade
+                  ? ui("See plans")
+                  : serverBlocked
+                    ? ui("View plans")
+                    : ui("View Business")}
+            </Button>
             <button
               type="button"
               onClick={() => {
@@ -215,7 +229,7 @@ export function UpgradeQuotaBanner() {
                 }
               }}
               className="ml-0.5 shrink-0 text-muted-foreground/50 transition-colors hover:text-foreground"
-              aria-label="dismiss AI usage notice"
+              aria-label={ui("Dismiss AI usage notice")}
             >
               <X className="h-3.5 w-3.5" />
             </button>

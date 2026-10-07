@@ -31,14 +31,17 @@ function safeJson(value: unknown): string {
 }
 
 function safeToolInput(value: unknown): Record<string, any> {
+	let parsed = value;
 	if (typeof value === 'string') {
 		try {
-			return JSON.parse(value);
+			parsed = JSON.parse(value);
 		} catch {
 			return {};
 		}
 	}
-	return (value && typeof value === 'object') ? value as Record<string, any> : {};
+	return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+		? parsed as Record<string, any>
+		: {};
 }
 
 function anthropicStopReasonToOpenAI(reason: unknown): string {
@@ -584,13 +587,15 @@ export class AnthropicProvider implements AIProvider {
 		return {
 			choices: [
 				{
+					finish_reason: anthropicStopReasonToOpenAI(response.stop_reason),
 					message: {
 						content: textContent,
 						role: 'assistant',
 						tool_calls: response.content
 							.filter((block): block is ContentBlock => block.type === 'tool_use')
 							.map((block) => ({
-								type: block.type,
+								id: (block as any).id,
+								type: 'function',
 								function: {
 									name: (block as any).name,
 									arguments: JSON.stringify((block as any).input),

@@ -25,11 +25,16 @@ const EXPECTED_TARGETS: &[&str] = &[
     "codex",
     "cursor",
     "discord",
+    "fastmail",
     "fantastical",
     "gemini_desktop",
     "geminiweb",
     "ghostty",
+    "github",
+    "gitlab",
     "gmail",
+    "hackernews",
+    "hey",
     "iterm2",
     "mail",
     "messages",
@@ -45,18 +50,21 @@ const EXPECTED_TARGETS: &[&str] = &[
     "obsidian",
     "omnifocus",
     "pages",
+    "protonmail",
     "slack",
     "sparkdesktop",
     "sparkmailclassic",
     "superhuman",
     "terminal",
     "textedit",
+    "thunderbird",
     "todoist",
     "toggl",
     "vscode",
     "warp",
     "whatsapp",
     "whatsapp_web",
+    "wikipedia",
     "windowsconsole",
     "windowsterminal",
     "windsurf",
@@ -84,21 +92,21 @@ fn identity_for(profile: &screenpipe_semantic::parsers::BuiltinAppProfile) -> Ap
 }
 
 #[test]
-fn catalog_exactly_matches_all_52_targets() {
+fn catalog_exactly_matches_all_60_targets() {
     let actual: BTreeSet<_> = builtin_app_profiles()
         .iter()
         .map(|profile| profile.id)
         .collect();
     let expected: BTreeSet<_> = EXPECTED_TARGETS.iter().copied().collect();
-    assert_eq!(builtin_app_profiles().len(), 52);
-    assert_eq!(actual.len(), 52, "profile ids must be unique");
+    assert_eq!(builtin_app_profiles().len(), 60);
+    assert_eq!(actual.len(), 60, "profile ids must be unique");
     assert_eq!(actual, expected);
 }
 
 #[test]
 fn every_profile_has_identity_family_and_bounded_registry_coverage() {
     let registry = builtin_parser_registry().expect("built-in manifests must compile");
-    assert_eq!(registry.len(), 23);
+    assert_eq!(registry.len(), 27);
     for profile in builtin_app_profiles() {
         assert!(!profile.families.is_empty(), "{} has no family", profile.id);
         let unique_families: HashSet<_> = profile.families.iter().copied().collect();
@@ -143,7 +151,11 @@ fn every_profile_has_identity_family_and_bounded_registry_coverage() {
         ));
         assert_eq!(
             plan.parser_ids.len(),
-            profile.families.len() + override_count,
+            if matches!(profile.id, "github" | "gitlab" | "hackernews" | "wikipedia") {
+                1
+            } else {
+                profile.families.len() + override_count
+            },
             "{} matched unexpected parser candidates",
             profile.id
         );

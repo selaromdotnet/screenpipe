@@ -51,7 +51,10 @@ function ContextualSuggestions({
   isRefreshing,
   onFillSuggestion,
   onRefresh,
-}: Omit<HomeStarterSurfaceProps, "summaryCardsProps">) {
+  onPreviewPrompt,
+}: Omit<HomeStarterSurfaceProps, "summaryCardsProps"> & {
+  onPreviewPrompt?: (prompt: string | null) => void;
+}) {
   const visibleSuggestions = suggestions.slice(0, 3);
   const impressionSignature = visibleSuggestions
     .map((suggestion) =>
@@ -74,6 +77,11 @@ function ContextualSuggestions({
     // change. Prompt text is deliberately never sent to analytics.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activityMode, impressionSignature]);
+
+  useEffect(
+    () => () => onPreviewPrompt?.(null),
+    [onPreviewPrompt],
+  );
 
   return (
     <div className="ph-no-capture relative flex w-full flex-col items-center px-4 pb-2 pt-6">
@@ -112,7 +120,12 @@ function ContextualSuggestions({
                 type="button"
                 data-testid={`home-contextual-suggestion-${index + 1}`}
                 title={suggestion.preview || suggestion.text}
+                onMouseEnter={() => onPreviewPrompt?.(suggestion.text)}
+                onMouseLeave={() => onPreviewPrompt?.(null)}
+                onFocus={() => onPreviewPrompt?.(suggestion.text)}
+                onBlur={() => onPreviewPrompt?.(null)}
                 onClick={() => {
+                  onPreviewPrompt?.(null);
                   posthog.capture("home_card_clicked", {
                     ...suggestionAnalyticsProperties(
                       suggestion,
@@ -157,14 +170,14 @@ function ContextualSuggestions({
           onRefresh();
         }}
         disabled={isLoading || isRefreshing}
-        className="mt-3 inline-flex cursor-pointer items-center gap-1.5 border border-border/30 px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground transition-all duration-150 hover:border-foreground hover:bg-foreground hover:text-background disabled:cursor-default disabled:opacity-40"
+        className="mt-3 inline-flex cursor-pointer items-center gap-1.5 border border-border/30 px-2 py-1 text-[10px] font-medium normal-case tracking-wide text-muted-foreground transition-all duration-150 hover:border-foreground hover:bg-foreground hover:text-background disabled:cursor-default disabled:opacity-40"
       >
         <RefreshCw
           className={`h-3 w-3 ${isRefreshing ? "animate-spin motion-reduce:animate-none" : ""}`}
           strokeWidth={1.5}
           aria-hidden
         />
-        refresh
+        Refresh
       </button>
     </div>
   );
@@ -197,6 +210,7 @@ export function HomeStarterSurface({
       isRefreshing={isRefreshing}
       onFillSuggestion={onFillSuggestion}
       onRefresh={onRefresh}
+      onPreviewPrompt={summaryCardsProps.onPreviewPrompt}
     />
   );
 }

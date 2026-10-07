@@ -9,10 +9,12 @@ pub mod artifacts;
 pub mod audio;
 pub mod browser;
 pub mod capture;
+pub mod cloud_agents;
 pub mod cloud_proxy;
 pub mod connect_broker;
 pub mod content;
 pub mod data;
+pub mod data_sync_proxy;
 pub mod elements;
 pub mod frames;
 pub mod health;
@@ -38,3 +40,12 @@ pub mod vault;
 pub mod vision;
 pub mod web_search;
 pub mod websocket;
+
+pub mod workflows;
+
+pub mod workflow_catalog;
+pub mod workflow_edits;
+pub mod workflow_pipeline;
+pub(crate) mod workflow_workspace;
+
+pub mod starred;

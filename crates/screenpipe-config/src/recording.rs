@@ -4,7 +4,37 @@
 
 //! The core recording settings type shared across all screenpipe components.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// The auth-token migration scrubs a JWT-shaped legacy `userId` by persisting
+/// JSON `null`. Keep the historical empty-string sentinel when that store is
+/// read back without accepting nulls for unrelated recording settings.
+fn deserialize_null_user_id_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Older desktop builds persisted a single selected monitor as a string, while
+/// current builds persist an array. Accept both shapes so an upgrade preserves
+/// the user's selection instead of rejecting the entire settings store.
+fn deserialize_monitor_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Vec(Vec<String>),
+        String(String),
+    }
+
+    Ok(match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Vec(ids) => ids,
+        StringOrVec::String(id) => vec![id],
+    })
+}
 
 /// Custom vocabulary entry for transcription biasing and word replacement.
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
@@ -54,12 +84,44 @@ impl<'de> Deserialize<'de> for VocabEntry {
     }
 }
 
+/// A production settings store contains a weekday name, while the current UI
+/// persists Monday as 0 through Sunday as 6. Accept the seven unambiguous names
+/// without weakening validation for other strings.
+fn deserialize_day_of_week<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumberOrName {
+        Number(u8),
+        Name(String),
+    }
+
+    match NumberOrName::deserialize(deserializer)? {
+        NumberOrName::Number(day) => Ok(day),
+        NumberOrName::Name(name) => match name.to_ascii_lowercase().as_str() {
+            "monday" => Ok(0),
+            "tuesday" => Ok(1),
+            "wednesday" => Ok(2),
+            "thursday" => Ok(3),
+            "friday" => Ok(4),
+            "saturday" => Ok(5),
+            "sunday" => Ok(6),
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown weekday name {name:?}"
+            ))),
+        },
+    }
+}
+
 /// A single schedule rule: a day-of-week + time range + what to record.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleRule {
     /// Day of week: 0 = Monday, 6 = Sunday
+    #[serde(deserialize_with = "deserialize_day_of_week")]
     pub day_of_week: u8,
     /// Start time in "HH:MM" (24h format, local time)
     pub start_time: String,
@@ -105,6 +167,99 @@ impl SemanticContextMode {
     pub const fn includes_computer_use(self) -> bool {
         matches!(self, Self::ComputerUse | Self::Both)
     }
+}
+
+/// Scroll checkpoint frequency, independent of text extraction, image quality and audio.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingDetail {
+    #[default]
+    Auto,
+    LowImpact,
+    Balanced,
+    MoreDetail,
+}
+
+/// One strict hostname rule used by browser capture allowlists and blocklists.
+///
+/// `domain` is normalized by the capture policy before matching. The rule
+/// always matches the domain itself; `include_subdomains` extends the match to
+/// descendant hosts, except descendants rooted at `excluded_subdomains`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub struct DomainRule {
+    pub domain: String,
+    #[serde(default)]
+    pub include_subdomains: bool,
+    #[serde(default)]
+    pub excluded_subdomains: Vec<String>,
+}
+
+/// A browser URL block rule.
+///
+/// Strings are the legacy `ignoredUrls` format and keep their historical
+/// domain matching behavior. Structured rules provide explicit exact-domain,
+/// subdomain, and exception semantics without introducing a second setting.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(untagged)]
+pub enum UrlRule {
+    Legacy(String),
+    Structured(DomainRule),
+}
+
+fn invalid_domain_rule() -> DomainRule {
+    DomainRule {
+        domain: String::new(),
+        include_subdomains: false,
+        excluded_subdomains: Vec::new(),
+    }
+}
+
+/// Preserve malformed structured policies as an invalid sentinel. The runtime
+/// policy compiler recognizes the empty hostname and fails capture closed;
+/// rejecting the whole settings store here could make a caller fall back to
+/// defaults and accidentally widen capture.
+fn deserialize_domain_rules_fail_closed<'de, D>(
+    deserializer: D,
+) -> Result<Vec<DomainRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(values) = value.as_array() else {
+        return Ok(vec![invalid_domain_rule()]);
+    };
+    Ok(values
+        .iter()
+        .map(|value| {
+            serde_json::from_value::<DomainRule>(value.clone())
+                .unwrap_or_else(|_| invalid_domain_rule())
+        })
+        .collect())
+}
+
+/// Accept both the historical string array and structured rules in the same
+/// `ignoredUrls` field. Invalid structured values become a sentinel so the
+/// runtime fails capture closed instead of silently discarding a privacy rule.
+fn deserialize_url_rules_fail_closed<'de, D>(deserializer: D) -> Result<Vec<UrlRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(values) = value.as_array() else {
+        return Ok(vec![UrlRule::Structured(invalid_domain_rule())]);
+    };
+
+    Ok(values
+        .iter()
+        .map(|value| {
+            serde_json::from_value::<UrlRule>(value.clone())
+                .unwrap_or_else(|_| UrlRule::Structured(invalid_domain_rule()))
+        })
+        .collect())
 }
 
 /// The single source of truth for recording/capture configuration.
@@ -181,10 +336,10 @@ pub struct RecordingSettings {
     )]
     pub experimental_coreaudio_system_audio: bool,
 
-    /// Beta ("Smart recording" in the app): during detected meetings, capture
+    /// Automatic meeting capture: during detected meetings, capture
     /// the meeting app's own audio via a per-process tap plus the microphone
     /// that app actually has open (instead of the global mix + assumed-default
-    /// mic). Default `false`. Takes precedence over everything: it engages in
+    /// mic). Default `true`. Takes precedence over everything: it engages in
     /// ANY `audio_capture_mode` (continuous or meetings-only) and displaces
     /// the configured devices for the meeting's duration. Requires macOS 14.4+
     /// or Windows, plus the meeting detector (with `disable_meeting_detector`
@@ -202,10 +357,10 @@ pub struct RecordingSettings {
     /// link out of A2DP into SCO, degrading the user's headphone/speaker
     /// output quality (48kHz stereo -> 24kHz stereo or mono HFP, depending on
     /// hardware) — a macOS/OS-level tradeoff with no external workaround
-    /// (issue #3750). Default `false`: Bluetooth input devices are only
-    /// actually opened while a meeting is detected; outside a meeting they
-    /// stay enabled-but-gated (selected in settings, not streaming) so the
-    /// Bluetooth link stays in A2DP. Set `true` to always record Bluetooth
+    /// (issue #3750). Default `false`: automatically selected Bluetooth inputs
+    /// are opened only during meetings, keeping A2DP outside meetings. A
+    /// manually selected device or explicit device-start request is exempt.
+    /// Set `true` to always record automatically selected Bluetooth
     /// mics regardless of meeting state (prior behavior). Has no effect on
     /// wired/built-in/unrecognized mics, on Bluetooth output devices, or on a
     /// dedicated Bluetooth microphone with no output side of its own (macOS:
@@ -248,7 +403,8 @@ pub struct RecordingSettings {
     pub filter_music: bool,
 
     /// Maximum batch duration in seconds for batch transcription.
-    /// None = use engine-aware defaults (Deepgram=5000s, OpenAI=3000s, Whisper=600s).
+    /// None or zero = use the audio engine's default. Overrides apply only to
+    /// OpenAI-compatible endpoints, including meeting retranscription.
     /// Also controls the max deferral cap during active meetings.
     #[serde(rename = "batchMaxDurationSecs", default)]
     pub batch_max_duration_secs: Option<u64>,
@@ -284,15 +440,14 @@ pub struct RecordingSettings {
     #[serde(rename = "semanticContextMode", default)]
     pub semantic_context_mode: SemanticContextMode,
 
-    /// Disable the timeline / rewind feature. When true, the engine skips
-    /// timeline-only work: warming the hot frame cache from the DB at startup
-    /// and buffering captured frames/audio into the in-memory hot cache that
-    /// only the timeline streaming endpoint reads.
+    /// Legacy timeline gate retained for managed deployments and compatibility.
+    /// Consumer installs migrate visibility to sidebarNavLayout. Screenshot
+    /// capture controls cache work through `timeline_cache_disabled`.
     #[serde(rename = "disableTimeline", default)]
     pub disable_timeline: bool,
 
     /// Specific monitor IDs to capture.
-    #[serde(rename = "monitorIds")]
+    #[serde(rename = "monitorIds", deserialize_with = "deserialize_monitor_ids")]
     pub monitor_ids: Vec<String>,
 
     /// Capture from all connected monitors.
@@ -302,6 +457,13 @@ pub struct RecordingSettings {
     /// Video quality preset: "low", "balanced", "high", "max".
     #[serde(rename = "videoQuality")]
     pub video_quality: String,
+
+    /// Max width (px) of the macOS screen capture that OCR reads. 0 = native;
+    /// nonzero values below 1280 are raised to 1280. Stored snapshots use the
+    /// smaller of this width and the `videoQuality` width. Other platforms
+    /// always capture native.
+    #[serde(rename = "captureMaxWidth", default)]
+    pub capture_max_width: u32,
 
     /// Maximum width for stored snapshots. Images wider than this are downscaled
     /// (preserving aspect ratio) before JPEG encoding. 0 = no limit (store at
@@ -437,9 +599,23 @@ pub struct RecordingSettings {
     #[serde(rename = "includedWindows")]
     pub included_windows: Vec<String>,
 
-    /// URLs to exclude from capture.
-    #[serde(rename = "ignoredUrls", default)]
-    pub ignored_urls: Vec<String>,
+    /// Browser URLs to exclude from capture. Existing string entries remain
+    /// supported; new entries can use explicit structured domain rules.
+    #[serde(
+        rename = "ignoredUrls",
+        default,
+        deserialize_with = "deserialize_url_rules_fail_closed"
+    )]
+    pub ignored_urls: Vec<UrlRule>,
+
+    /// Strict browser hostname allowlist. Browser windows without a positively
+    /// detected matching URL are skipped; native apps follow app/window rules.
+    #[serde(
+        rename = "includedUrls",
+        default,
+        deserialize_with = "deserialize_domain_rules_fail_closed"
+    )]
+    pub included_urls: Vec<DomainRule>,
 
     /// Automatically detect and skip incognito / private browsing windows.
     #[serde(rename = "ignoreIncognitoWindows")]
@@ -459,18 +635,24 @@ pub struct RecordingSettings {
     pub pause_on_drm_content: bool,
 
     /// Skip persisting clipboard rows/content in the UI recorder. Defaults to
-    /// `true` (clipboard DB capture OFF) — passwords / API keys / private keys
-    /// frequently pass through the clipboard. Clipboard operations can still
+    /// `false` in enterprise builds and `true` in consumer builds.
+    /// Clipboard operations can still
     /// wake event-driven capture when `captureOnClipboard` is enabled.
-    #[serde(rename = "disableClipboardCapture", default = "default_true")]
+    #[serde(
+        rename = "disableClipboardCapture",
+        default = "default_disable_input_capture"
+    )]
     pub disable_clipboard_capture: bool,
 
     /// Skip persisting keyboard / typed-text rows in the UI recorder.
-    /// Defaults to `true` (keyboard DB capture OFF). Keyboard events still
-    /// wake event-driven capture, and the accessibility tree + OCR still
+    /// Defaults to `false` in enterprise builds and `true` in consumer builds.
+    /// Keyboard events still wake event-driven capture, and the accessibility tree + OCR still
     /// capture on-screen text so Rewind/Ask keep working.
     /// Opt in to keyboard DB rows via the "Capture keyboard" toggle.
-    #[serde(rename = "disableKeyboardCapture", default = "default_true")]
+    #[serde(
+        rename = "disableKeyboardCapture",
+        default = "default_disable_input_capture"
+    )]
     pub disable_keyboard_capture: bool,
 
     /// Skip persisting mouse-click rows in the UI recorder. Defaults to
@@ -499,9 +681,9 @@ pub struct RecordingSettings {
     /// `frames.accessibility_text`, and `ui_events.text_content`. Raw
     /// secrets are gone after the worker processes the row — that's
     /// the contract of the user-facing "AI PII removal" toggle.
-    /// Off by default; capture path is unaffected either way. See
+    /// On by default in enterprise builds; capture path is unaffected. See
     /// `screenpipe-redact` for the full design.
-    #[serde(rename = "asyncPiiRedaction", default)]
+    #[serde(rename = "asyncPiiRedaction", default = "default_ai_pii_redaction")]
     pub async_pii_redaction: bool,
 
     /// Strip secrets from coding-agent (pi) session logs at rest. The
@@ -515,23 +697,25 @@ pub struct RecordingSettings {
     #[serde(rename = "redactAgentSessionSecrets", default)]
     pub redact_agent_session_secrets: bool,
 
-    /// Enable image-PII redaction on captured screen frames. When
-    /// `true`, the `screenpipe_redact::image::worker` runs alongside
-    /// the text reconciliation worker, scans the `frames` table, runs
-    /// the RF-DETR-Nano detector, and blacks out detected PII regions
-    /// in each JPG (atomic overwrite of the source file). Off by
-    /// default — orthogonal to `async_pii_redaction` (text path),
-    /// independently togglable. Requires the `screenpipe-redact`
-    /// crate to be built with one of the `onnx-*` cargo features and
-    /// the `rfdetr_v8.onnx` model present at `~/.screenpipe/models/`.
-    #[serde(rename = "asyncImagePiiRedaction", default)]
+    /// Enable image-PII redaction on captured screen frames. The image
+    /// worker scans the `frames` table and blacks out detected PII regions
+    /// in each JPG (atomic overwrite of the source file), using `pii_backend`.
+    /// On by default in enterprise builds, independently of text redaction.
+    /// The local backend requires an `onnx-*` cargo feature and the
+    /// `rfdetr_v8.onnx` model at `~/.screenpipe/models/`.
+    #[serde(
+        rename = "asyncImagePiiRedaction",
+        default = "default_ai_pii_redaction"
+    )]
     pub async_image_pii_redaction: bool,
 
     /// Where the AI PII redaction actually runs. One switch flips
     /// BOTH modalities (text + image) because the user-facing
     /// "AI PII removal" toggle is one knob.
     ///
-    /// - `"local"` (default): on-device ONNX models. Privacy by
+    /// Enterprise builds default to `"tinfoil"`; consumer builds default to `"local"`.
+    ///
+    /// - `"local"`: on-device ONNX models. Privacy by
     ///   construction — pixels and text never leave the box. Slower,
     ///   especially on weak hardware (~1-3 s per text row, ~60-180 ms
     ///   per frame).
@@ -597,7 +781,10 @@ pub struct RecordingSettings {
     // ── Cloud / Auth ───────────────────────────────────────────────────
     /// Screenpipe cloud user ID. Empty string means not logged in.
     /// Kept as String (not Option) to match existing store.bin schema.
-    #[serde(rename = "userId")]
+    #[serde(
+        rename = "userId",
+        deserialize_with = "deserialize_null_user_id_as_default"
+    )]
     pub user_id: String,
 
     /// Display name for speaker identification.
@@ -639,6 +826,10 @@ pub struct RecordingSettings {
     /// Previously stored in SettingsStore.extra["powerMode"].
     #[serde(rename = "powerMode", default)]
     pub power_mode: Option<String>,
+
+    /// Controls scroll checkpoint frequency without changing text extraction.
+    #[serde(rename = "recordingDetail", default)]
+    pub recording_detail: RecordingDetail,
 
     /// Keep the computer awake while screenpipe is running.
     /// Default off so existing installs keep the OS sleep behavior they chose.
@@ -700,6 +891,12 @@ pub struct RecordingSettings {
 }
 
 impl RecordingSettings {
+    /// Avoid background frame/audio buffering when screenshots are off. Saved
+    /// history remains available through the timeline's database fallback.
+    pub fn timeline_cache_disabled(&self) -> bool {
+        self.disable_timeline || self.disable_screenshots || self.disable_vision
+    }
+
     /// Returns the Deepgram API key if actually configured.
     /// Treats empty string and "default" as not configured (matching existing behavior).
     pub fn effective_deepgram_key(&self) -> Option<&str> {
@@ -753,7 +950,7 @@ impl Default for RecordingSettings {
             audio_devices: vec![],
             use_system_default_audio: true,
             experimental_coreaudio_system_audio: false,
-            experimental_meeting_piggyback: false,
+            experimental_meeting_piggyback: default_experimental_meeting_piggyback(),
             always_record_bluetooth_mic: false,
             windows_input_aec_enabled: false,
             macos_input_vpio_enabled: false,
@@ -772,6 +969,7 @@ impl Default for RecordingSettings {
             monitor_ids: vec![],
             use_all_monitors: true,
             video_quality: "balanced".to_string(),
+            capture_max_width: 0,
             max_snapshot_width: default_max_snapshot_width(),
             disable_snapshot_compaction: false,
             disable_meeting_detector: false,
@@ -791,18 +989,19 @@ impl Default for RecordingSettings {
             ignored_windows: vec![],
             included_windows: vec![],
             ignored_urls: vec![],
+            included_urls: vec![],
             ignore_incognito_windows: true,
             enhanced_incognito_detection: false,
             pause_on_drm_content: false,
-            disable_clipboard_capture: true,
-            disable_keyboard_capture: true,
+            disable_clipboard_capture: default_disable_input_capture(),
+            disable_keyboard_capture: default_disable_input_capture(),
             disable_click_capture: false,
             record_while_locked: false,
             languages: vec![],
-            use_pii_removal: false,
-            async_pii_redaction: false,
+            use_pii_removal: default_ai_pii_redaction(),
+            async_pii_redaction: default_ai_pii_redaction(),
             redact_agent_session_secrets: false,
-            async_image_pii_redaction: false,
+            async_image_pii_redaction: default_ai_pii_redaction(),
             pii_backend: default_pii_backend(),
             pii_redaction_labels: default_pii_redaction_labels(),
             pii_redaction_columns: default_pii_redaction_columns(),
@@ -816,6 +1015,7 @@ impl Default for RecordingSettings {
             openai_compatible_raw_audio: false,
             port: 3030,
             power_mode: None,
+            recording_detail: RecordingDetail::Auto,
             keep_computer_awake: false,
             use_chinese_mirror: false,
             analytics_enabled: true,
@@ -829,6 +1029,10 @@ impl Default for RecordingSettings {
             listen_on_lan: false,
         }
     }
+}
+
+fn default_disable_input_capture() -> bool {
+    !cfg!(feature = "enterprise-build")
 }
 
 fn default_true() -> bool {
@@ -851,11 +1055,9 @@ fn default_experimental_coreaudio_system_audio() -> bool {
     false
 }
 
-/// Default OFF. The per-process tap must prove itself in the field behind this
-/// opt-in before it becomes the default capture choice (rollout decision
-/// 2026-07-01). Flip deliberately, in its own PR, with TESTING.md updated.
-fn default_experimental_meeting_piggyback() -> bool {
-    false
+/// Meeting capture is automatic; the backend checks platform support.
+pub fn default_experimental_meeting_piggyback() -> bool {
+    true
 }
 
 fn default_max_snapshot_width() -> u32 {
@@ -870,8 +1072,16 @@ fn default_pause_extraction_on_input_ms() -> u64 {
     150
 }
 
+fn default_ai_pii_redaction() -> bool {
+    cfg!(feature = "enterprise-build")
+}
+
 fn default_pii_backend() -> String {
-    "local".to_string()
+    if cfg!(feature = "enterprise-build") {
+        "tinfoil".to_string()
+    } else {
+        "local".to_string()
+    }
 }
 
 /// Default redaction allow-list: secrets only. The safety baseline —
@@ -916,6 +1126,75 @@ fn default_hd_recording_interval_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pii_defaults_follow_build_and_preserve_explicit_choices() {
+        let enterprise = cfg!(feature = "enterprise-build");
+        let defaults = RecordingSettings::default();
+        let missing: RecordingSettings = serde_json::from_str("{}").unwrap();
+        for settings in [defaults, missing] {
+            assert_eq!(settings.use_pii_removal, enterprise);
+            assert_eq!(settings.async_pii_redaction, enterprise);
+            assert_eq!(settings.async_image_pii_redaction, enterprise);
+            assert_eq!(
+                settings.pii_backend,
+                if enterprise { "tinfoil" } else { "local" }
+            );
+        }
+        for enabled in [true, false] {
+            for backend in ["local", "tinfoil"] {
+                let settings: RecordingSettings = serde_json::from_value(serde_json::json!({
+                    "usePiiRemoval": enabled,
+                    "asyncPiiRedaction": enabled,
+                    "asyncImagePiiRedaction": enabled,
+                    "piiBackend": backend,
+                }))
+                .unwrap();
+                assert_eq!(settings.use_pii_removal, enabled);
+                assert_eq!(settings.async_pii_redaction, enabled);
+                assert_eq!(settings.async_image_pii_redaction, enabled);
+                assert_eq!(settings.pii_backend, backend);
+            }
+        }
+    }
+
+    #[test]
+    fn input_capture_defaults_follow_build_and_preserve_explicit_choices() {
+        let disabled = !cfg!(feature = "enterprise-build");
+        let defaults = RecordingSettings::default();
+        let missing: RecordingSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        for settings in [defaults, missing] {
+            assert_eq!(settings.disable_clipboard_capture, disabled);
+            assert_eq!(settings.disable_keyboard_capture, disabled);
+        }
+        for explicit in [true, false] {
+            let settings: RecordingSettings = serde_json::from_value(serde_json::json!({
+                "disableClipboardCapture": explicit,
+                "disableKeyboardCapture": explicit,
+            }))
+            .unwrap();
+            assert_eq!(settings.disable_clipboard_capture, explicit);
+            assert_eq!(settings.disable_keyboard_capture, explicit);
+        }
+    }
+
+    #[test]
+    fn screenshot_capture_controls_timeline_cache() {
+        for (timeline, screenshots, vision, expected) in [
+            (false, false, false, false),
+            (false, true, false, true),
+            (false, false, true, true),
+            (true, false, false, true),
+        ] {
+            let settings = super::RecordingSettings {
+                disable_timeline: timeline,
+                disable_screenshots: screenshots,
+                disable_vision: vision,
+                ..Default::default()
+            };
+            assert_eq!(settings.timeline_cache_disabled(), expected);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -940,6 +1219,73 @@ mod tests {
         assert!(!settings.macos_input_vpio_enabled);
         assert_eq!(settings.aec_mode, AecMode::Off);
         assert_eq!(settings.effective_aec_flags(), (false, false, false));
+        assert!(settings.ignored_urls.is_empty());
+        assert!(settings.included_urls.is_empty());
+    }
+
+    #[test]
+    fn structured_domain_rules_deserialize_and_round_trip() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+                "ignoredUrls": ["legacy.example", {
+                    "domain": "admin.worktrace.ai",
+                    "includeSubdomains": true,
+                    "excludedSubdomains": []
+                }],
+                "includedUrls": [{
+                    "domain": "worktrace.ai",
+                    "includeSubdomains": true,
+                    "excludedSubdomains": ["abc.worktrace.ai"]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.ignored_urls[0],
+            UrlRule::Legacy("legacy.example".to_string())
+        );
+        assert_eq!(
+            settings.ignored_urls[1],
+            UrlRule::Structured(DomainRule {
+                domain: "admin.worktrace.ai".to_string(),
+                include_subdomains: true,
+                excluded_subdomains: vec![],
+            })
+        );
+        assert_eq!(settings.included_urls[0].domain, "worktrace.ai");
+        assert_eq!(
+            settings.included_urls[0].excluded_subdomains,
+            vec!["abc.worktrace.ai"]
+        );
+
+        let round_trip: RecordingSettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(round_trip.included_urls[0].domain, "worktrace.ai");
+    }
+
+    #[test]
+    fn malformed_domain_rule_survives_as_fail_closed_sentinel() {
+        let json = r#"{"includedUrls":[{"domain":"worktrace.ai","includeSubdomains":"yes"}]}"#;
+        let settings = serde_json::from_str::<RecordingSettings>(json).unwrap();
+        assert_eq!(settings.included_urls, vec![invalid_domain_rule()]);
+
+        let wrong_shape =
+            serde_json::from_str::<RecordingSettings>(r#"{"includedUrls":"worktrace.ai"}"#)
+                .unwrap();
+        assert_eq!(wrong_shape.included_urls, vec![invalid_domain_rule()]);
+
+        let malformed_block = serde_json::from_str::<RecordingSettings>(
+            r#"{"ignoredUrls":["legacy.example",{"domain":12}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            malformed_block.ignored_urls,
+            vec![
+                UrlRule::Legacy("legacy.example".to_string()),
+                UrlRule::Structured(invalid_domain_rule())
+            ]
+        );
     }
 
     #[test]
@@ -1020,12 +1366,54 @@ mod tests {
     }
 
     #[test]
-    fn meeting_piggyback_defaults_off() {
+    fn legacy_scalar_monitor_id_deserializes_as_single_selection() {
+        let mut json = serde_json::to_value(RecordingSettings::default()).unwrap();
+        json["monitorIds"] = serde_json::json!(r"\\.\DISPLAY1_3840x2160_0,0");
+
+        let settings: RecordingSettings = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            settings.monitor_ids,
+            vec![r"\\.\DISPLAY1_3840x2160_0,0".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_monitor_id_shape_still_fails_deserialization() {
+        let mut json = serde_json::to_value(RecordingSettings::default()).unwrap();
+        json["monitorIds"] = serde_json::json!({"id": "DISPLAY1"});
+
+        assert!(serde_json::from_value::<RecordingSettings>(json).is_err());
+    }
+
+    #[test]
+    fn persisted_schedule_accepts_weekday_name_but_rejects_unknown_name() {
+        let mut persisted = serde_json::to_value(RecordingSettings::default()).unwrap();
+        persisted["scheduleRules"] = serde_json::json!([{
+            "dayOfWeek": "friday",
+            "startTime": "09:00",
+            "endTime": "17:00",
+            "recordMode": "all"
+        }]);
+
+        let settings: RecordingSettings = serde_json::from_value(persisted.clone()).unwrap();
+        assert_eq!(settings.schedule_rules[0].day_of_week, 4);
+
+        persisted["scheduleRules"][0]["dayOfWeek"] = serde_json::json!("funday");
+        assert!(serde_json::from_value::<RecordingSettings>(persisted).is_err());
+    }
+
+    #[test]
+    fn meeting_piggyback_defaults_on() {
         let config = RecordingSettings::default();
-        assert!(!config.experimental_meeting_piggyback);
-        // Posture guard: promotion to default-on must be a deliberate flip of
-        // default_experimental_meeting_piggyback, reviewed on its own.
-        assert!(!default_experimental_meeting_piggyback());
+        assert!(config.experimental_meeting_piggyback);
+        let mut persisted = serde_json::to_value(config).unwrap();
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .remove("experimentalMeetingPiggyback");
+        let restored: RecordingSettings = serde_json::from_value(persisted).unwrap();
+        assert!(restored.experimental_meeting_piggyback);
     }
 
     #[test]
@@ -1094,6 +1482,33 @@ mod tests {
         assert!(settings.vocabulary.is_empty()); // default
         assert_eq!(settings.audio_capture_mode, "always"); // backward-compatible default
         assert!(!settings.enhanced_incognito_detection); // old stores stay permission-free
+    }
+
+    #[test]
+    fn scrubbed_legacy_user_id_null_uses_empty_string_sentinel() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+            "disableAudio": false,
+            "audioTranscriptionEngine": "whisper-large-v3-turbo",
+            "audioDevices": ["default"],
+            "monitorIds": ["default"],
+            "videoQuality": "balanced",
+            "userId": null
+        }"#,
+        )
+        .expect("the auth-token scrubbed store must remain readable");
+
+        assert_eq!(settings.user_id, "");
+        assert_eq!(
+            settings.audio_transcription_engine,
+            "whisper-large-v3-turbo"
+        );
+
+        let malformed = serde_json::from_str::<RecordingSettings>(r#"{"userId": 42}"#);
+        assert!(
+            malformed.is_err(),
+            "non-null malformed userId must still fail"
+        );
     }
 
     #[test]
@@ -1215,5 +1630,35 @@ mod tests {
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let deserialized: RecordingSettings = toml::from_str(&toml_str).unwrap();
         assert_eq!(settings, deserialized);
+    }
+}
+
+#[cfg(test)]
+mod recording_detail_tests {
+    use super::*;
+
+    #[test]
+    fn older_settings_default_to_auto_and_all_modes_round_trip() {
+        let old: RecordingSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.recording_detail, RecordingDetail::Auto);
+        for (name, mode) in [
+            ("auto", RecordingDetail::Auto),
+            ("low_impact", RecordingDetail::LowImpact),
+            ("balanced", RecordingDetail::Balanced),
+            ("more_detail", RecordingDetail::MoreDetail),
+        ] {
+            let settings: RecordingSettings = serde_json::from_value(
+                serde_json::json!({"recordingDetail": name, "powerMode": "battery_saver"}),
+            )
+            .unwrap();
+            assert_eq!(settings.recording_detail, mode);
+            let value = serde_json::to_value(settings).unwrap();
+            assert_eq!(value["recordingDetail"], name);
+            assert_eq!(value["powerMode"], "battery_saver");
+        }
+        assert!(serde_json::from_value::<RecordingSettings>(
+            serde_json::json!({"recordingDetail": "unbounded"})
+        )
+        .is_err());
     }
 }

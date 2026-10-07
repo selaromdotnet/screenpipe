@@ -12,7 +12,14 @@ import {
   afterEach,
   afterAll,
 } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 
 const analyticsMocks = vi.hoisted(() => ({
   capture: vi.fn(),
@@ -53,6 +60,8 @@ const ARTIFACTS = Array.from({ length: 5 }, (_, i) => ({
 }));
 
 let artifactFetchError = false;
+let extraArtifacts: typeof ARTIFACTS = [];
+let artifactRequestDelay: Promise<void> | null = null;
 
 vi.mock("@/lib/api", () => ({
   localFetch: vi.fn(async (path: string) => {
@@ -84,6 +93,9 @@ vi.mock("@/lib/api", () => ({
       });
     }
     if (path.startsWith("/artifacts")) {
+      if (artifactRequestDelay && path.includes("q=")) {
+        await artifactRequestDelay;
+      }
       if (artifactFetchError) {
         return {
           ok: false,
@@ -95,12 +107,14 @@ vi.mock("@/lib/api", () => ({
       const url = new URL(`http://x${path}`);
       const source = url.searchParams.get("source");
       const q = url.searchParams.get("q")?.toLowerCase();
-      let data = ARTIFACTS;
+      let data = [...ARTIFACTS, ...extraArtifacts];
       if (source) data = data.filter((a) => a.source === source);
       if (q)
         data = data.filter(
           (a) =>
             a.title.toLowerCase().includes(q) ||
+            a.path.toLowerCase().includes(q) ||
+            (a.original_path ?? "").toLowerCase().includes(q) ||
             (a.preview ?? "").toLowerCase().includes(q),
         );
       return ok({
@@ -125,7 +139,32 @@ vi.mock("@/lib/utils/tauri", () => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => undefined) }));
-vi.mock("@tauri-apps/api/event", () => ({ emit: vi.fn(async () => undefined) }));
+
+const eventMocks = vi.hoisted(() => ({
+  listeners: new Map<string, Set<(event: { payload: unknown }) => void>>(),
+  emit: vi.fn(async () => undefined),
+  listen: vi.fn(
+    async (name: string, handler: (event: { payload: unknown }) => void) => {
+      const listeners = eventMocks.listeners.get(name) ?? new Set();
+      listeners.add(handler);
+      eventMocks.listeners.set(name, listeners);
+      return () => listeners.delete(handler);
+    },
+  ),
+}));
+
+vi.mock("@tauri-apps/api/event", () => ({
+  emit: eventMocks.emit,
+  listen: eventMocks.listen,
+}));
+
+const chatMocks = vi.hoisted(() => ({
+  showChatWithPrefill: vi.fn(async () => undefined),
+}));
+
+vi.mock("@/lib/chat-utils", () => ({
+  showChatWithPrefill: chatMocks.showChatWithPrefill,
+}));
 
 vi.mock("@/components/settings/compact-markdown", () => ({
   CompactMarkdown: ({ children, "data-testid": testId }: { children: string; "data-testid"?: string }) => (
@@ -150,12 +189,16 @@ vi.mock("@/components/ui/use-toast", () => ({
 
 import { BrainSection, resetBrainViewStateForTests } from "../brain-section";
 import { localFetch } from "@/lib/api";
+import { commands } from "@/lib/utils/tauri";
 import { emit } from "@tauri-apps/api/event";
 import { useChatStore } from "@/lib/stores/chat-store";
 
 beforeEach(() => {
   vi.clearAllMocks();
   artifactFetchError = false;
+  extraArtifacts = [];
+  artifactRequestDelay = null;
+  eventMocks.listeners.clear();
   resetBrainViewStateForTests();
   useChatStore.getState().actions.hydrateFromDisk([
     {
@@ -200,6 +243,14 @@ const memoryRows = () =>
 const artifactRows = () =>
   screen.queryAllByTestId(/^brain-item-artifact-/);
 
+const dispatchTauriEvent = (name: string, payload: unknown) => {
+  act(() => {
+    for (const listener of eventMocks.listeners.get(name) ?? []) {
+      listener({ payload });
+    }
+  });
+};
+
 // jsdom has no PointerEvent, which Radix needs to process pointerdown.
 globalThis.PointerEvent ||= MouseEvent as typeof PointerEvent;
 
@@ -230,7 +281,7 @@ describe("BrainSection type filter", () => {
     await waitFor(() => {
       expect(screen.getByTestId("brain-view-switcher")).toHaveAttribute(
         "aria-label",
-        "switch Brain view, current: Memories",
+        "Switch Brain view, current: Memories",
       );
     });
 
@@ -246,7 +297,7 @@ describe("BrainSection type filter", () => {
     expect(artifactRows().length).toBe(0);
     expect(screen.getByTestId("brain-view-switcher")).toHaveAttribute(
       "aria-label",
-      "switch Brain view, current: Memories",
+      "Switch Brain view, current: Memories",
     );
     expect(analyticsMocks.capture).toHaveBeenCalledWith("brain_viewed", {
       tab: "memories",
@@ -261,14 +312,14 @@ describe("BrainSection type filter", () => {
     await waitFor(() => expect(artifactRows().length).toBe(5));
     expect(screen.getByTestId("brain-view-switcher")).toHaveAttribute(
       "aria-label",
-      "switch Brain view, current: Artifacts",
+      "Switch Brain view, current: Artifacts",
     );
 
     selectBrainView("overview");
     await waitFor(() =>
       expect(screen.getByTestId("brain-view-switcher")).toHaveAttribute(
         "aria-label",
-        "switch Brain view, current: Live Views",
+        "Switch Brain view, current: Live Views",
       ),
     );
     const dashboardRow = screen.getByTestId("overview-dashboard-row");
@@ -282,7 +333,7 @@ describe("BrainSection type filter", () => {
     await waitFor(() => expect(memoryRows().length).toBe(8));
     expect(screen.getByTestId("brain-view-switcher")).toHaveAttribute(
       "aria-label",
-      "switch Brain view, current: Memories",
+      "Switch Brain view, current: Memories",
     );
   });
 
@@ -306,6 +357,34 @@ describe("BrainSection type filter", () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it("previews a pipe's HTML artifact in a frame that cannot load remote images", async () => {
+    extraArtifacts = [{ ...ARTIFACTS[1], title: "report.html", kind: "html", path: "/tmp/pipes/glob-pipe/output/report.html" }];
+    vi.mocked(commands.readViewerFile).mockResolvedValue({
+      status: "ok",
+      data: {
+        kind: "text",
+        text: '<link rel="preconnect" href="https://secret.example.com"><p>report</p><img src="https://example.com/x.png?d=secret">',
+      },
+    } as never);
+    render(<BrainSection />);
+    await waitFor(() => expect(memoryRows().length).toBeGreaterThan(0));
+
+    selectBrainView("artifacts");
+
+    const frame = await waitFor(() => {
+      const element = document.querySelector("iframe");
+      if (!element) throw new Error("no preview frame yet");
+      return element;
+    });
+    const html = frame.getAttribute("srcdoc") ?? "";
+    // The policy comes first, so it governs everything the artifact loads.
+    expect(html).toMatch(/^<meta http-equiv="Content-Security-Policy" content="[^"]*\bimg-src data:[^"]*">/);
+    expect(html).toContain("default-src 'none'");
+    expect(html).toContain('<img src="https://example.com/x.png?d=secret">');
+    // WebKit connects to a preconnect host even under the policy.
+    expect(html).not.toContain("secret.example.com");
   });
 
   it("artifacts tab hides every memory row", async () => {
@@ -417,7 +496,7 @@ describe("BrainSection type filter", () => {
     await waitFor(() => {
       expect(screen.getByTestId("brain-artifacts-error")).toBeTruthy();
     });
-    expect(screen.getByText("failed to load artifacts")).toBeTruthy();
+    expect(screen.getByText("Failed to load artifacts")).toBeTruthy();
     expect(screen.getByText("HTTP 500")).toBeTruthy();
     expect(
       screen.queryByText("no artifacts yet. create a chat note or run a pipe."),
@@ -484,6 +563,116 @@ describe("BrainSection type filter", () => {
     );
   });
 
+  it("shows a loading state then opens a notification artifact in Brain", async () => {
+    let releaseRequest!: () => void;
+    artifactRequestDelay = new Promise<void>((resolve) => {
+      releaseRequest = resolve;
+    });
+
+    render(<BrainSection />);
+    await waitFor(() => expect(memoryRows().length).toBe(8));
+
+    dispatchTauriEvent("open-brain-artifact", {
+      path: ARTIFACTS[1].path,
+      source: "notification",
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("brain-artifact-request-state")).toHaveAttribute(
+        "data-state",
+        "locating",
+      );
+    });
+    expect(screen.getByText("Opening result")).toBeTruthy();
+
+    act(() => releaseRequest());
+    await waitFor(() => expect(screen.getByTestId("brain-detail-panel")).toBeTruthy());
+    expect(screen.getByTestId("brain-view-switcher")).toHaveAttribute(
+      "title",
+      "Switch Brain view, current: Artifacts",
+    );
+    expect(artifactRows().length).toBe(5);
+    expect(analyticsMocks.capture).toHaveBeenCalledWith(
+      "brain_notification_artifact_opened",
+      {
+        result: "resolved",
+        target_type: "legacy_path",
+        artifact_kind: "markdown",
+        registered: false,
+      },
+    );
+    expect(JSON.stringify(analyticsMocks.capture.mock.calls)).not.toContain(
+      ARTIFACTS[1].path,
+    );
+  });
+
+  it("shows an unavailable state for an artifact that no longer exists", async () => {
+    render(<BrainSection />);
+    await waitFor(() => expect(memoryRows().length).toBe(8));
+
+    dispatchTauriEvent("open-brain-artifact", {
+      registeredId: 999_999,
+      source: "notification",
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("brain-artifact-request-state")).toHaveAttribute(
+        "data-state",
+        "missing",
+      );
+    });
+    expect(screen.getByText("Result unavailable")).toBeTruthy();
+    expect(screen.queryByTestId("brain-artifact-request-viewer")).toBeNull();
+    expect(localFetch).toHaveBeenCalledWith(
+      "/artifacts?limit=1&offset=0&id=999999",
+    );
+  });
+
+  it("offers a retry when the local artifact index is unavailable", async () => {
+    render(<BrainSection />);
+    await waitFor(() => expect(memoryRows().length).toBe(8));
+
+    artifactFetchError = true;
+    dispatchTauriEvent("open-brain-artifact", {
+      path: ARTIFACTS[2].path,
+      source: "notification",
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("brain-artifact-request-state")).toHaveAttribute(
+        "data-state",
+        "error",
+      );
+    });
+    expect(screen.getByText("Couldn't load result")).toBeTruthy();
+    expect(screen.getByTestId("brain-artifact-request-viewer")).toBeTruthy();
+
+    artifactFetchError = false;
+    fireEvent.click(screen.getByTestId("brain-artifact-request-retry"));
+    await waitFor(() => expect(screen.getByTestId("brain-detail-panel")).toBeTruthy());
+  });
+
+  it("opens an editable chat with the artifact preview and does not auto-send", async () => {
+    render(<BrainSection />);
+    await waitFor(() => expect(memoryRows().length).toBe(8));
+
+    selectBrainView("artifacts");
+    await waitFor(() => expect(artifactRows().length).toBe(5));
+    fireEvent.click(screen.getByTestId("brain-item-artifact-100"));
+    fireEvent.click(screen.getByTestId("brain-detail-ask-ai"));
+
+    await waitFor(() => {
+      expect(chatMocks.showChatWithPrefill).toHaveBeenCalledWith({
+        context: "",
+        prompt: `help me understand the Screenpipe artifact at ${ARTIFACTS[0].path}`,
+        autoSend: false,
+        source: "brain-artifact",
+        useHomeChat: true,
+        filePreviewPath: ARTIFACTS[0].path,
+      });
+    });
+  });
+
   it("jumps to the origin chat only from the detail panel action", async () => {
     render(<BrainSection />);
     await waitFor(() => expect(memoryRows().length).toBe(8));
@@ -494,7 +683,7 @@ describe("BrainSection type filter", () => {
     fireEvent.click(screen.getByTestId("brain-item-artifact-100"));
 
     openDetailMenu();
-    fireEvent.click(await screen.findByText("go to chat"));
+    fireEvent.click(await screen.findByText("Go to chat"));
 
     expect(emit).toHaveBeenCalledWith("chat-load-conversation", {
       conversationId: "chat-b",
@@ -668,7 +857,7 @@ describe("BrainSection type filter", () => {
     ) as HTMLTextAreaElement;
     expect(textarea.value).toBe(MEMORIES[0].content);
 
-    const tagInput = screen.getByPlaceholderText("add tag...");
+    const tagInput = screen.getByPlaceholderText("Add tag...");
     fireEvent.change(tagInput, { target: { value: "new-tag" } });
     fireEvent.keyDown(tagInput, { key: "Enter" });
 

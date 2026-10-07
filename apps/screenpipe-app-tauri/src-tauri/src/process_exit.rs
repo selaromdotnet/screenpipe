@@ -26,6 +26,114 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tracing::{info, warn};
 
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+const E2E_SCK_RELAUNCH_RACE_SEED: &str = "packaged-updater-sck-race";
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+const E2E_SCK_RELAUNCH_DEADLINE_FILE: &str = ".e2e-sck-relaunch-not-before";
+const MACOS_UPDATER_RELAUNCH_SETTLE: Duration = Duration::from_secs(3);
+#[cfg(any(target_os = "macos", test))]
+const MACOS_UPDATER_RELAUNCH_HELPER: &str = r#"
+old_pid=$1
+settle_seconds=$2
+shift 2
+checks=0
+while kill -0 "$old_pid" 2>/dev/null && [ "$checks" -lt 100 ]; do
+    /bin/sleep 0.05
+    checks=$((checks + 1))
+done
+/bin/sleep "$settle_seconds"
+exec "$@"
+"#;
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_updater_relaunch_command<I, S>(
+    binary: &Path,
+    args: I,
+    old_pid: u32,
+    settle: Duration,
+) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(MACOS_UPDATER_RELAUNCH_HELPER)
+        .arg("screenpipe-updater-relaunch-helper")
+        .arg(old_pid.to_string())
+        .arg(settle.as_secs().to_string())
+        .arg(binary)
+        .args(args);
+    command
+}
+
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+fn e2e_seed_has_exact_token(token: &str) -> bool {
+    std::env::var("SCREENPIPE_E2E_SEED")
+        .ok()
+        .is_some_and(|seeds| seeds.split(',').any(|seed| seed.trim() == token))
+}
+
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+fn e2e_sck_relaunch_deadline_path() -> PathBuf {
+    screenpipe_core::paths::default_screenpipe_data_dir()
+        .join(E2E_SCK_RELAUNCH_DEADLINE_FILE)
+}
+
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// E2E-only model of replayd/TCC still releasing the dying app. The replacement
+/// process consumes this marker at the very beginning of `main`, before any
+/// ScreenCaptureKit call can happen.
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+fn arm_e2e_sck_relaunch_race() {
+    if !e2e_seed_has_exact_token(E2E_SCK_RELAUNCH_RACE_SEED) {
+        return;
+    }
+    let deadline = epoch_millis() + MACOS_UPDATER_RELAUNCH_SETTLE.as_millis();
+    if let Err(error) = std::fs::write(e2e_sck_relaunch_deadline_path(), deadline.to_string()) {
+        warn!("e2e: failed to arm SCK updater-relaunch race: {error}");
+    } else {
+        info!("e2e: armed SCK updater-relaunch settle deadline");
+    }
+}
+
+#[cfg(not(all(feature = "e2e", target_os = "macos")))]
+fn arm_e2e_sck_relaunch_race() {}
+
+/// Latch whether this E2E replacement process started during the simulated
+/// replayd/TCC release window. The screen crate turns the latch into the same
+/// persistent permission-denied enumeration observed in the field incident.
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+pub fn latch_e2e_sck_relaunch_race() {
+    if !e2e_seed_has_exact_token(E2E_SCK_RELAUNCH_RACE_SEED) {
+        return;
+    }
+    let path = e2e_sck_relaunch_deadline_path();
+    let deadline = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u128>().ok());
+    let _ = std::fs::remove_file(&path);
+    match deadline {
+        Some(deadline) if epoch_millis() < deadline => {
+            std::env::set_var("SCREENPIPE_E2E_SCK_RELAUNCH_POISONED", "1");
+            warn!("e2e: replacement launched before SCK settle deadline; latching permission denial");
+        }
+        Some(_) => info!("e2e: replacement launched after SCK settle deadline"),
+        None => {}
+    }
+}
+
+#[cfg(not(all(feature = "e2e", target_os = "macos")))]
+pub fn latch_e2e_sck_relaunch_race() {}
+
 /// Returns true when a panic payload is shutdown-time noise, not a real crash.
 pub(crate) fn is_orderly_shutdown_panic(payload: &str) -> bool {
     payload.contains("Tokio 1.x context was found, but it is being shutdown")
@@ -166,6 +274,42 @@ fn relaunch_binary(app: &AppHandle) -> Option<PathBuf> {
     Some(current_binary)
 }
 
+const RELAUNCH_HOME_VISIBLE: &str = "SCREENPIPE_RELAUNCH_HOME_VISIBLE";
+
+pub(crate) fn home_window_visible(app: &AppHandle) -> Option<bool> {
+    match app.get_webview_window("home") {
+        Some(window) => window
+            .is_visible()
+            .and_then(|visible| window.is_minimized().map(|minimized| visible && !minimized))
+            .ok(),
+        None => Some(false),
+    }
+}
+
+/// Consume before spawning any children, so a later ordinary launch cannot
+/// inherit the previous recovery's window preference.
+pub(crate) fn take_relaunch_home_visibility() -> Option<bool> {
+    let value = std::env::var(RELAUNCH_HOME_VISIBLE).ok();
+    std::env::remove_var(RELAUNCH_HOME_VISIBLE);
+    value.and_then(|value| value.parse().ok())
+}
+
+pub(crate) fn configure_relaunch_home(
+    command: &mut Command,
+    visible: Option<bool>,
+    data_dir: &std::path::Path,
+) {
+    command.env_remove(RELAUNCH_HOME_VISIBLE);
+    if let Some(visible) = visible {
+        command.env(RELAUNCH_HOME_VISIBLE, visible.to_string());
+    }
+    crate::recording::recovery_log::append(
+        data_dir,
+        "relaunch_window_state",
+        &format!("home_visible={visible:?}"),
+    );
+}
+
 /// Spawn a replacement app process, then terminate the current process without
 /// running C/C++ atexit handlers. Tauri's built-in restart uses
 /// `std::process::exit`, which can abort in ORT/ggml teardown after the new app
@@ -174,30 +318,85 @@ fn relaunch_binary(app: &AppHandle) -> Option<PathBuf> {
 /// The replacement gets its own process group: launchd kills a job's whole
 /// process group when the job exits, so an inherited group dies with us.
 pub fn force_app_relaunch(app: AppHandle, status: i32) -> ! {
+    force_app_relaunch_with_home(app, status, Some(true))
+}
+
+fn force_app_relaunch_with_home(app: AppHandle, status: i32, home_visible: Option<bool>) -> ! {
     // Apply a staged update now, at the last moment before this process goes
     // away — installing any earlier orphans the running bundle and kills TCC
     // attribution (see staged_update.rs). Idempotent with the RunEvent::Exit
     // call. The relaunch binary path below was cached at process start, so
     // the spawn hits the freshly installed bundle.
     #[cfg(target_os = "macos")]
-    crate::staged_update::install_staged_if_any(&app);
+    let update_installed = crate::staged_update::install_staged_if_any(&app);
+    #[cfg(not(target_os = "macos"))]
+    let update_installed = false;
+
+    if update_installed {
+        arm_e2e_sck_relaunch_race();
+    }
 
     let env = app.env();
     if let Some(binary) = relaunch_binary(&app) {
-        let mut command = Command::new(&binary);
-        command.args(env.args_os.iter().skip(1));
+        if update_installed {
+            crate::update_diagnostics::record(
+                "relaunch_requested",
+                &format!("executable={}", binary.display()),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = if update_installed {
+            macos_updater_relaunch_command(
+                &binary,
+                env.args_os.iter().skip(1),
+                std::process::id(),
+                MACOS_UPDATER_RELAUNCH_SETTLE,
+            )
+        } else {
+            let mut command = Command::new(&binary);
+            command.args(env.args_os.iter().skip(1));
+            command
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut command = {
+            let mut command = Command::new(&binary);
+            command.args(env.args_os.iter().skip(1));
+            command
+        };
+        // Startup repoints this variable at recordings. A replacement app must
+        // reopen the original settings store before selecting recordings again.
+        command.env("SCREENPIPE_DATA_DIR", crate::config::app_data_dir());
+        configure_relaunch_home(
+            &mut command,
+            home_visible,
+            &crate::db_relaunch::active_data_dir(),
+        );
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
         match command.spawn() {
+            Ok(child) if update_installed => info!(
+                "safe relaunch: spawned delayed updater helper for {} (pid {}, settle {}s)",
+                binary.display(),
+                child.id(),
+                MACOS_UPDATER_RELAUNCH_SETTLE.as_secs()
+            ),
             Ok(child) => info!(
                 "safe relaunch: spawned replacement {} (pid {})",
                 binary.display(),
                 child.id()
             ),
-            Err(err) => warn!("safe relaunch: failed to spawn {}: {err}", binary.display()),
+            Err(err) => {
+                if update_installed {
+                    crate::update_diagnostics::record(
+                        "relaunch_spawn_failed",
+                        &format!("executable={} error={err}", binary.display()),
+                    );
+                }
+                warn!("safe relaunch: failed to spawn {}: {err}", binary.display());
+            }
         }
     }
 
@@ -207,12 +406,51 @@ pub fn force_app_relaunch(app: AppHandle, status: i32) -> ! {
 /// Request a relaunch from async/UI code while allowing IPC replies and logs to
 /// flush briefly before the current process is force-exited.
 pub fn request_app_relaunch(app: AppHandle, reason: &'static str, delay: Duration) {
+    if let Err(error) = crate::search_only::prepare_restart() {
+        warn!("relaunch deferred: could not preserve recording mode: {error}");
+        return;
+    }
+    request_prepared_relaunch_with_home(app, reason, delay, Some(true));
+}
+
+/// Automatic recovery must not bring back a window the user closed. Explicit
+/// restarts continue through request_app_relaunch with normal startup behavior.
+pub(crate) fn request_recovery_relaunch(app: AppHandle, reason: &'static str, delay: Duration) {
+    if let Err(error) = crate::search_only::prepare_restart() {
+        warn!("relaunch deferred: could not preserve recording mode: {error}");
+        return;
+    }
+    let home_visible = home_window_visible(&app);
+    request_prepared_relaunch_with_home(app, reason, delay, home_visible);
+}
+
+/// Updater callers already persisted the session before draining the server.
+/// Do not introduce another fallible write after committing the installer.
+pub(crate) fn request_prepared_app_relaunch(
+    app: AppHandle,
+    reason: &'static str,
+    delay: Duration,
+) {
+    request_prepared_relaunch_with_home(app, reason, delay, None);
+}
+
+fn request_prepared_relaunch_with_home(
+    app: AppHandle,
+    reason: &'static str,
+    delay: Duration,
+    home_visible: Option<bool>,
+) {
     QUIT_REQUESTED.store(true, Ordering::SeqCst);
 
     std::thread::spawn(move || {
         std::thread::sleep(delay);
         info!("safe relaunch requested: {reason}");
-        force_app_relaunch(app, 0);
+        crate::recording::recovery_log::append(
+            &crate::db_relaunch::active_data_dir(),
+            "app_relaunch_requested",
+            reason,
+        );
+        force_app_relaunch_with_home(app, 0, home_visible);
     });
 }
 
@@ -405,7 +643,7 @@ fn hide_app_to_tray(app: &AppHandle) {
 ///
 /// Only user-initiated quit paths (app menu Cmd+Q, tray Quit, dock Quit via
 /// `ExitRequested`) go through here — programmatic paths (updater restart,
-/// relaunch) call [`request_app_quit`] / [`request_app_relaunch`] directly so
+/// relaunch) call [`request_full_app_quit`] / [`request_app_relaunch`] directly so
 /// they never block on a dialog.
 #[cfg(target_os = "macos")]
 pub fn confirm_and_request_app_quit(app: AppHandle) {
@@ -461,23 +699,24 @@ pub fn confirm_and_request_app_quit(app: AppHandle) {
 /// to the both-on wording when settings can't be read.
 #[cfg(target_os = "macos")]
 fn quit_message(app: &AppHandle, show_minimize: bool) -> String {
+    use crate::localization::ui_text;
+
     let (audio_on, vision_on) = crate::store::SettingsStore::get(app)
         .ok()
         .flatten()
         .map(|s| (!s.recording.disable_audio, !s.recording.disable_vision))
         .unwrap_or((true, true));
 
-    let stops = match (vision_on, audio_on) {
-        (true, true) => "Screen and audio recording will stop",
-        (true, false) => "Screen recording will stop",
-        (false, true) => "Audio recording will stop",
-        (false, false) => "All recording will stop",
-    };
-
-    if show_minimize {
-        format!("{stops}. Minimize to Tray to keep recording in the background.")
-    } else {
-        format!("{stops} when you quit.")
+    // Translate complete sentences so each locale can choose its own word order.
+    match (vision_on, audio_on, show_minimize) {
+        (true, true, true) => ui_text("Screen and audio recording will stop. Minimize to Tray to keep recording in the background."),
+        (true, false, true) => ui_text("Screen recording will stop. Minimize to Tray to keep recording in the background."),
+        (false, true, true) => ui_text("Audio recording will stop. Minimize to Tray to keep recording in the background."),
+        (false, false, true) => ui_text("All recording will stop. Minimize to Tray to keep recording in the background."),
+        (true, true, false) => ui_text("Screen and audio recording will stop when you quit."),
+        (true, false, false) => ui_text("Screen recording will stop when you quit."),
+        (false, true, false) => ui_text("Audio recording will stop when you quit."),
+        (false, false, false) => ui_text("All recording will stop when you quit."),
     }
 }
 
@@ -486,15 +725,10 @@ fn quit_message(app: &AppHandle, show_minimize: bool) -> String {
 /// `runModal` spins a nested modal loop until the user responds.
 #[cfg(target_os = "macos")]
 fn show_quit_alert(app: &AppHandle, show_minimize: bool, message: &str) {
+    use crate::localization::ui_text;
     use objc::{class, msg_send, sel, sel_impl};
     use tauri_nspanel::cocoa::base::{id, nil};
     use tauri_nspanel::cocoa::foundation::NSString;
-
-    // NSAlert binds Return to the first button and Escape only to a button
-    // titled exactly "Cancel", so the order and the literal label matter.
-    const QUIT_BUTTON: &str = "Quit screenpipe";
-    const MINIMIZE_BUTTON: &str = "Minimize to Tray";
-    const CANCEL_BUTTON: &str = "Cancel";
 
     // NSModalResponse for the first/second added button.
     const FIRST_BUTTON: i64 = 1000;
@@ -508,19 +742,23 @@ fn show_quit_alert(app: &AppHandle, show_minimize: bool, message: &str) {
         // NSAlertStyleInformational — app icon, never a caution-triangle badge.
         let _: () = msg_send![alert, setAlertStyle: 1i64];
 
-        let title = NSString::alloc(nil).init_str("Quit screenpipe?");
+        let title = NSString::alloc(nil).init_str(&ui_text("Quit screenpipe?"));
         let _: () = msg_send![alert, setMessageText: title];
         let message = NSString::alloc(nil).init_str(message);
         let _: () = msg_send![alert, setInformativeText: message];
 
-        let quit = NSString::alloc(nil).init_str(QUIT_BUTTON);
+        let quit = NSString::alloc(nil).init_str(&ui_text("Quit screenpipe"));
         let _: id = msg_send![alert, addButtonWithTitle: quit];
         if show_minimize {
-            let minimize = NSString::alloc(nil).init_str(MINIMIZE_BUTTON);
+            let minimize = NSString::alloc(nil).init_str(&ui_text("Minimize to Tray"));
             let _: id = msg_send![alert, addButtonWithTitle: minimize];
         }
-        let cancel = NSString::alloc(nil).init_str(CANCEL_BUTTON);
-        let _: id = msg_send![alert, addButtonWithTitle: cancel];
+        let cancel = NSString::alloc(nil).init_str(&ui_text("Cancel"));
+        let cancel_button: id = msg_send![alert, addButtonWithTitle: cancel];
+        // AppKit infers Escape from the literal English "Cancel". Keep the
+        // safe keyboard action explicit when that title is translated.
+        let escape = NSString::alloc(nil).init_str("\u{1b}");
+        let _: () = msg_send![cancel_button, setKeyEquivalent: escape];
 
         // Packaged builds inherit the bundle icon automatically; a bare dev
         // binary has none, so load the repo icon explicitly.
@@ -556,8 +794,18 @@ pub fn confirm_and_request_app_quit(app: AppHandle) {
     request_app_quit(app);
 }
 
-/// Shared quit entry point for tray menu, app menu (Cmd+Q), etc.
+/// User Quit may retain search. Programmatic exit, OS logout, and updater
+/// handoffs continue through the existing full-exit path.
 pub fn request_app_quit(app: AppHandle) {
+    if crate::search_only::keep_after_quit(&app) {
+        crate::search_only::request_enter(app);
+    } else {
+        request_full_app_quit(app);
+    }
+}
+
+/// Full exit for confirmed opt-out Quit, updater handoffs, and failed teardown.
+pub(crate) fn request_full_app_quit(app: AppHandle) {
     if crate::db_recovery_notifications::recovery_active() {
         info!("Quit ignored while protected database recovery is active");
         crate::db_recovery_notifications::notify_recovery_quit_blocked();
@@ -592,7 +840,53 @@ pub fn request_app_quit(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_cf_bundle_executable;
+    use super::{extract_cf_bundle_executable, macos_updater_relaunch_command};
+
+    #[test]
+    fn relaunch_home_visibility_child() {
+        let Ok(expected) = std::env::var("SCREENPIPE_TEST_RELAUNCH_HOME") else {
+            return;
+        };
+        assert_eq!(super::take_relaunch_home_visibility(), expected.parse().ok());
+        assert_eq!(super::take_relaunch_home_visibility(), None);
+        assert!(std::env::var_os(super::RELAUNCH_HOME_VISIBLE).is_none());
+    }
+
+    #[test]
+    fn recovery_relaunch_home_visibility_crosses_process_boundary_once() {
+        let root = tempfile::tempdir().unwrap();
+        for (scenario, visible) in [
+            ("closed recovery", Some(false)),
+            ("visible recovery", Some(true)),
+            ("explicit restart", Some(true)),
+            ("ordinary quit and reopen", None),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "process_exit::tests::relaunch_home_visibility_child"])
+                .env(
+                    "SCREENPIPE_TEST_RELAUNCH_HOME",
+                    visible.map_or("none", |v| if v { "true" } else { "false" }),
+                )
+                // A fresh snapshot must replace any stale inherited preference.
+                .env(super::RELAUNCH_HOME_VISIBLE, (!visible.unwrap_or(false)).to_string());
+            super::configure_relaunch_home(&mut command, visible, root.path());
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process_exit::tests::relaunch_home_visibility_child"])
+            .env("SCREENPIPE_TEST_RELAUNCH_HOME", "none")
+            .env(super::RELAUNCH_HOME_VISIBLE, "invalid")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
 
     #[test]
     fn extracts_bundle_executable_from_xml_plist() {
@@ -610,6 +904,26 @@ mod tests {
         assert_eq!(
             extract_cf_bundle_executable(plist).as_deref(),
             Some("screenpipe-app")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn updater_relaunch_helper_preserves_spaced_arguments_without_shell_interpolation() {
+        let args = ["%s|%s", "argument with spaces", "literal;$HOME"];
+        let output = macos_updater_relaunch_command(
+            std::path::Path::new("/usr/bin/printf"),
+            args,
+            u32::MAX,
+            std::time::Duration::ZERO,
+        )
+        .output()
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "argument with spaces|literal;$HOME"
         );
     }
 }

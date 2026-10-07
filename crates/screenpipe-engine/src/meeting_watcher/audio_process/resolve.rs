@@ -230,22 +230,32 @@ pub(crate) async fn db_find_browser_evidence(
     // `frames.timestamp` is RFC3339 (`...T...+00:00`). Comparing it to
     // SQLite's `datetime()` string (`... ...`) is lexical and pulls in stale
     // same-day frames.
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT DISTINCT app_name, window_name, browser_url FROM frames \
+    //
+    // Newest page first: the 10s window routinely holds two different meeting
+    // rooms right after the user leaves one call and joins the next, and the
+    // first matching row is the URL the candidate carries. Returning rows in
+    // arbitrary order let a stale frame of the OLD room outrank the room the
+    // browser is showing now, which hid the room change from the detector.
+    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT app_name, window_name, browser_url, MAX(timestamp) AS newest FROM frames \
          WHERE timestamp > strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-10 seconds') \
-         AND app_name IS NOT NULL AND window_name IS NOT NULL",
+         AND app_name IS NOT NULL AND window_name IS NOT NULL \
+         GROUP BY app_name, window_name, browser_url \
+         ORDER BY newest DESC",
     )
     .fetch_all(&db.pool)
     .await?;
 
     Ok(rows
         .into_iter()
-        .filter(|(app_name, _, _)| is_browser_app(app_name))
-        .map(|(app_name, window_name, browser_url)| BrowserPageEvidence {
-            browser_app: Some(app_name),
-            url: browser_url,
-            title: Some(window_name),
-        })
+        .filter(|(app_name, _, _, _)| is_browser_app(app_name))
+        .map(
+            |(app_name, window_name, browser_url, _)| BrowserPageEvidence {
+                browser_app: Some(app_name),
+                url: browser_url,
+                title: Some(window_name),
+            },
+        )
         .collect())
 }
 
@@ -761,35 +771,213 @@ pub(crate) fn acquire_input_processes(
 /// evidence in the AX tree. Returns a `CallSignalEvidence` per scanned app.
 ///
 /// Only called during pre-active states (`needs_ax_resolution`) and only for
-/// `Native` candidates whose profile requires call signal verification.
+/// resolved candidates whose profile requires call signal verification.
 /// Platform-agnostic: delegates to `MeetingUiScanner::scan_process` which
 /// uses AX on macOS, UIA on Windows, and is a no-op on other platforms.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+struct CallSignalScanTarget {
+    session_key: ProcessKey,
+    platform: String,
+    pid: i32,
+    profile_index: usize,
+    #[cfg(any(target_os = "macos", test))]
+    browser_app: Option<String>,
+}
+
+fn candidate_call_signal_profile<'a>(
+    candidate: &ResolvedMeetingCandidate,
+    profiles: &'a [MeetingDetectionProfile],
+) -> Option<(&'a MeetingDetectionProfile, usize)> {
+    let (platform, _, _, is_browser) = candidate.call_signal_identity()?;
+    profiles.iter().enumerate().find_map(|(index, profile)| {
+        // A browser-only profile can share a platform name with the native
+        // profile, whose start policy must remain independent.
+        if !is_browser
+            && profile.app_identifiers.macos_app_names.is_empty()
+            && profile.app_identifiers.windows_process_names.is_empty()
+        {
+            return None;
+        }
+        (platform_name_for_profile(profile, is_browser).eq_ignore_ascii_case(platform))
+            .then_some((profile, index))
+    })
+}
+
+fn candidate_requires_call_signal(
+    candidate: &ResolvedMeetingCandidate,
+    profiles: &[MeetingDetectionProfile],
+) -> bool {
+    candidate_call_signal_profile(candidate, profiles)
+        .is_some_and(|(profile, _)| profile.requires_call_signal)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn call_signal_scan_target(
+    candidate: &ResolvedMeetingCandidate,
+    profiles: &[MeetingDetectionProfile],
+) -> Option<CallSignalScanTarget> {
+    let (platform, session_key, process, _) = candidate.call_signal_identity()?;
+    let (profile, profile_index) = candidate_call_signal_profile(candidate, profiles)?;
+    if !profile.requires_call_signal {
+        return None;
+    }
+    Some(CallSignalScanTarget {
+        session_key: session_key.clone(),
+        platform: platform.to_string(),
+        pid: process.pid?,
+        profile_index,
+        #[cfg(any(target_os = "macos", test))]
+        browser_app: match candidate {
+            ResolvedMeetingCandidate::Browser { browser_app, .. } => Some(browser_app.clone()),
+            _ => None,
+        },
+    })
+}
+
+/// CoreAudio commonly identifies a Chromium audio helper. Its AX tree has no
+/// browser windows: scan the browser UI process while keeping the evidence
+/// keyed to the original microphone session. Do not fall back to the helper
+/// when the browser has exited or its UI process cannot be resolved.
+#[cfg(any(target_os = "macos", test))]
+fn call_signal_scan_pid(
+    target: &CallSignalScanTarget,
+    resolve_browser: impl FnOnce(&str) -> i32,
+) -> Option<i32> {
+    let pid = target
+        .browser_app
+        .as_deref()
+        .map(resolve_browser)
+        .unwrap_or(target.pid);
+    if pid > 0 {
+        Some(pid)
+    } else {
+        warn!(
+            platform = %target.platform,
+            audio_pid = target.pid,
+            "meeting call-control scan could not resolve the browser UI process; meeting start withheld"
+        );
+        None
+    }
+}
+
+#[cfg(test)]
+mod call_signal_target_tests {
+    use super::*;
+
+    #[test]
+    fn browser_controls_are_scanned_in_the_ui_process_and_keep_the_audio_session() {
+        let process = AudioInputProcess {
+            audio_session_id: Some("arc-helper-mic-session".into()),
+            audio_object_id: Some(300),
+            pid: Some(84),
+            bundle_id: Some("company.thebrowser.Browser.helper".into()),
+            process_name: Some("Arc Helper".into()),
+            owner_app_name: Some("Arc".into()),
+            owner_bundle_id: Some("company.thebrowser.Browser".into()),
+            first_seen_at_ms: None,
+        };
+        let session_key = ProcessKey::from_process(&process).unwrap();
+        let candidate = ResolvedMeetingCandidate::Browser {
+            platform: "Slack Huddle".into(),
+            meeting_url: "https://app.slack.com/client/T123/C456".into(),
+            browser_app: "Arc".into(),
+            session_key: session_key.clone(),
+            first_seen_at: Instant::now(),
+            process,
+            live_evidence: true,
+        };
+        let profiles = load_detection_profiles();
+        let target = call_signal_scan_target(&candidate, &profiles).unwrap();
+        assert_eq!(target.session_key, session_key);
+        assert_eq!(
+            call_signal_scan_pid(&target, |browser| {
+                assert_eq!(browser, "Arc");
+                123
+            }),
+            Some(123)
+        );
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(log.reopen().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(call_signal_scan_pid(&target, |_| -1), None);
+        });
+        let diagnostic = std::fs::read_to_string(log.path()).unwrap();
+        assert!(diagnostic.contains("could not resolve the browser UI process"));
+        assert!(diagnostic.contains("meeting start withheld"));
+        assert!(diagnostic.contains("platform=Slack Huddle"));
+        assert_eq!(
+            diagnostic.trim(),
+            include_str!("../../../tests/fixtures/slack-missing-browser-diagnostic.txt").trim()
+        );
+        println!("{diagnostic}");
+        assert_eq!(call_signal_scan_pid(&target, |_| 0), None);
+
+        let native = CallSignalScanTarget {
+            browser_app: None,
+            ..target
+        };
+        assert_eq!(
+            call_signal_scan_pid(&native, |_| panic!("native must use its own PID")),
+            Some(84)
+        );
+    }
+}
+
+pub(crate) fn retain_candidates_with_required_call_signal(
+    candidates: &mut Vec<ResolvedMeetingCandidate>,
+    profiles: &[MeetingDetectionProfile],
+    call_evidence: &[CallSignalEvidence],
+) {
+    candidates.retain(|candidate| {
+        if !candidate_requires_call_signal(candidate, profiles) {
+            return true;
+        }
+        let Some((platform, session_key, _, _)) = candidate.call_signal_identity() else {
+            return true;
+        };
+        let platform_lower = platform.to_lowercase();
+        let evidence = call_evidence.iter().find(|evidence| {
+            evidence.session_key == *session_key && evidence.platform == platform_lower
+        });
+        if evidence.is_some_and(|evidence| evidence.is_in_call) {
+            return true;
+        }
+        debug!(
+            "audio-process meeting detector: {} candidate blocked by call signal gate ({})",
+            platform,
+            if evidence.is_some() {
+                "no call UI found"
+            } else {
+                "no keyed evidence produced"
+            }
+        );
+        false
+    });
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn scan_messaging_call_signals(
     candidates: &[ResolvedMeetingCandidate],
     profiles: &[MeetingDetectionProfile],
 ) -> Vec<CallSignalEvidence> {
-    let to_scan: Vec<(String, i32, usize)> = candidates
+    let mut to_scan: Vec<CallSignalScanTarget> = candidates
         .iter()
-        .filter_map(|c| {
-            if let ResolvedMeetingCandidate::Native {
-                platform, process, ..
-            } = c
-            {
-                let profile_idx = profiles
-                    .iter()
-                    .position(|p| platform_name_for_profile(p, false) == *platform)?;
-                let profile = &profiles[profile_idx];
-                if profile.requires_call_signal {
-                    Some((platform.clone(), process.pid?, profile_idx))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
+        .filter_map(|candidate| call_signal_scan_target(candidate, profiles))
         .collect();
+    to_scan.sort_by(|a, b| {
+        (&a.session_key, &a.platform, a.pid, a.profile_index).cmp(&(
+            &b.session_key,
+            &b.platform,
+            b.pid,
+            b.profile_index,
+        ))
+    });
+    to_scan.dedup();
 
     if to_scan.is_empty() {
         return Vec::new();
@@ -800,25 +988,42 @@ async fn scan_messaging_call_signals(
         let scanner = crate::meeting_watcher::shared::scanner::MeetingUiScanner::new();
         to_scan
             .into_iter()
-            .map(|(platform, pid, profile_idx)| {
-                let profile = &profiles[profile_idx];
+            .filter_map(|target| {
+                let profile = &profiles[target.profile_index];
+                #[cfg(target_os = "macos")]
+                let Some(pid) = call_signal_scan_pid(
+                    &target,
+                    crate::meeting_watcher::ui_scan::resolve_browser_pid,
+                ) else {
+                    return None;
+                };
+                #[cfg(not(target_os = "macos"))]
+                let pid = target.pid;
                 let result = scanner.scan_process(pid, profile);
                 debug!(
                     "audio-process meeting detector: call signal scan for {} (pid {}): \
                      is_in_call={}, signals={:?}",
-                    platform, pid, result.is_in_call, result.matched_signals
+                    target.platform, pid, result.is_in_call, result.matched_signals
                 );
-                CallSignalEvidence {
-                    platform: platform.to_lowercase(),
+                Some(CallSignalEvidence {
+                    session_key: target.session_key,
+                    platform: target.platform.to_lowercase(),
                     is_in_call: result.is_in_call,
                     matched_signals: result.matched_signals,
-                }
+                })
             })
             .collect()
     });
     match tokio::time::timeout(Duration::from_secs(5), scan).await {
         Ok(Ok(results)) => results,
-        _ => Vec::new(),
+        Ok(Err(error)) => {
+            warn!(%error, "meeting call-control scan task failed; meeting start withheld");
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(%error, "meeting call-control scan timed out; meeting start withheld");
+            Vec::new()
+        }
     }
 }
 
@@ -863,51 +1068,15 @@ pub(crate) async fn build_candidates(
 
     candidates.retain(|candidate| !matches!(candidate, ResolvedMeetingCandidate::Ignored));
 
-    // Call signal gate for messaging-first platforms (#4776): apps like
+    // Call signal gate for messaging-first platforms (#4776): apps/sites like
     // WhatsApp/Signal/Telegram grab the mic for voice notes identically to
-    // calls. Before promoting them to Native, scan their AX tree for real
+    // calls. Before promoting resolved native or browser candidates, scan the
+    // mic-holding process's AX tree for real
     // call UI (e.g. Calling_Window). Only run during pre-active states —
     // once a meeting is Active the platform is settled.
     if needs_ax_resolution(state) {
         let call_evidence = scan_messaging_call_signals(&candidates, profiles).await;
-        candidates.retain(|candidate| {
-            if let ResolvedMeetingCandidate::Native { platform, .. } = candidate {
-                let platform_lower = platform.to_lowercase();
-                // Check if this platform requires call signal verification.
-                let requires_gate = profiles.iter().any(|p| {
-                    p.requires_call_signal
-                        && platform_name_for_profile(p, false).to_lowercase() == platform_lower
-                });
-                if requires_gate {
-                    // Fail-closed: block unless we have explicit evidence of a
-                    // real call. If the AX scan timed out or the process had no
-                    // PID, no evidence is produced and we err on the side of NOT
-                    // starting a phantom meeting.
-                    match call_evidence.iter().find(|e| e.platform == platform_lower) {
-                        Some(evidence) if evidence.is_in_call => {
-                            // Real call confirmed — allow.
-                        }
-                        Some(_) => {
-                            debug!(
-                                "audio-process meeting detector: {} blocked by call signal gate \
-                                 (voice note / idle, no call UI found)",
-                                platform
-                            );
-                            return false;
-                        }
-                        None => {
-                            debug!(
-                                "audio-process meeting detector: {} blocked by call signal gate \
-                                 (no evidence produced — scan may have timed out)",
-                                platform
-                            );
-                            return false;
-                        }
-                    }
-                }
-            }
-            true
-        });
+        retain_candidates_with_required_call_signal(&mut candidates, profiles, &call_evidence);
     }
 
     filter_suppressed_candidates(&mut candidates, suppressed_sessions);

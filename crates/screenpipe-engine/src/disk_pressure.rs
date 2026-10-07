@@ -158,7 +158,12 @@ fn start_disk_pressure_monitor_with(
     })
 }
 
-fn available_space_for_path(path: &Path) -> Option<u64> {
+/// Available bytes on the most specific mounted volume containing `path`.
+///
+/// The launch-time SQLite quarantine gate reuses this exact probe so a stale
+/// `SQLITE_FULL` marker cannot be cleared using a different notion of disk
+/// recovery than the active-capture guard.
+pub fn available_space_for_path(path: &Path) -> Option<u64> {
     let resolved_path = canonicalize_nearest_existing(path);
     let mut system = System::new();
     system.refresh_disks_list();
@@ -244,6 +249,8 @@ mod tests {
         assert!(!is_low_disk(LOW_DISK_THRESHOLD_BYTES + 1));
         assert!(is_low_disk(LOW_DISK_THRESHOLD_BYTES));
         assert!(is_low_disk(0));
+        // Small-drive regression: usable space below the former 20 GiB reserve.
+        assert!(!is_low_disk(12 * 1024 * 1024 * 1024));
         assert!(!has_recovered(LOW_DISK_RECOVERY_THRESHOLD_BYTES - 1));
         assert!(has_recovered(LOW_DISK_RECOVERY_THRESHOLD_BYTES));
     }

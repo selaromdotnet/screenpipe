@@ -20,6 +20,7 @@ import {
   AUTOMATE_MY_WORK_TEMPLATE_NAME,
   buildAutomateMyWorkPrompt,
   FALLBACK_TEMPLATES,
+  parseTemplateInstructions,
   type CustomTemplate,
 } from "@/lib/summary-templates";
 import { type AutomationPipeInventory } from "@/lib/automation-pipe-evals";
@@ -33,6 +34,14 @@ import {
   type UserGoalCategory,
 } from "@/lib/live-views/onboarding-activation";
 import { CustomSummaryBuilder } from "./custom-summary-builder";
+import {
+  HomeCardAgentActions,
+  type HomeCardAgentTask,
+} from "./home-card-agent-actions";
+import { useGT } from "gt-react";
+import { msg, useMessages } from "gt-react";
+import { localizeDefinitions } from "@/lib/i18n/definitions";
+
 
 interface SummaryCardsProps {
   onSendMessage: (
@@ -41,6 +50,7 @@ interface SummaryCardsProps {
     entrySource?: ChatEntrySource,
     entryCard?: ChatEntryCard,
   ) => void;
+  onPreviewPrompt?: (prompt: string | null) => void;
   customTemplates: CustomTemplate[];
   onSaveCustomTemplate: (template: CustomTemplate) => void;
   onUpdateCustomTemplate: (template: CustomTemplate) => void;
@@ -85,6 +95,38 @@ export function homeCardSlugsForGoal(category: UserGoalCategory): string[] {
   return HOME_CARD_SLUGS_BY_GOAL[category];
 }
 
+// Chip labels centre in the whole chip. The agent logos only appear on hover,
+// focus or while a launch opens (always on touch screens), so room for them
+// opens only then; reserving it at rest pushed every label off-centre by a
+// different amount.
+const CHIP_LABEL_ROOM =
+  "px-2 group-hover/home-card:pr-12 group-focus-within/home-card:pr-12 group-has-[[data-expanded=true]]/home-card:pr-12 [@media(hover:none)]:pr-12";
+
+const QUICK_SUMMARY_TASKS = [
+  {
+    name: "meeting-prep",
+    title: msg("Meeting Prep", {}),
+    previewPrompt: "Summarize context I'll need for upcoming meetings",
+  },
+  {
+    name: "blockers",
+    title: msg("Blockers", {}),
+    previewPrompt: "What problems, errors, or blockers did I encounter?",
+  },
+] satisfies HomeCardAgentTask[];
+
+function customTemplateAgentTask(template: CustomTemplate): HomeCardAgentTask {
+  const instructions =
+    template.instructions ??
+    parseTemplateInstructions(template.prompt) ??
+    template.prompt;
+  return {
+    name: `custom-${template.id}`,
+    title: template.title,
+    previewPrompt: `Run my saved ${template.title} summary for ${template.timeRange}. ${instructions}`,
+  };
+}
+
 function HomeCardIcon({ slug, className }: { slug: string; className: string }) {
   const props = { className, strokeWidth: 1.5 };
   if (slug === "day-recap") return <CalendarDays {...props} />;
@@ -93,10 +135,38 @@ function HomeCardIcon({ slug, className }: { slug: string; className: string }) 
   return <Zap {...props} />;
 }
 
+function HomeCardArrow({ slug }: { slug: string }) {
+  return (
+    <ArrowRight
+      data-testid={`home-card-arrow-${slug}`}
+      className="h-4 w-4 shrink-0 text-foreground/55 transition-all duration-150 group-hover/card-primary:translate-x-0.5 group-hover/card-primary:opacity-0 group-hover/card-primary:text-background group-focus-visible/card-primary:opacity-0 group-focus-visible/card-primary:text-background motion-reduce:transition-none"
+      strokeWidth={1.5}
+      aria-hidden
+    />
+  );
+}
+
+function previewPromptForPipe(pipe: TemplatePipe): string {
+  return pipe.previewPrompt || pipe.description || pipe.title;
+}
+
+function promptPreviewHandlers(
+  prompt: string,
+  onPreviewPrompt?: (prompt: string | null) => void,
+) {
+  return {
+    onMouseEnter: () => onPreviewPrompt?.(prompt),
+    onMouseLeave: () => onPreviewPrompt?.(null),
+    onFocus: () => onPreviewPrompt?.(prompt),
+    onBlur: () => onPreviewPrompt?.(null),
+  };
+}
+
 // ─── Main component ──────────────────────────────────────────────────────────
 
 export function SummaryCards({
   onSendMessage,
+  onPreviewPrompt,
   customTemplates,
   onSaveCustomTemplate,
   onUpdateCustomTemplate,
@@ -106,6 +176,13 @@ export function SummaryCards({
   existingPipes = [],
   userGoalCategory = DEFAULT_USER_GOAL_CATEGORY,
 }: SummaryCardsProps) {
+
+  const uiMessages = useMessages();
+  const ui = useGT();
+  const templateLabel = (pipe: TemplatePipe, field: "title" | "description") => {
+    const source = FALLBACK_TEMPLATES.find(item => item.name === pipe.name)?.[field];
+    return source && source === pipe[field] ? uiMessages(source) : pipe[field];
+  };
   const [showAll, setShowAll] = useState(false);
   const [showBuilder, setShowBuilder] = useState(false);
   const [editingTemplate, setEditingTemplate] = useState<CustomTemplate | null>(null);
@@ -140,7 +217,13 @@ export function SummaryCards({
     }
   }, [impressionSignature]);
 
+  useEffect(
+    () => () => onPreviewPrompt?.(null),
+    [onPreviewPrompt],
+  );
+
   const handleCardClick = (pipe: TemplatePipe) => {
+    onPreviewPrompt?.(null);
     const entryCard = entryCardForHomeTemplate(pipe.name);
     posthog.capture("home_card_clicked", {
       kind: pipe.featured ? "template_featured" : "template_discover",
@@ -151,13 +234,14 @@ export function SummaryCards({
       pipe.name === AUTOMATE_MY_WORK_TEMPLATE_NAME
         ? buildAutomateMyWorkPrompt(existingPipes)
         : pipe.prompt;
-    onSendMessage(prompt, `${pipe.icon} ${pipe.title}`, "home_card", entryCard);
+    onSendMessage(prompt, `${pipe.icon} ${templateLabel(pipe, "title")}`, "home_card", entryCard);
   };
 
   // Opens the builder pre-filled for review/editing instead of running
   // immediately — saved prompts often reference dates or context that
   // changed since they were saved (#5239). Run lives inside the dialog.
   const handleCustomTemplateClick = (template: CustomTemplate) => {
+    onPreviewPrompt?.(null);
     posthog.capture("home_card_clicked", {
       kind: "custom_template",
     });
@@ -175,7 +259,7 @@ export function SummaryCards({
         <PipeAIIconLarge size={40} thinking={false} className="relative text-foreground/80" />
       </div>
       <h3 className="text-sm font-medium mb-0.5 text-foreground">
-        {userName ? `How can I help, ${userName}?` : "How can I help today?"}
+        {userName ? ui("How can I help, {value1}?", { value1: userName }) : ui("How can I help today?")}
       </h3>
       <p className="text-xs text-muted-foreground mb-2">
         From everything you&apos;ve seen, said, or heard
@@ -183,55 +267,72 @@ export function SummaryCards({
 
       {/* The onboarding goal or General Settings choice determines priority. */}
       {featured[0] && (
-        <button
-          data-testid={`summary-card-${featured[0].name}`}
-          onClick={() => handleCardClick(featured[0])}
-          className="group relative w-full max-w-lg mb-1.5 text-left px-4 py-3.5 border border-border/40 border-l-2 border-l-phosphor-strong hover:!bg-foreground hover:text-background hover:border-foreground hover:border-l-phosphor transition-all duration-150 cursor-pointer"
-        >
-          <div className="flex items-center gap-3">
-            <HomeCardIcon
-              slug={featured[0].name}
-              className="h-5 w-5 shrink-0 text-foreground/70 group-hover:text-background"
-            />
-            <div className="flex-1">
-              <div className="text-sm font-semibold group-hover:text-background leading-tight">
-                {featured[0].title}
+        <div className="group/home-card relative mb-1.5 w-full max-w-lg">
+          <button
+            type="button"
+            data-testid={`summary-card-${featured[0].name}`}
+            onClick={() => handleCardClick(featured[0])}
+            {...promptPreviewHandlers(
+              previewPromptForPipe(featured[0]),
+              onPreviewPrompt,
+            )}
+            className="group/card-primary w-full cursor-pointer rounded-lg border border-foreground/25 border-l-2 border-l-signal bg-card pl-4 pr-16 py-3.5 text-left text-foreground transition-colors duration-150 hover:border-foreground hover:bg-foreground hover:text-background focus-visible:border-foreground focus-visible:bg-foreground focus-visible:text-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground focus-visible:ring-offset-2 focus-visible:ring-offset-background motion-reduce:transition-none"
+          >
+            <div className="flex items-center gap-3">
+              <HomeCardIcon
+                slug={featured[0].name}
+                className="h-5 w-5 shrink-0 text-foreground/70 group-hover/card-primary:text-background group-focus-visible/card-primary:text-background"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold group-hover/card-primary:text-background group-focus-visible/card-primary:text-background leading-tight">
+                  {templateLabel(featured[0], "title")}
+                </div>
+                <div className="text-pretty text-xs text-muted-foreground group-hover/card-primary:text-background/60 group-focus-visible/card-primary:text-background/60 leading-tight mt-0.5">
+                  {templateLabel(featured[0], "description")}
+                </div>
               </div>
-              <div className="text-xs text-muted-foreground group-hover:text-background/60 leading-tight mt-0.5">
-                {featured[0].description}
-              </div>
+              <HomeCardArrow slug={featured[0].name} />
             </div>
-            <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground/30 group-hover:text-background/50" strokeWidth={1.5} />
-          </div>
-        </button>
+          </button>
+          <HomeCardAgentActions pipe={featured[0]} stacked />
+        </div>
       )}
 
       {featured[1] && (
+        <div className="group/home-card relative mb-1.5 w-full max-w-lg">
           <button
+            type="button"
             data-testid={`summary-card-${featured[1].name}`}
             onClick={() => handleCardClick(featured[1])}
-            className="group w-full max-w-lg mb-1.5 text-left px-3 py-2.5 border border-border/20 hover:bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer"
+            {...promptPreviewHandlers(
+              previewPromptForPipe(featured[1]),
+              onPreviewPrompt,
+            )}
+            className="group/card-primary w-full cursor-pointer rounded-lg border border-foreground/20 bg-card pl-4 pr-16 py-3 text-left text-foreground transition-colors duration-150 hover:border-foreground hover:bg-foreground hover:text-background focus-visible:border-foreground focus-visible:bg-foreground focus-visible:text-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground focus-visible:ring-offset-2 focus-visible:ring-offset-background motion-reduce:transition-none"
           >
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-3">
               <HomeCardIcon
                 slug={featured[1].name}
-                className="h-4 w-4 shrink-0 text-muted-foreground group-hover:text-background"
+                className="h-4 w-4 shrink-0 text-foreground/65 group-hover/card-primary:text-background group-focus-visible/card-primary:text-background"
               />
-              <div className="flex-1">
-                <div className="text-xs font-medium text-muted-foreground group-hover:text-background leading-tight">
-                  {featured[1].title}
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-semibold text-foreground/85 group-hover/card-primary:text-background group-focus-visible/card-primary:text-background leading-tight">
+                  {templateLabel(featured[1], "title")}
                 </div>
-                <div className="text-xs text-muted-foreground/60 group-hover:text-background/60 leading-tight mt-0.5">
-                  {featured[1].description}
+                <div className="text-pretty text-xs text-muted-foreground group-hover/card-primary:text-background/70 group-focus-visible/card-primary:text-background/70 leading-tight mt-0.5">
+                  {templateLabel(featured[1], "description")}
                 </div>
               </div>
+              <HomeCardArrow slug={featured[1].name} />
             </div>
           </button>
+          <HomeCardAgentActions pipe={featured[1]} stacked />
+        </div>
       )}
 
       {/* ─── Quick action chips ───────────────────────────────────────────── */}
       {/* One wrapping flow in the same 512px column as the cards: built-in
-          chips first, then the user's saved templates, then "+ custom". The
+          chips first, then the user's saved templates, then "+ Custom". The
           per-chip pin glyph is the sole user-created marker — it also cues the
           behavior split (built-ins run immediately, templates open the edit
           dialog). Labels and forced rows reviewed out in #5243. */}
@@ -240,61 +341,104 @@ export function SummaryCards({
       <div className="w-full max-w-lg mb-4 flex flex-wrap items-center gap-1">
         {/* Template-backed chips (Time Breakdown, Missed To-Dos) */}
         {featured.slice(2).map((pipe) => (
-          <button
-            key={pipe.name}
-            data-testid={`summary-card-${pipe.name}`}
-            onClick={() => handleCardClick(pipe)}
-            className="grow px-2 py-0.5 text-[11px] bg-muted/20 hover:bg-foreground hover:text-background border border-border/30 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer"
-          >
-            {pipe.title}
-          </button>
+          <div key={pipe.name} className="group/home-card relative min-w-[148px] flex-1">
+            <button
+              type="button"
+              data-testid={`summary-card-${pipe.name}`}
+              onClick={() => handleCardClick(pipe)}
+              {...promptPreviewHandlers(
+                previewPromptForPipe(pipe),
+                onPreviewPrompt,
+              )}
+              className={`group/card-primary h-10 w-full cursor-pointer rounded-md border border-foreground/20 bg-card ${CHIP_LABEL_ROOM} text-[11px] text-foreground/75 transition-[color,background-color,border-color,padding] duration-150 ease-out hover:border-foreground hover:bg-foreground hover:text-background focus-visible:border-foreground focus-visible:bg-foreground focus-visible:text-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground focus-visible:ring-offset-1 focus-visible:ring-offset-background motion-reduce:transition-none`}
+            >
+              <span className="transition-opacity duration-150 motion-reduce:transition-none">
+                {templateLabel(pipe, "title")}
+              </span>
+            </button>
+            <HomeCardAgentActions pipe={pipe} placement="chip" stacked />
+          </div>
         ))}
         {/* Quick summary chips */}
-        {[
-          { label: "Meeting Prep", prompt: "Summarize context I'll need for upcoming meetings" },
-          { label: "Blockers", prompt: "What problems, errors, or blockers did I encounter?" },
-        ].map((qt) => (
-          <button
-            key={qt.label}
-            onClick={() => {
-              posthog.capture("home_card_clicked", {
-                kind: "quick_summary_chip",
-              });
-              const prompt = `Analyze my screen and audio recordings from today.\n\nUser instructions: ${qt.prompt}\n\nOnly report activities you can verify from the recordings. If uncertain, say so. Format with clear headings and bullet points.`;
-              onSendMessage(
-                prompt,
-                `\u2728 ${qt.label} \u2014 Today`,
-                "home_card",
-                "other_builtin",
-              );
-            }}
-            className="grow px-2 py-0.5 text-[11px] bg-muted/20 hover:bg-foreground hover:text-background border border-border/30 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer"
-          >
-            {qt.label}
-          </button>
+        {localizeDefinitions(QUICK_SUMMARY_TASKS, uiMessages).map((task) => (
+          <div key={task.name} className="group/home-card relative min-w-[148px] flex-1">
+            <button
+              type="button"
+              {...promptPreviewHandlers(
+                task.previewPrompt ?? task.title,
+                onPreviewPrompt,
+              )}
+              onClick={() => {
+                onPreviewPrompt?.(null);
+                posthog.capture("home_card_clicked", {
+                  kind: "quick_summary_chip",
+                });
+                const prompt = `Analyze my screen and audio recordings from today.\n\nUser instructions: ${task.previewPrompt}\n\nOnly report activities you can verify from the recordings. If uncertain, say so. Format with clear headings and bullet points.`;
+                onSendMessage(
+                  prompt,
+                  `\u2728 ${task.title} \u2014 Today`,
+                  "home_card",
+                  "other_builtin",
+                );
+              }}
+              className={`group/card-primary h-10 w-full cursor-pointer rounded-md border border-foreground/20 bg-card ${CHIP_LABEL_ROOM} text-[11px] text-foreground/75 transition-[color,background-color,border-color,padding] duration-150 ease-out hover:border-foreground hover:bg-foreground hover:text-background focus-visible:border-foreground focus-visible:bg-foreground focus-visible:text-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground focus-visible:ring-offset-1 focus-visible:ring-offset-background motion-reduce:transition-none`}
+            >
+              <span className="transition-opacity duration-150 motion-reduce:transition-none">
+                {task.title}
+              </span>
+            </button>
+            <HomeCardAgentActions
+              pipe={task}
+              entryCard="other_builtin"
+              placement="chip" stacked
+            />
+          </div>
         ))}
         {/* User's saved templates — chips slightly fainter than built-ins with
             a pin glyph marking them as user-owned. Full text and management
             (edit/delete) live in the edit dialog. */}
         {customTemplates.map((ct) => (
-          <button
+          <div
             key={ct.id}
-            onClick={() => handleCustomTemplateClick(ct)}
-            title={ct.description || ct.timeRange}
-            className="grow inline-flex items-center justify-center gap-1 px-2 py-0.5 text-[11px] bg-muted/10 hover:bg-foreground hover:text-background border border-border/20 hover:border-foreground text-muted-foreground/80 transition-all duration-150 cursor-pointer max-w-[140px]"
+            className="group/home-card relative inline-flex min-w-[148px] max-w-[180px] grow"
           >
-            <Pin className="w-3 h-3 shrink-0" strokeWidth={1.5} />
-            <span className="truncate">{ct.title}</span>
-          </button>
+            <button
+              type="button"
+              {...promptPreviewHandlers(
+                ct.instructions ??
+                  parseTemplateInstructions(ct.prompt) ??
+                  ct.prompt,
+                onPreviewPrompt,
+              )}
+              onClick={() => handleCustomTemplateClick(ct)}
+              title={ct.description || ct.timeRange}
+              className={`group/card-primary inline-flex h-10 w-full cursor-pointer items-center justify-center gap-1 rounded-md border border-foreground/20 bg-card ${CHIP_LABEL_ROOM} text-[11px] text-foreground/70 transition-[color,background-color,border-color,padding] duration-150 ease-out hover:border-foreground hover:bg-foreground hover:text-background focus-visible:border-foreground focus-visible:bg-foreground focus-visible:text-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground focus-visible:ring-offset-1 focus-visible:ring-offset-background motion-reduce:transition-none`}
+            >
+              <span className="inline-flex min-w-0 items-center gap-1 transition-opacity duration-150 motion-reduce:transition-none">
+                <Pin className="h-3 w-3 shrink-0" strokeWidth={1.5} />
+                <span className="truncate">{ct.title}</span>
+              </span>
+            </button>
+            <HomeCardAgentActions
+              pipe={customTemplateAgentTask(ct)}
+              entryCard="custom"
+              placement="chip" stacked
+            />
+          </div>
         ))}
+        {/* An empty slot, not a ready action. Hover inverts like the other
+            chips, but the dashes take the background colour: in the fill's
+            colour they vanish and the slot reads as a solid block. */}
         <button
+          type="button"
           onClick={() => {
             posthog.capture("home_card_clicked", { kind: "custom_summary_open" });
             setShowBuilder(true);
           }}
-          className="px-2 py-0.5 text-[11px] border border-dashed border-border/40 text-muted-foreground/50 hover:text-foreground hover:border-foreground transition-all duration-150 cursor-pointer"
+          data-testid="custom-summary-open"
+          className="h-10 min-w-[148px] flex-1 cursor-pointer rounded-md border border-dashed border-foreground/25 px-1 text-[11px] text-muted-foreground transition-colors duration-150 ease-out hover:border-background/50 hover:bg-foreground hover:text-background focus-visible:border-background/50 focus-visible:bg-foreground focus-visible:text-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground focus-visible:ring-offset-1 focus-visible:ring-offset-background motion-reduce:transition-none"
         >
-          + custom
+          + Custom
         </button>
       </div>
 
@@ -310,14 +454,18 @@ export function SummaryCards({
             <button
               key={pipe.name}
               onClick={() => handleCardClick(pipe)}
-              className="group text-left p-2 border border-border/30 bg-muted/10 hover:bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer"
+              {...promptPreviewHandlers(
+                previewPromptForPipe(pipe),
+                onPreviewPrompt,
+              )}
+              className="group/card-primary group cursor-pointer rounded-lg border border-border/30 bg-muted/10 p-2 text-left transition-all duration-150 hover:border-foreground hover:bg-foreground hover:text-background"
             >
               <div className="text-sm mb-0.5">{pipe.icon}</div>
               <div className="text-xs font-medium group-hover:text-background mb-0.5 leading-tight">
-                {pipe.title}
+                {templateLabel(pipe, "title")}
               </div>
               <div className="text-xs text-muted-foreground group-hover:text-background/60 leading-tight line-clamp-1">
-                {pipe.description}
+                {templateLabel(pipe, "description")}
               </div>
             </button>
           ))}

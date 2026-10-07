@@ -19,9 +19,41 @@ import {
 } from "./desktop-remote-control";
 
 describe("desktop remote control", () => {
+  it.each(["macos", "windows", "linux"])(
+    "enables structured context for old opt-outs on %s and honors emergency stops",
+    (platform) => {
+      const settings = {
+        platform,
+        enableSemanticContext: false,
+        semanticContextPreference: false,
+        enterpriseManagedSettings: { enableSemanticContext: false },
+        remoteControlPreferences: {
+          ...NEW_INSTALL_REMOTE_CONTROL_PREFERENCES,
+          semanticContext: false,
+        },
+      };
+      const policy = structuredClone(LOCAL_DESKTOP_REMOTE_POLICY);
+      policy.boolean.semanticContext.defaultEnabled = false;
+      const enabled = buildDesktopRemoteControlPatch(settings, policy);
+      expect(enabled.preferences.semanticContext).toBe(true);
+      expect(enabled.patch.enableSemanticContext).toBe(true);
+      expect(enabled.recorderRestartRequired).toBe(true);
+      policy.boolean.semanticContext.forceDisabled = true;
+      const stopped = buildDesktopRemoteControlPatch(
+        { ...settings, ...enabled.patch }, policy,
+      );
+      expect(stopped.patch.enableSemanticContext).toBe(false);
+      policy.boolean.semanticContext.forceDisabled = false;
+      const restored = buildDesktopRemoteControlPatch(
+        { ...settings, ...enabled.patch, ...stopped.patch }, policy,
+      );
+      expect(restored.patch.enableSemanticContext).toBe(true);
+    },
+  );
+
   it("preserves each shipped default for missing or malformed flag payloads", () => {
     expect(parseBooleanRemotePolicy("semanticContext", null)).toEqual({
-      defaultEnabled: false,
+      defaultEnabled: true,
       forceDisabled: false,
     });
     expect(parseBooleanRemotePolicy("coreAudioSystemAudio", undefined)).toEqual(
@@ -44,7 +76,7 @@ describe("desktop remote control", () => {
         forceDisabled: false,
         arbitrarySetting: true,
       }),
-    ).toEqual({ defaultEnabled: false, forceDisabled: false });
+    ).toEqual({ defaultEnabled: true, forceDisabled: false });
     expect(
       parseAecModeRemotePolicy({
         defaultValue: "invalid",
@@ -116,6 +148,29 @@ describe("desktop remote control", () => {
     ).toBe(true);
   });
 
+  it("automatically enables meeting capture for old opt-outs and old rollout defaults", () => {
+    const settings = {
+      experimentalMeetingPiggyback: false,
+      remoteControlPreferences: { ...NEW_INSTALL_REMOTE_CONTROL_PREFERENCES, smartRecording: false },
+      enterpriseManagedSettings: { experimentalMeetingPiggyback: false },
+    };
+    const policy = {
+      ...LOCAL_DESKTOP_REMOTE_POLICY,
+      boolean: {
+        ...LOCAL_DESKTOP_REMOTE_POLICY.boolean,
+        smartRecording: { defaultEnabled: false, forceDisabled: false },
+      },
+    };
+    const result = buildDesktopRemoteControlPatch(settings, policy);
+    expect(result.preferences.smartRecording).toBeNull();
+    expect(result.patch.experimentalMeetingPiggyback).toBe(true);
+    expect(result.recorderRestartRequired).toBe(true);
+    policy.boolean.smartRecording.forceDisabled = true;
+    expect(buildDesktopRemoteControlPatch(
+      { ...settings, experimentalMeetingPiggyback: true }, policy,
+    ).patch.experimentalMeetingPiggyback).toBe(false);
+  });
+
   it("preserves existing values while new stores inherit remote defaults", () => {
     expect(
       normalizeDesktopRemotePreferences({
@@ -130,11 +185,9 @@ describe("desktop remote control", () => {
     ).toEqual({
       semanticContext: true,
       coreAudioSystemAudio: false,
-      smartRecording: true,
+      smartRecording: null,
       filterMusic: false,
       prioritizeInputLatency: true,
-      // Never chosen: stays null so the rollout default still applies.
-      sidebarCustomization: null,
       overlayHiding: null,
       aecMode: "screenpipe",
     });
@@ -187,13 +240,31 @@ describe("desktop remote control", () => {
           defaultEnabled: false,
           forceDisabled: false,
         },
+        overlayHiding: { defaultEnabled: false, forceDisabled: false },
+      },
+      autoUpdate: { forceEnabled: false },
+    });
+  });
+
+  it("drops the retired sidebar rollout without resetting other policies", () => {
+    const storedPolicy = {
+      ...LOCAL_DESKTOP_REMOTE_POLICY,
+      boolean: {
+        ...LOCAL_DESKTOP_REMOTE_POLICY.boolean,
+        semanticContext: { defaultEnabled: true, forceDisabled: true },
         sidebarCustomization: {
           defaultEnabled: false,
           forceDisabled: false,
         },
-        overlayHiding: { defaultEnabled: false, forceDisabled: false },
       },
-      autoUpdate: { forceEnabled: false },
+    };
+
+    expect(normalizeDesktopRemotePolicySnapshot(storedPolicy)).toEqual({
+      ...LOCAL_DESKTOP_REMOTE_POLICY,
+      boolean: {
+        ...LOCAL_DESKTOP_REMOTE_POLICY.boolean,
+        semanticContext: { defaultEnabled: true, forceDisabled: true },
+      },
     });
   });
 
@@ -265,9 +336,9 @@ describe("desktop remote control", () => {
       remoteControlPreferences: NEW_INSTALL_REMOTE_CONTROL_PREFERENCES,
       remoteControlPolicy: LOCAL_DESKTOP_REMOTE_POLICY,
       autoUpdate: false,
-      enableSemanticContext: false,
+      enableSemanticContext: true,
       experimentalCoreaudioSystemAudio: true,
-      experimentalMeetingPiggyback: false,
+      experimentalMeetingPiggyback: true,
       filterMusic: true,
       prioritizeInputLatency: false,
       aecMode: "off" as const,
@@ -337,7 +408,7 @@ describe("desktop remote control", () => {
 
     expect(
       buildDesktopRemoteControlPatch(settings, policy).changedControls,
-    ).toEqual([]);
+    ).toEqual(["semanticContext", "smartRecording"]);
   });
 
   it("ships the rollout capability disabled and never seeds a local opt-in", () => {
@@ -384,12 +455,11 @@ describe("desktop remote control", () => {
     const result = buildDesktopRemoteControlPatch(
       {
         platform: "macos",
-        enableSemanticContext: false,
+        enableSemanticContext: true,
         experimentalCoreaudioSystemAudio: true,
-        experimentalMeetingPiggyback: false,
+        experimentalMeetingPiggyback: true,
         filterMusic: true,
         prioritizeInputLatency: false,
-        enableSidebarCustomization: false,
         aecMode: "off",
         screenpipeAecEnabled: false,
         macosInputVpioEnabled: false,

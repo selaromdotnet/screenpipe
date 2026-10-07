@@ -9,6 +9,11 @@ use specta::Type;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error, info, warn};
 
+/// Match RecordingConfig's effective audio setting, including legacy mode-only stores.
+pub(crate) fn microphone_required(settings: &screenpipe_config::RecordingSettings) -> bool {
+    !settings.disable_audio && !settings.audio_capture_mode.eq_ignore_ascii_case("disabled")
+}
+
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub enum OSPermission {
@@ -85,37 +90,21 @@ pub fn screen_recording_permission_state() -> ScreenRecordingPermissionState {
 
 #[cfg(target_os = "macos")]
 fn direct_tcc_screen_recording_preflight() -> Result<bool, String> {
-    use std::ffi::c_void;
+    screenpipe_core::permissions::check_screen_recording_tcc().map(|status| status.is_granted())
+}
 
-    type TccAccessPreflight = unsafe extern "C" fn(*const c_void) -> u32;
+/// Whether this process can safely enter ScreenCaptureKit right now.
+///
+/// `GrantedNeedsRestart` and `RevokedButCached` are both unusable: only a
+/// matching cached + cache-bypassed TCC grant may start capture.
+#[cfg(target_os = "macos")]
+pub fn screen_recording_permission_usable_in_process() -> bool {
+    screen_recording_state_usable_in_process(screen_recording_permission_state())
+}
 
-    const TCC_FRAMEWORK: &[u8] = b"/System/Library/PrivateFrameworks/TCC.framework/TCC\0";
-    const PREFLIGHT_SYMBOL: &[u8] = b"TCCAccessPreflight\0";
-    const SCREEN_CAPTURE_SERVICE_SYMBOL: &[u8] = b"kTCCServiceScreenCapture\0";
-    const TCC_PREFLIGHT_GRANTED: u32 = 0;
-
-    unsafe {
-        let handle = libc::dlopen(
-            TCC_FRAMEWORK.as_ptr().cast(),
-            libc::RTLD_LAZY | libc::RTLD_LOCAL,
-        );
-        if handle.is_null() {
-            return Err("failed to load TCC.framework".to_string());
-        }
-
-        let preflight_symbol = libc::dlsym(handle, PREFLIGHT_SYMBOL.as_ptr().cast());
-        let service_symbol = libc::dlsym(handle, SCREEN_CAPTURE_SERVICE_SYMBOL.as_ptr().cast());
-        if preflight_symbol.is_null() || service_symbol.is_null() {
-            libc::dlclose(handle);
-            return Err("required TCC.framework symbols are unavailable".to_string());
-        }
-
-        let preflight: TccAccessPreflight = std::mem::transmute(preflight_symbol);
-        let service = *(service_symbol as *const *const c_void);
-        let result = preflight(service);
-        libc::dlclose(handle);
-        Ok(result == TCC_PREFLIGHT_GRANTED)
-    }
+#[cfg(any(target_os = "macos", test))]
+fn screen_recording_state_usable_in_process(state: ScreenRecordingPermissionState) -> bool {
+    matches!(state, ScreenRecordingPermissionState::Granted)
 }
 
 /// Restart only after the user explicitly clicks the in-app action. macOS's
@@ -443,7 +432,7 @@ pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
     let mut last_err: Option<String> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let state = app.state::<crate::recording::RecordingState>();
-        match crate::recording::start_capture(state, app.clone()).await {
+        match crate::recording::restart_capture_after_permission(state, app.clone()).await {
             Ok(()) => {
                 if attempt > 1 {
                     info!(
@@ -1473,6 +1462,20 @@ mod screen_recording_state_tests {
         );
     }
 
+    #[test]
+    fn only_matching_grants_are_usable_for_capture() {
+        assert!(screen_recording_state_usable_in_process(
+            ScreenRecordingPermissionState::Granted
+        ));
+        for state in [
+            ScreenRecordingPermissionState::Denied,
+            ScreenRecordingPermissionState::GrantedNeedsRestart,
+            ScreenRecordingPermissionState::RevokedButCached,
+        ] {
+            assert!(!screen_recording_state_usable_in_process(state));
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn reads_the_current_process_tcc_preflight() {
@@ -1640,5 +1643,25 @@ mod mic_grant_restart_tests {
         assert!(flag
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod microphone_requirement_tests {
+    #[test]
+    fn microphone_requirement_matches_effective_recorder_audio_config() {
+        for disabled in [false, true] {
+            for mode in ["always", "meetings-only", "disabled", "DISABLED", "", "unknown"] {
+                let settings = screenpipe_config::RecordingSettings {
+                    disable_audio: disabled,
+                    audio_capture_mode: mode.to_owned(),
+                    ..Default::default()
+                };
+                let config = screenpipe_engine::RecordingConfig::from_settings(
+                    &settings, std::path::PathBuf::from("/tmp/permission-requirement-test"), None,
+                );
+                assert_eq!(super::microphone_required(&settings), !config.disable_audio, "disable_audio={disabled}, mode={mode}");
+            }
+        }
     }
 }

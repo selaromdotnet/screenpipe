@@ -8,26 +8,49 @@
 // fails, and disconnect stays idempotent.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { parse as parseYaml } from "yaml";
 
 const fsMock = vi.hoisted(() => ({
   files: new Map<string, string>(),
   unreadable: new Set<string>(),
+  forbiddenDirectories: new Set<string>(),
 }));
+
+const pathMock = vi.hoisted(() => ({ home: "/Users/test" }));
 
 const skillsMock = vi.hoisted(() => ({
   installExternalAgentSkills: vi.fn(async () => ["a", "b"]),
   removeExternalAgentSkills: vi.fn(async () => ["a", "b"]),
 }));
 
-vi.mock("@tauri-apps/api/path", () => ({
-  homeDir: vi.fn(async () => "/Users/test"),
-  join: vi.fn(async (...parts: string[]) => parts.join("/")),
-  dirname: vi.fn(async (p: string) => p.split("/").slice(0, -1).join("/")),
+const tauriMock = vi.hoisted(() => ({
+  getEnv: vi.fn(async () => ""),
+  resolveAiToolConfigPath: vi.fn<[string], Promise<
+    { status: "ok"; data: string } | { status: "error"; error: string }
+  >>(),
+  grokbotConnection: vi.fn(),
+  setAiToolAutoConnectOptOut: vi.fn(async () => ({ status: "ok", data: null })),
 }));
+
+vi.mock("@tauri-apps/api/path", async () => {
+  const { posix, win32 } = await import("node:path");
+  const paths = () => pathMock.home.includes("\\") ? win32 : posix;
+  // Tauri simplifies verbatim Windows prefixes in join/dirname and strips
+  // trailing separators in join, unlike node:path.join.
+  const simplified = (path: string) => path.replace(/^\\\\\?\\/, "");
+  return {
+    homeDir: vi.fn(async () => pathMock.home),
+    configDir: vi.fn(async () => paths().join(pathMock.home, "Library/Application Support")),
+    join: vi.fn(async (...parts: string[]) => simplified(paths().join(...parts)).replace(/[\\/]+$/, "")),
+    dirname: vi.fn(async (path: string) => simplified(paths().dirname(path))),
+  };
+});
 
 vi.mock("@tauri-apps/plugin-fs", () => ({
   exists: vi.fn(async (path: string) => fsMock.files.has(path) || fsMock.unreadable.has(path)),
-  mkdir: vi.fn(async () => undefined),
+  mkdir: vi.fn(async (path: string) => {
+    if (fsMock.forbiddenDirectories.has(path)) throw new Error(`forbidden path: ${path}`);
+  }),
   readTextFile: vi.fn(async (path: string) => {
     if (fsMock.unreadable.has(path)) throw new Error("EACCES: permission denied");
     const text = fsMock.files.get(path);
@@ -60,11 +83,15 @@ vi.mock("@tauri-apps/plugin-fs", () => ({
 
 vi.mock("@/lib/utils/tauri", () => ({
   commands: {
+    getEnv: tauriMock.getEnv,
+    resolveAiToolConfigPath: tauriMock.resolveAiToolConfigPath,
     getLocalApiConfig: vi.fn(async () => ({ key: "sp-test", port: 3030, auth_enabled: true })),
     bunCheck: vi.fn(async () => ({
       status: "ok",
       data: { available: true, path: "/app/bun" },
     })),
+    setAiToolAutoConnectOptOut: tauriMock.setAiToolAutoConnectOptOut,
+    grokbotConnection: tauriMock.grokbotConnection,
   },
 }));
 
@@ -77,21 +104,39 @@ vi.mock("@/lib/hooks/use-hardcoded-tiles", () => ({
 vi.mock("@/lib/external-agent-skills", () => skillsMock);
 
 import {
+  installVscodeMcp,
+  uninstallVscodeMcp,
+  isVscodeMcpInstalled,
+  isToolConfigHealthy,
+  installCodexMcp,
+  installCloudMcp,
+  uninstallCodexMcp,
   installCursorMcp,
   uninstallCursorMcp,
+  installOpenclawMcp,
+  uninstallOpenclawMcp,
+  isOpenclawMcpInstalled,
   installHermesMcp,
+  isHermesMcpInstalled,
   uninstallHermesMcp,
   installRunnerMcp,
   uninstallRunnerMcp,
+  installGeminiMcp,
+  uninstallGeminiMcp,
   detectAiTools,
   connectAiTool,
+  connectAiToolTargets,
   disconnectAiTool,
+  disconnectAiToolTargets,
   friendlyToolError,
 } from "@/lib/ai-tools-mcp";
 
 const CURSOR = "/Users/test/.cursor/mcp.json";
+const CLAUDE_DESKTOP = "/Users/test/Library/Application Support/Claude/claude_desktop_config.json";
+const CLAUDE_CODE = "/Users/test/.claude.json";
 const HERMES = "/Users/test/.hermes/config.yaml";
 const RUNNER = "/Users/test/.runner/mcp.json";
+const GEMINI = "/Users/test/.gemini/settings.json";
 
 const backupsOf = (path: string) =>
   Array.from(fsMock.files.keys()).filter((p) => p.startsWith(`${path}.screenpipe-backup-`));
@@ -100,13 +145,77 @@ const tmpsOf = (path: string) =>
   Array.from(fsMock.files.keys()).filter((p) => p.startsWith(`${path}.`) && p.endsWith(".tmp"));
 
 beforeEach(() => {
+  pathMock.home = "/Users/test";
+  tauriMock.getEnv.mockReset().mockResolvedValue("");
+  tauriMock.resolveAiToolConfigPath.mockReset();
+  tauriMock.resolveAiToolConfigPath.mockImplementation(async (path) => ({ status: "ok", data: path }));
   fsMock.files.clear();
   fsMock.unreadable.clear();
+  fsMock.forbiddenDirectories.clear();
   skillsMock.installExternalAgentSkills.mockClear();
   skillsMock.removeExternalAgentSkills.mockClear();
+  tauriMock.setAiToolAutoConnectOptOut.mockClear();
 });
 
 describe("safe config IO", () => {
+  it.each([
+    ["POSIX", "/Users/test/", "/Users/test/.claude.json", "/Users/test/.claude.json"],
+    ["Windows", "C:\\Users\\test\\", "C:\\Users\\test\\.claude.json", "C:\\Users\\test\\.claude.json"],
+    ["Windows canonical", "C:\\Users\\test\\", "C:\\Users\\test\\.claude.json", "\\\\?\\C:\\Users\\test\\.claude.json"],
+  ])("connects and disconnects Claude Code with a forbidden home directory on %s", async (_, home, configPath, target) => {
+    pathMock.home = home;
+    fsMock.forbiddenDirectories.add(home.slice(0, -1));
+    tauriMock.resolveAiToolConfigPath.mockImplementation(async (path) => ({
+      status: "ok", data: path === configPath ? target : path,
+    }));
+    const seeded = JSON.stringify({ theme: "dark", mcpServers: { other: { command: "other-tool" } } });
+    fsMock.files.set(target, seeded);
+
+    await connectAiTool("claude-code");
+    expect(JSON.parse(fsMock.files.get(target)!).mcpServers.screenpipe).toBeDefined();
+    expect(fsMock.files.get(backupsOf(target)[0])).toBe(seeded);
+    expect(tmpsOf(target)).toEqual([]);
+
+    await disconnectAiTool("claude-code");
+    expect(JSON.parse(fsMock.files.get(target)!)).toEqual(JSON.parse(seeded));
+    expect(tmpsOf(target)).toEqual([]);
+
+    // A first connection also works when the home-level config is absent.
+    fsMock.files.delete(target);
+    await connectAiTool("claude-code");
+    expect(JSON.parse(fsMock.files.get(target)!).mcpServers.screenpipe).toBeDefined();
+  });
+
+  it.each([
+    ["/Users/test/.codex/config.toml", 'model = "test"\n', installCodexMcp, uninstallCodexMcp],
+    [CURSOR, '{"theme":"dark"}', installCursorMcp, uninstallCursorMcp],
+  ] as const)("backs up and replaces the resolved target of %s on connect and disconnect", async (path, seeded, install, uninstall) => {
+    const target = `/Users/test/dotfiles/${path.split("/").pop()}`;
+    fsMock.files.set(target, seeded);
+    tauriMock.resolveAiToolConfigPath.mockImplementation(async (requested) => ({
+      status: "ok", data: requested === path ? target : requested,
+    }));
+
+    await install();
+    expect(fsMock.files.get(target)).toContain("screenpipe");
+    expect(fsMock.files.get(backupsOf(target)[0])).toBe(seeded);
+    expect(fsMock.files.has(path)).toBe(false);
+    expect(backupsOf(path)).toHaveLength(0);
+    expect(tmpsOf(target)).toHaveLength(0);
+
+    await uninstall();
+    expect(fsMock.files.get(target)).not.toContain("screenpipe");
+    expect(fsMock.files.get(target)).toContain(path.endsWith("toml") ? 'model = "test"' : '"theme": "dark"');
+    expect(fsMock.files.has(path)).toBe(false);
+  });
+
+  it("refuses connect and disconnect when config resolution fails", async () => {
+    tauriMock.resolveAiToolConfigPath.mockResolvedValue({ status: "error", error: "could not resolve config: symlink loop" });
+    await expect(installCodexMcp()).rejects.toThrow(/could not resolve config/);
+    await expect(uninstallCodexMcp()).rejects.toThrow(/could not resolve config/);
+    expect(fsMock.files.size).toBe(0);
+  });
+
   it("preserves unrelated servers and settings, and takes a backup", async () => {
     const seeded = JSON.stringify({ mcpServers: { other: { command: "x" } }, theme: "dark" });
     fsMock.files.set(CURSOR, seeded);
@@ -122,6 +231,25 @@ describe("safe config IO", () => {
     expect(backupsOf(CURSOR)).toHaveLength(1);
     expect(fsMock.files.get(backupsOf(CURSOR)[0])).toBe(seeded);
     expect(tmpsOf(CURSOR)).toHaveLength(0);
+  });
+
+  it("canonicalizes a differently-cased screenpipe entry instead of duplicating it", async () => {
+    fsMock.files.set(
+      CURSOR,
+      JSON.stringify({
+        mcpServers: {
+          Screenpipe: { command: "old" },
+          other: { command: "x" },
+        },
+      }),
+    );
+
+    await installCursorMcp();
+
+    const servers = JSON.parse(fsMock.files.get(CURSOR)!).mcpServers;
+    expect(Object.keys(servers).sort()).toEqual(["other", "screenpipe"]);
+    await uninstallCursorMcp();
+    expect(Object.keys(JSON.parse(fsMock.files.get(CURSOR)!).mcpServers)).toEqual(["other"]);
   });
 
   it("refuses to overwrite invalid JSON and leaves the file untouched", async () => {
@@ -171,6 +299,51 @@ describe("safe config IO", () => {
   });
 });
 
+describe("OpenClaw native MCP configuration", () => {
+  const path = "/Users/test/.openclaw/openclaw.json";
+  it("writes mcp.servers in a JSON5 config and preserves unrelated settings", async () => {
+    fsMock.files.set(path, "{ // user config\n gateway: {mode: 'local'}, mcp: {servers: {other: {command: 'keep'}}}, }");
+    await installOpenclawMcp();
+    await expect(isOpenclawMcpInstalled()).resolves.toBe(true);
+    const root = JSON.parse(fsMock.files.get(path)!);
+    expect(root.gateway).toEqual({mode: "local"});
+    expect(root.mcpServers).toBeUndefined();
+    expect(root.mcp.servers.other.command).toBe("keep");
+    expect(root.mcp.servers.screenpipe).toMatchObject({command:"/app/bun", transport:"stdio", env:{SCREENPIPE_LOCAL_API_KEY:"sp-test", SCREENPIPE_MCP_CLIENT:"openclaw"}});
+    await uninstallOpenclawMcp();
+    expect(JSON.parse(fsMock.files.get(path)!).mcp.servers).toEqual({other:{command:"keep"}});
+    await expect(isOpenclawMcpInstalled()).resolves.toBe(false);
+  });
+
+  it("migrates legacy servers and repairs the old Screenpipe entry idempotently", async () => {
+    fsMock.files.set(path, JSON.stringify({mcpServers:{Screenpipe:{command:"stale"},other:{command:"keep"}},mcp:{servers:{native:{command:"native"}}}}));
+    await expect(isOpenclawMcpInstalled()).resolves.toBe(false);
+    await installOpenclawMcp();
+    const first = fsMock.files.get(path)!;
+    await installOpenclawMcp();
+    expect(fsMock.files.get(path)).toBe(first);
+    const root = JSON.parse(first);
+    expect(root.mcpServers).toBeUndefined();
+    expect(Object.keys(root.mcp.servers).sort()).toEqual(["native","other","screenpipe"]);
+  });
+
+  it.each([
+    '{mcp: []}', '{mcp: {servers: []}}', '{mcpServers: []}', '{broken',
+    '{mcpServers:{other:{command:"a"}},mcp:{servers:{other:{command:"b"}}}}',
+  ])("refuses malformed maps and migration conflicts unchanged: %s", async seeded => {
+    fsMock.files.set(path, seeded);
+    await expect(installOpenclawMcp()).rejects.toThrow();
+    await expect(uninstallOpenclawMcp()).rejects.toThrow();
+    expect(fsMock.files.get(path)).toBe(seeded);
+  });
+
+  it("disconnects a legacy entry without deleting other servers", async () => {
+    fsMock.files.set(path, JSON.stringify({mcpServers:{screenpipe:{command:"old"}, other:{command:"keep"}}}));
+    await uninstallOpenclawMcp();
+    expect(JSON.parse(fsMock.files.get(path)!)).toEqual({mcp:{servers:{other:{command:"keep"}}}});
+  });
+});
+
 describe("hermes yaml handling", () => {
   it("appends a real block below the shipped commented example, and removes it cleanly", async () => {
     const seeded = "model: x\n# mcp_servers:\n#   time:\n#     command: uvx\n";
@@ -190,11 +363,51 @@ describe("hermes yaml handling", () => {
     expect(after).not.toContain("SCREENPIPE_LOCAL_API_KEY");
   });
 
-  it("fails visibly on a hand-authored mcp_servers block", async () => {
-    fsMock.files.set(HERMES, "mcp_servers:\n  other:\n    command: x\n");
+  it("connects and disconnects alongside existing servers, preserving comments", async () => {
+    const seeded = "# my model\nmodel: x\nmcp_servers:\n  # keep my server\n  other:\n    command: x\nnotifications: true\n";
+    fsMock.files.set(HERMES, seeded);
+    await expect(isToolConfigHealthy("hermes")).resolves.toBe(true);
+    await installHermesMcp();
+    await expect(isHermesMcpInstalled()).resolves.toBe(true);
+    const connected = fsMock.files.get(HERMES)!;
+    expect(connected).toContain("# my model");
+    expect(connected).toContain("# keep my server");
+    expect(parseYaml(connected).mcp_servers.other).toEqual({ command: "x" });
+    expect(parseYaml(connected).mcp_servers.screenpipe.env.SCREENPIPE_LOCAL_API_KEY).toBe("sp-test");
+    await uninstallHermesMcp();
+    expect(parseYaml(fsMock.files.get(HERMES)!)).toEqual(parseYaml(seeded));
+    await expect(isHermesMcpInstalled()).resolves.toBe(false);
+  });
 
-    await expect(installHermesMcp()).rejects.toThrow(/add the screenpipe server manually/);
-    expect(fsMock.files.get(HERMES)).toBe("mcp_servers:\n  other:\n    command: x\n");
+  it("refreshes stale credentials without duplicating a mixed-case Screenpipe entry", async () => {
+    fsMock.files.set(HERMES, "mcp_servers:\n  Screenpipe:\n    command: old\n    env: {SCREENPIPE_LOCAL_API_KEY: stale}\n  other: {command: keep}\n");
+    await installHermesMcp();
+    await installHermesMcp();
+    const servers = parseYaml(fsMock.files.get(HERMES)!).mcp_servers;
+    expect(Object.keys(servers).sort()).toEqual(["other", "screenpipe"]);
+    expect(servers.screenpipe.env.SCREENPIPE_LOCAL_API_KEY).toBe("sp-test");
+  });
+
+  it("does not mistake mentions in prompts or other settings for an installed server", async () => {
+    fsMock.files.set(HERMES, "prompt: |\n  use screenpipe-mcp\nskills:\n  screenpipe: true\n");
+    await expect(isHermesMcpInstalled()).resolves.toBe(false);
+    await installHermesMcp();
+    await expect(isHermesMcpInstalled()).resolves.toBe(true);
+  });
+
+  it("supports an inline mapping while preserving unrelated YAML", async () => {
+    fsMock.files.set(HERMES, "mcp_servers: {other: {command: keep}}\nmodel: x\n");
+    await installHermesMcp();
+    await uninstallHermesMcp();
+    expect(parseYaml(fsMock.files.get(HERMES)!)).toEqual({ model: "x", mcp_servers: {other: {command: "keep"}} });
+  });
+
+  it.each(["mcp_servers: [broken", "mcp_servers: nope\n", "mcp_servers: {}\nmcp_servers: {}\n", "- not-a-config\n"])("refuses malformed YAML unchanged: %s", async (seeded) => {
+    fsMock.files.set(HERMES, seeded);
+    await expect(installHermesMcp()).rejects.toThrow();
+    await expect(uninstallHermesMcp()).rejects.toThrow();
+    await expect(isToolConfigHealthy("hermes")).resolves.toBe(false);
+    expect(fsMock.files.get(HERMES)).toBe(seeded);
   });
 });
 
@@ -226,6 +439,79 @@ describe("runner desktop MCP", () => {
     const removed = JSON.parse(fsMock.files.get(RUNNER)!);
     expect(removed.mcpServers.screenpipe).toBeUndefined();
     expect(removed.mcpServers.other.url).toBe("https://example.com/mcp");
+  });
+});
+
+describe("Claude Code MCP", () => {
+  it("detects and connects Claude Code without Claude Desktop", async () => {
+    fsMock.files.set(CLAUDE_CODE, "{}\n");
+
+    await expect(detectAiTools()).resolves.toContain("claude-code");
+    await connectAiTool("claude-code");
+
+    const entry = JSON.parse(fsMock.files.get(CLAUDE_CODE)!).mcpServers.screenpipe;
+    expect(entry.command).toBe("/app/bun");
+    expect(entry.env.SCREENPIPE_MCP_CLIENT).toBe("claude-code");
+    expect(skillsMock.installExternalAgentSkills).toHaveBeenCalledWith("claude");
+  });
+
+  it("keeps the shared skill when only one Claude config can connect", async () => {
+    fsMock.files.set(CLAUDE_DESKTOP, "{}\n");
+    fsMock.files.set(CLAUDE_CODE, "broken{");
+
+    const result = await connectAiToolTargets(["claude", "claude-code"]);
+
+    expect(result.succeeded).toEqual(["claude"]);
+    expect(result.failed.map(({ id }) => id)).toEqual(["claude-code"]);
+    expect(JSON.parse(fsMock.files.get(CLAUDE_DESKTOP)!).mcpServers.screenpipe).toBeTruthy();
+    expect(fsMock.files.get(CLAUDE_CODE)).toBe("broken{");
+    expect(skillsMock.removeExternalAgentSkills).toHaveBeenCalledTimes(1);
+    expect(skillsMock.installExternalAgentSkills).toHaveBeenLastCalledWith("claude");
+  });
+
+  it("opts out both Claude targets even when one config cannot be removed", async () => {
+    fsMock.files.set(CLAUDE_DESKTOP, JSON.stringify({
+      mcpServers: { screenpipe: { command: "/app/bun" } },
+    }));
+    fsMock.files.set(CLAUDE_CODE, "broken{");
+
+    const result = await disconnectAiToolTargets(["claude", "claude-code"]);
+
+    expect(result.succeeded).toEqual(["claude"]);
+    expect(result.failed.map(({ id }) => id)).toEqual(["claude-code"]);
+    expect(JSON.parse(fsMock.files.get(CLAUDE_DESKTOP)!).mcpServers.screenpipe).toBeUndefined();
+    expect(tauriMock.setAiToolAutoConnectOptOut).toHaveBeenCalledWith("claude", true);
+    expect(tauriMock.setAiToolAutoConnectOptOut).toHaveBeenCalledWith("claude-code", true);
+  });
+});
+
+describe("gemini CLI MCP", () => {
+  it("detects Gemini CLI from its user config directory", async () => {
+    fsMock.files.set("/Users/test/.gemini", "directory marker");
+
+    await expect(detectAiTools()).resolves.toContain("gemini");
+  });
+
+  it("preserves Gemini settings and unrelated servers across install and remove", async () => {
+    const seeded = JSON.stringify({
+      mcpServers: { other: { command: "other-server" } },
+      ui: { theme: "GitHub" },
+    });
+    fsMock.files.set(GEMINI, seeded);
+
+    await installGeminiMcp();
+
+    const config = JSON.parse(fsMock.files.get(GEMINI)!);
+    expect(config.ui.theme).toBe("GitHub");
+    expect(config.mcpServers.other.command).toBe("other-server");
+    expect(config.mcpServers.screenpipe.command).toBe("/app/bun");
+    expect(config.mcpServers.screenpipe.env.SCREENPIPE_MCP_CLIENT).toBe("gemini");
+    expect(backupsOf(GEMINI)).toHaveLength(1);
+
+    await uninstallGeminiMcp();
+    const removed = JSON.parse(fsMock.files.get(GEMINI)!);
+    expect(removed.mcpServers.screenpipe).toBeUndefined();
+    expect(removed.mcpServers.other.command).toBe("other-server");
   });
 });
 
@@ -271,6 +557,17 @@ describe("transactional connect / disconnect", () => {
     expect(skillsMock.installExternalAgentSkills).toHaveBeenCalledWith("cursor");
     expect(skillsMock.removeExternalAgentSkills).not.toHaveBeenCalled();
     expect(JSON.parse(fsMock.files.get(CURSOR)!).mcpServers.screenpipe).toBeTruthy();
+    expect(tauriMock.setAiToolAutoConnectOptOut).toHaveBeenCalledWith("cursor", false);
+  });
+
+  it("installs and removes Gemini's user-scoped skills with its MCP entry", async () => {
+    await connectAiTool("gemini");
+    expect(skillsMock.installExternalAgentSkills).toHaveBeenCalledWith("gemini");
+    expect(JSON.parse(fsMock.files.get(GEMINI)!).mcpServers.screenpipe).toBeTruthy();
+
+    await disconnectAiTool("gemini");
+    expect(skillsMock.removeExternalAgentSkills).toHaveBeenCalledWith("gemini");
+    expect(tauriMock.setAiToolAutoConnectOptOut).toHaveBeenCalledWith("gemini", true);
   });
 
   it("disconnect removes skills even when the MCP step fails, then rethrows", async () => {
@@ -286,5 +583,148 @@ describe("transactional connect / disconnect", () => {
 
     expect(skillsMock.installExternalAgentSkills).not.toHaveBeenCalled();
     expect(skillsMock.removeExternalAgentSkills).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("Grok Bot skill transport", () => {
+  it("connects and disconnects via native reconciliation without local MCP or skill writes", async () => {
+    tauriMock.grokbotConnection.mockImplementation(async action => ({ status: "ok", data: { detected: true, connected: action === "connect" } }));
+    await connectAiTool("grokbot");
+    await disconnectAiTool("grokbot");
+    expect(tauriMock.grokbotConnection).toHaveBeenNthCalledWith(1, "connect");
+    expect(tauriMock.grokbotConnection).toHaveBeenNthCalledWith(2, "disconnect");
+    expect(fsMock.files.size).toBe(0);
+    expect(skillsMock.installExternalAgentSkills).not.toHaveBeenCalled();
+  });
+  it("treats unconfirmed installation as a failed connection", async () => {
+    tauriMock.grokbotConnection.mockResolvedValue({ status: "ok", data: { detected: true, connected: false } });
+    await expect(connectAiTool("grokbot")).rejects.toThrow("not confirmed");
+  });
+});
+
+
+describe("VS Code MCP", () => {
+  const path = "/Users/test/Library/Application Support/Code/User/mcp.json";
+  it("detects the user profile and preserves JSONC, inputs, and other servers through connect/disconnect", async () => {
+    fsMock.files.set(path.slice(0, -"/mcp.json".length), "");
+    const original = `{
+      // keep this comment
+      "servers": { "screenpipe": { "command": "old", "sandboxEnabled": true, "cwd": "/project" }, "other": { "type": "http", "url": "https://example.com" }, },
+      "inputs": [{ "id": "token" }],
+    }`;
+    fsMock.files.set(path, original);
+    expect(await detectAiTools()).toContain("vscode");
+    expect(await isToolConfigHealthy("vscode")).toBe(true);
+    await connectAiTool("vscode");
+    expect(await isVscodeMcpInstalled()).toBe(true);
+    const text = fsMock.files.get(path)!;
+    const { parse } = await import("jsonc-parser");
+    const config = parse(text);
+    expect(text).toContain("// keep this comment");
+    expect(config.servers.other.url).toBe("https://example.com");
+    expect(config.inputs).toEqual([{ id: "token" }]);
+    expect(config.mcpServers).toBeUndefined();
+    expect(config.servers.screenpipe.sandboxEnabled).toBe(true);
+    expect(config.servers.screenpipe.cwd).toBe("/project");
+    expect(config.servers.screenpipe).toMatchObject({ type: "stdio", command: "/app/bun", env: { SCREENPIPE_LOCAL_API_KEY: "sp-test", SCREENPIPE_MCP_CLIENT: "vscode", SCREENPIPE_API_URL: "http://localhost:3030" } });
+    expect(backupsOf(path).map((p) => fsMock.files.get(p))).toContain(original);
+    expect(tauriMock.setAiToolAutoConnectOptOut).toHaveBeenCalledWith("vscode", false);
+    await disconnectAiTool("vscode");
+    expect(tauriMock.setAiToolAutoConnectOptOut).toHaveBeenCalledWith("vscode", true);
+    expect(await isVscodeMcpInstalled()).toBe(false);
+    expect(parse(fsMock.files.get(path)!).servers.other).toEqual(config.servers.other);
+    expect(skillsMock.installExternalAgentSkills).not.toHaveBeenCalled();
+  });
+  it.each(["[]", "null", '{"servers":[]}', '{"servers":null}', '{"servers":{} "inputs":[]}'])("refuses malformed config %s without overwriting", async (original) => {
+    fsMock.files.set(path, original);
+    await expect(installVscodeMcp()).rejects.toThrow();
+    expect(fsMock.files.get(path)).toBe(original);
+    expect(await isToolConfigHealthy("vscode")).toBe(false);
+  });
+  it("initializes missing config and removes mixed-case stale entries", async () => {
+    await installVscodeMcp();
+    expect(await isVscodeMcpInstalled()).toBe(true);
+    fsMock.files.set(path, '{"servers":{"Screenpipe":{"type":"stdio"},"screenpipe":{"type":"stdio"},"other":{}}}');
+    await uninstallVscodeMcp();
+    expect(JSON.parse(fsMock.files.get(path)!).servers).toEqual({ other: {} });
+  });
+});
+
+
+describe("explicit cloud MCP setup without a CLI", () => {
+  const path = "/Users/test/.codex/config.toml";
+  const url = "https://screenpipe.com/api/user/data-sync/mcp";
+  it("preserves existing Codex text and local servers, backs up, and is idempotent", async () => {
+    fsMock.files.set("/Users/test/.codex", "");
+    const original =
+      '# personal settings\nmodel = "my-model"\n[mcp_servers.screenpipe]\ncommand = "local-server"\n';
+    fsMock.files.set(path, original);
+    await installCloudMcp("codex");
+    expect(fsMock.files.get(path)).toContain(original);
+    expect(fsMock.files.get(path)).toContain(
+      `[mcp_servers.screenpipe-cloud]\nurl = "${url}"`,
+    );
+    expect(backupsOf(path)).toHaveLength(1);
+    expect(fsMock.files.get(backupsOf(path)[0])).toBe(original);
+    const installed = fsMock.files.get(path);
+    await installCloudMcp("codex");
+    expect(fsMock.files.get(path)).toBe(installed);
+    expect(tmpsOf(path)).toHaveLength(0);
+  });
+  it.each([
+    "broken = [",
+    '[mcp_servers.screenpipe-cloud]\nurl = "https://other.test/mcp"',
+    '[mcp_servers.screenpipe-cloud]\nurl = "' + url + '"\nenabled = false',
+    'mcp_servers = { local = { command = "keep" } }',
+  ])(
+    "refuses invalid, conflicting, disabled, or incompatible configs untouched: %s",
+    async (original) => {
+      fsMock.files.set("/Users/test/.codex", "");
+      fsMock.files.set(path, original);
+      await expect(installCloudMcp("codex")).rejects.toThrow("was not changed");
+      expect(fsMock.files.get(path)).toBe(original);
+      expect(backupsOf(path)).toHaveLength(0);
+    },
+  );
+  it("does not create an AI installation when no app config exists", async () => {
+    await expect(installCloudMcp("codex")).rejects.toThrow("Open Codex once");
+    await expect(installCloudMcp("claude-code")).rejects.toThrow(
+      "Open Claude Code once",
+    );
+    expect(fsMock.files.size).toBe(0);
+  });
+  it("preserves Claude Code user settings and local MCP entry", async () => {
+    fsMock.files.set(
+      CLAUDE_CODE,
+      JSON.stringify({
+        theme: "dark",
+        mcpServers: { screenpipe: { command: "local" } },
+      }),
+    );
+    await installCloudMcp("claude-code");
+    expect(JSON.parse(fsMock.files.get(CLAUDE_CODE)!)).toEqual({
+      theme: "dark",
+      mcpServers: {
+        screenpipe: { command: "local" },
+        "screenpipe-cloud": { type: "http", url },
+      },
+    });
+    const installed = fsMock.files.get(CLAUDE_CODE);
+    await installCloudMcp("claude-code");
+    expect(fsMock.files.get(CLAUDE_CODE)).toBe(installed);
+  });
+  it("preserves an unreadable config instead of replacing it", async () => {
+    fsMock.files.set("/Users/test/.codex", "");
+    fsMock.unreadable.add(path);
+    await expect(installCloudMcp("codex")).rejects.toThrow("could not read");
+    expect(fsMock.files.has(path)).toBe(false);
+  });
+  it("does not edit a default profile when the app uses a custom config home", async () => {
+    tauriMock.getEnv.mockResolvedValue("/custom/profile");
+    await expect(installCloudMcp("codex")).rejects.toThrow(
+      "custom config location",
+    );
+    expect(fsMock.files.size).toBe(0);
   });
 });

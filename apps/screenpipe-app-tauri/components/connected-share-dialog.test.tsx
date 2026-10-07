@@ -145,7 +145,7 @@ describe("ConnectedShareDialog", () => {
 
     fireEvent.click(send);
 
-    await screen.findByText("sent to Slack");
+    await screen.findByText("Sent to Slack");
     const sendCall = mocks.localFetch.mock.calls.find(
       ([path]) => path === "/connections/slack/send",
     );
@@ -222,7 +222,7 @@ describe("ConnectedShareDialog", () => {
 
     fireEvent.click(create);
 
-    await screen.findByText("created ENG-42");
+    await screen.findByText("Created ENG-42");
     const mutationCall = mocks.localFetch.mock.calls.find(
       ([path, init]) =>
         path === "/connections/linear/proxy/graphql" &&
@@ -268,10 +268,10 @@ describe("ConnectedShareDialog", () => {
     await openDestinations();
     expect(
       await screen.findByTestId("connected-share-connect-slack"),
-    ).toHaveTextContent("connect Slack");
+    ).toHaveTextContent("Connect Slack");
     expect(
       screen.getByTestId("connected-share-connect-linear"),
-    ).toHaveTextContent("connect Linear");
+    ).toHaveTextContent("Connect Linear");
 
     fireEvent.click(screen.getByTestId("connected-share-connect-notion"));
 
@@ -282,6 +282,27 @@ describe("ConnectedShareDialog", () => {
       connectionId: "notion",
     });
     expect(mocks.showChatWithPrefill).not.toHaveBeenCalled();
+    window.removeEventListener("open-settings", openSettings);
+  });
+
+  it("keeps the edited draft while host connection setup refreshes availability", async () => {
+    mocks.localFetch.mockResolvedValue(jsonResponse({ data: [{ id: "notion", connected: false }] }));
+    const onOpenChange = vi.fn(), onConnect = vi.fn(), openSettings = vi.fn();
+    window.addEventListener("open-settings", openSettings);
+    const props = { open: true, onOpenChange, onConnect, artifact };
+    const view = render(<ConnectedShareDialog {...props} />);
+    await openDestinations();
+    fireEvent.click(await screen.findByTestId("connected-share-connect-notion"));
+    expect(onConnect).toHaveBeenCalledWith("notion");
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(openSettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("connected-share-preview-toggle"));
+    fireEvent.change(screen.getByLabelText("Edit before sending"), { target: { value: "My edited workflow" } });
+    const checks = mocks.localFetch.mock.calls.length;
+    view.rerender(<ConnectedShareDialog {...props} connectionsRevision={1} />);
+    await waitFor(() => expect(mocks.localFetch.mock.calls.length).toBeGreaterThan(checks));
+    expect(screen.getByLabelText("Edit before sending")).toHaveValue("My edited workflow");
+    expect(onOpenChange).not.toHaveBeenCalled();
     window.removeEventListener("open-settings", openSettings);
   });
 
@@ -342,6 +363,44 @@ describe("ConnectedShareDialog", () => {
     ).toBe(false);
   });
 
+  it("opens a clicked Obsidian icon on Obsidian and keeps the write approval-gated", async () => {
+    mocks.localFetch.mockResolvedValue(
+      jsonResponse({ data: [{ id: "obsidian", connected: true }] }),
+    );
+    const onOpenChange = vi.fn();
+
+    render(
+      <ConnectedShareDialog
+        open
+        onOpenChange={onOpenChange}
+        artifact={artifact}
+        initialDestination="chat-obsidian"
+      />,
+    );
+
+    const destination = await screen.findByTestId(
+      "connected-share-destination",
+    );
+    expect(destination).toHaveTextContent("Obsidian");
+    expect(mocks.showChatWithPrefill).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "prepare Obsidian in Chat" }),
+    );
+
+    await waitFor(() =>
+      expect(mocks.showChatWithPrefill).toHaveBeenCalledTimes(1),
+    );
+    expect(mocks.showChatWithPrefill).toHaveBeenCalledWith(
+      expect.objectContaining({
+        autoSend: false,
+        displayLabel: "Share “Roadmap” to Obsidian",
+        prompt: expect.stringContaining("exact vault-relative path"),
+      }),
+    );
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it("makes unchanged versus Chat processing an explicit choice", async () => {
     mocks.localFetch.mockImplementation(async (path: string) => {
       if (path === "/connections") {
@@ -394,6 +453,76 @@ describe("ConnectedShareDialog", () => {
     );
   });
 
+  // The mode toggle describes how a snapshot is processed, not where it goes.
+  // It used to blank the destination on the side it left, so a person who
+  // looked at "send unchanged" and came back found Obsidian gone and the send
+  // button back to "choose a destination" — two clicks on a toggle silently
+  // discarded the connection.
+  it("keeps each mode's connection when the toggle moves between them", async () => {
+    mocks.localFetch.mockImplementation(async (path: string) => {
+      if (path === "/connections") {
+        return jsonResponse({
+          data: [
+            { id: "slack", connected: true },
+            { id: "notion", connected: true, mcp: true },
+            { id: "obsidian", connected: true, mcp: true },
+          ],
+        });
+      }
+      if (path === "/connections/slack/instances") {
+        return jsonResponse({ instances: [] });
+      }
+      if (path.startsWith("/connections/slack/conversations")) {
+        return jsonResponse({ channels: [] });
+      }
+      throw new Error(`unexpected request: ${path}`);
+    });
+
+    render(
+      <ConnectedShareDialog open onOpenChange={vi.fn()} artifact={artifact} />,
+    );
+
+    const unchanged = await screen.findByTestId(
+      "connected-share-mode-unchanged",
+    );
+    const chat = screen.getByTestId("connected-share-mode-chat");
+    const destination = screen.getByTestId("connected-share-destination");
+    const confirm = screen.getByTestId("connected-share-confirm");
+
+    // Chat has two apps, so it opens unanswered until the person picks one.
+    fireEvent.click(chat);
+    await waitFor(() => expect(chat).toHaveAttribute("aria-pressed", "true"));
+    expect(destination).toHaveTextContent("choose where this goes");
+    await openDestinations();
+    fireEvent.click(
+      await screen.findByTestId("connected-share-destination-chat-obsidian"),
+    );
+    await waitFor(() => expect(destination).toHaveTextContent("Obsidian"));
+
+    // Obsidian cannot receive a frozen copy directly, so unchanged shows the
+    // one app that can. That is a different question, not a lost answer.
+    fireEvent.click(unchanged);
+    await waitFor(() =>
+      expect(unchanged).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(destination).toHaveTextContent("Slack");
+    expect(confirm).toHaveTextContent("send to Slack");
+
+    fireEvent.click(chat);
+    await waitFor(() => expect(chat).toHaveAttribute("aria-pressed", "true"));
+    expect(destination).toHaveTextContent("Obsidian");
+    expect(destination).not.toHaveTextContent("choose where this goes");
+    expect(confirm).toHaveTextContent("prepare Obsidian in Chat");
+    expect(confirm).not.toBeDisabled();
+
+    // And back again: the unchanged side kept its own answer too.
+    fireEvent.click(unchanged);
+    await waitFor(() =>
+      expect(unchanged).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(destination).toHaveTextContent("Slack");
+  });
+
   // A failed check used to resolve to the clipboard, so the dialog quietly
   // offered a local write under a button that says send. It now says it could
   // not check and offers retry, and nothing is sendable until it succeeds.
@@ -415,7 +544,7 @@ describe("ConnectedShareDialog", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByTestId("connected-share-confirm")).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await screen.findByTestId("connected-share-empty");
     expect(
       screen.queryByTestId("connected-share-connections-error"),
@@ -511,10 +640,8 @@ describe("ConnectedShareDialog", () => {
     expect(
       await screen.findByTestId("connected-share-slack-channels-error"),
     ).toHaveTextContent("You can still send to your own Slack messages");
-    fireEvent.click(
-      screen.getByRole("button", { name: "send to Slack" }),
-    );
-    await screen.findByText("sent to Slack");
+    fireEvent.click(screen.getByRole("button", { name: "send to Slack" }));
+    await screen.findByText("Sent to Slack");
   });
 
   it("keeps a failed provider action visible and retryable", async () => {
@@ -554,9 +681,7 @@ describe("ConnectedShareDialog", () => {
     expect(
       screen.queryByTestId("connected-share-receipt"),
     ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "send to Slack" }),
-    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "send to Slack" })).toBeEnabled();
   });
 
   // The dialog used to open on ten stacked regions and ask five questions
@@ -598,7 +723,7 @@ describe("ConnectedShareDialog", () => {
       // And the two controls they hide are genuinely not mounted.
       expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
       expect(
-        screen.queryByLabelText(/edits here apply only to Slack/),
+        screen.queryByLabelText(/Edits here apply only to Slack/),
       ).not.toBeInTheDocument();
     });
 
@@ -618,9 +743,13 @@ describe("ConnectedShareDialog", () => {
       fireEvent.click(
         await screen.findByTestId("connected-share-preview-toggle"),
       );
-      expect(screen.getByLabelText(/edits here apply only to Slack/)).toBeVisible();
+      expect(
+        screen.getByLabelText(/Edits here apply only to Slack/),
+      ).toBeVisible();
 
-      fireEvent.click(await screen.findByTestId("connected-share-contents-toggle"));
+      fireEvent.click(
+        await screen.findByTestId("connected-share-contents-toggle"),
+      );
       expect(screen.getAllByRole("checkbox")).toHaveLength(3);
     });
 
@@ -714,7 +843,11 @@ describe("ConnectedShareDialog", () => {
     it("sends to the remembered channel without asking again", async () => {
       seedStorage({ destination: "slack", target: "C1", instance: "acme" });
       render(
-        <ConnectedShareDialog open onOpenChange={vi.fn()} artifact={artifact} />,
+        <ConnectedShareDialog
+          open
+          onOpenChange={vi.fn()}
+          artifact={artifact}
+        />,
       );
 
       // No destination pick and no channel pick: recall answered both.
@@ -728,7 +861,7 @@ describe("ConnectedShareDialog", () => {
       );
       fireEvent.click(confirm);
 
-      await screen.findByText("sent to Slack");
+      await screen.findByText("Sent to Slack");
       expect(sendBody()).toMatchObject({ channel: "C1", instance: "acme" });
     });
 
@@ -738,7 +871,11 @@ describe("ConnectedShareDialog", () => {
       // outcome, because a self-send cannot leak into the wrong room.
       seedStorage({ destination: "slack", target: "C-deleted" });
       render(
-        <ConnectedShareDialog open onOpenChange={vi.fn()} artifact={artifact} />,
+        <ConnectedShareDialog
+          open
+          onOpenChange={vi.fn()}
+          artifact={artifact}
+        />,
       );
 
       const confirm = await screen.findByTestId("connected-share-confirm");
@@ -751,7 +888,7 @@ describe("ConnectedShareDialog", () => {
       );
       fireEvent.click(confirm);
 
-      await screen.findByText("sent to Slack");
+      await screen.findByText("Sent to Slack");
       expect(sendBody()).not.toHaveProperty("channel");
     });
 
@@ -761,36 +898,42 @@ describe("ConnectedShareDialog", () => {
       seedStorage({ destination: "slack", target: "C1" });
       mocks.localFetch.mockImplementation(
         async (path: string, init?: RequestInit) => {
-        if (path === "/connections") {
-          return jsonResponse({
-            data: [
-              { id: "slack", connected: false },
-              { id: "linear", connected: true },
-            ],
-          });
-        }
-        if (path === "/connections/linear/proxy/graphql") {
-          const body = JSON.parse((init as RequestInit)?.body as string);
-          if (body?.variables?.input) {
+          if (path === "/connections") {
+            return jsonResponse({
+              data: [
+                { id: "slack", connected: false },
+                { id: "linear", connected: true },
+              ],
+            });
+          }
+          if (path === "/connections/linear/proxy/graphql") {
+            const body = JSON.parse((init as RequestInit)?.body as string);
+            if (body?.variables?.input) {
+              return jsonResponse({
+                data: {
+                  issueCreate: {
+                    success: true,
+                    issue: { id: "i1", identifier: "COR-1", title: "Roadmap" },
+                  },
+                },
+              });
+            }
             return jsonResponse({
               data: {
-                issueCreate: {
-                  success: true,
-                  issue: { id: "i1", identifier: "COR-1", title: "Roadmap" },
-                },
+                teams: { nodes: [{ id: "T1", name: "Core", key: "COR" }] },
               },
             });
           }
-          return jsonResponse({
-            data: { teams: { nodes: [{ id: "T1", name: "Core", key: "COR" }] } },
-          });
-        }
-        throw new Error(`unexpected request: ${path}`);
+          throw new Error(`unexpected request: ${path}`);
         },
       );
 
       render(
-        <ConnectedShareDialog open onOpenChange={vi.fn()} artifact={artifact} />,
+        <ConnectedShareDialog
+          open
+          onOpenChange={vi.fn()}
+          artifact={artifact}
+        />,
       );
 
       await openDestinations();

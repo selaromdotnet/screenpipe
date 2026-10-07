@@ -15,6 +15,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     analytics,
+    history_access::HistoryAccessPolicy,
     hot_frame_cache::HotFrameCache,
     routes::{
         activity_ledger::get_activity_ledger,
@@ -38,8 +39,9 @@ use crate::{
         },
         elements::{get_frame_elements, search_elements},
         frames::{
-            get_frame_context, get_frame_data, get_frame_metadata, get_frame_text_data,
-            get_frame_thumbnail, get_next_valid_frame, run_frame_ocr, FrameThumbnailCache,
+            get_frame_context, get_frame_data, get_frame_metadata, get_frame_preview_media,
+            get_frame_preview_samples, get_frame_text_data, get_frame_thumbnail,
+            get_next_valid_frame, run_frame_ocr, FrameThumbnailCache,
         },
         health::{
             api_list_monitors, api_vision_status, audio_metrics_handler, health_check,
@@ -49,8 +51,9 @@ use crate::{
             bulk_delete_meetings_handler, delete_meeting_handler, export_handler,
             get_meeting_handler, get_meeting_summary_status_handler,
             get_meeting_transcript_handler, list_meetings_handler, meeting_status_handler,
-            merge_meetings_handler, split_meeting_handler, start_meeting_handler,
-            stop_meeting_handler, update_meeting_handler,
+            merge_meetings_handler, resolve_room_change_handler, save_meeting_summary_handler,
+            split_meeting_handler, start_meeting_handler, stop_meeting_handler,
+            update_meeting_handler,
         },
         memories::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
@@ -158,6 +161,7 @@ fn search_query_concurrency(read_pool_max: u32) -> usize {
 
 pub struct AppState {
     pub db: Arc<DatabaseManager>,
+    pub history_access: HistoryAccessPolicy,
     pub audio_manager: Arc<AudioManager>,
     pub app_start_time: DateTime<Utc>,
     pub screenpipe_dir: PathBuf,
@@ -171,6 +175,8 @@ pub struct AppState {
     pub ws_connection_count: Arc<AtomicUsize>,
     /// LRU cache for search results (10x faster for repeated queries)
     pub search_cache: SearchCache,
+    pub starred_session_writes: tokio::sync::Mutex<()>,
+    pub starred_revision: std::sync::atomic::AtomicU64,
     /// Fail-fast admission for uncached `/search` requests. Cache hits bypass
     /// this gate; misses return 503 when the pool-derived budget is occupied.
     pub search_query_semaphore: Arc<tokio::sync::Semaphore>,
@@ -247,7 +253,12 @@ pub struct AppState {
 }
 
 pub struct SCServer {
+    /// Exact catalog directory supplied by the desktop owner; never inferred from another app.
+    pub workflow_catalog_dir: Option<PathBuf>,
     db: Arc<DatabaseManager>,
+    /// Rolling history policy. Standalone/headless construction is unrestricted;
+    /// the consumer desktop app explicitly supplies its live account policy.
+    pub history_access: HistoryAccessPolicy,
     addr: SocketAddr,
     audio_manager: Arc<AudioManager>,
     screenpipe_dir: PathBuf,
@@ -300,9 +311,8 @@ pub struct SCServer {
     /// instance here on start and clears on stop so `/vision/device/*` hits
     /// the manager that is actually capturing.
     pub vision_manager: Arc<ArcSwap<Option<Arc<crate::vision_manager::VisionManager>>>>,
-    /// When true, the timeline / rewind feature is disabled. The server skips
-    /// warming the hot frame cache from the DB at startup (the cache is only
-    /// read by the timeline streaming endpoint). Set before `start()`.
+    /// Skip background timeline cache warm-up, while retaining database access
+    /// to saved history. Set before `start()` when capture/cache work is off.
     pub timeline_disabled: bool,
     /// Advertise this instance over mDNS. Disabled for loopback-only binds
     /// because LAN clients cannot reach those addresses and Windows may show a
@@ -378,7 +388,9 @@ impl SCServer {
     ) -> Self {
         let audio_metrics = audio_manager.metrics.clone();
         SCServer {
+            workflow_catalog_dir: None,
             db,
+            history_access: HistoryAccessPolicy::unrestricted(),
             addr,
             screenpipe_dir,
             vision_disabled,
@@ -611,6 +623,13 @@ impl SCServer {
             std::time::Instant::now(),
         );
 
+        // Engine-owned backstop for meeting summaries: reconciles completed
+        // meeting-summary runs against the meeting record and requeues runs a
+        // restart interrupted. Spawned here because both entrypoints (engine
+        // binary and the desktop's embedded server) build their router through
+        // this path; the finalizer itself is once-per-process.
+        crate::meeting_summary::spawn_meeting_summary_finalizer(self.db.clone());
+
         if analytics_enabled {
             // Spawn periodic API usage reporter (every 5 minutes)
             let counter_clone = api_request_count.clone();
@@ -749,9 +768,10 @@ impl SCServer {
             .clone()
             .unwrap_or_else(|| Arc::new(HotFrameCache::new()));
         if self.timeline_disabled {
-            // Timeline disabled: the hot frame cache is only read by the timeline
-            // streaming endpoint, so skip the (potentially 40s+) DB warm-up.
-            tracing::info!("timeline disabled: skipping hot frame cache warm_from_db");
+            // Skip the potentially expensive warm-up but mark it resolved so
+            // requests for saved history immediately use database backfill.
+            hot_frame_cache.skip_warmup();
+            tracing::info!("timeline cache disabled: skipping hot frame cache warm_from_db");
         } else {
             let cache = hot_frame_cache.clone();
             let db = self.db.clone();
@@ -762,6 +782,7 @@ impl SCServer {
 
         let app_state = Arc::new(AppState {
             db: self.db.clone(),
+            history_access: self.history_access.clone(),
             audio_manager: self.audio_manager.clone(),
             app_start_time: Utc::now(),
             screenpipe_dir: self.screenpipe_dir.clone(),
@@ -793,6 +814,8 @@ impl SCServer {
             // Search cache: short-lived and byte-bounded. Search payloads can
             // contain large OCR/audio text blobs, so an entry-count capacity
             // still allowed hundreds of MB of typed + serialized responses.
+            starred_session_writes: tokio::sync::Mutex::new(()),
+            starred_revision: std::sync::atomic::AtomicU64::new(0),
             search_cache: MokaCache::builder()
                 .weigher(|_key: &u64, value: &Arc<SearchCacheEntry>| value.weight())
                 .max_capacity(SEARCH_CACHE_MAX_BYTES)
@@ -888,6 +911,11 @@ impl SCServer {
             .post("/tags/vision/batch", get_tags_batch)
             .post("/tags/:content_type/:id", add_tags)
             .delete("/tags/:content_type/:id", remove_tags)
+            .get("/frames/preview-samples", get_frame_preview_samples)
+            .get(
+                "/frames/preview-media/:video_chunk_id",
+                get_frame_preview_media,
+            )
             .get("/frames/:frame_id", get_frame_data)
             .get("/frames/:frame_id/thumbnail", get_frame_thumbnail)
             .get("/frames/:frame_id/text", get_frame_text_data)
@@ -918,11 +946,13 @@ impl SCServer {
             .post("/meetings/bulk-delete", bulk_delete_meetings_handler)
             .post("/meetings/start", start_meeting_handler)
             .post("/meetings/stop", stop_meeting_handler)
+            .post("/meetings/room-change", resolve_room_change_handler)
             .get("/meetings/:id/transcript", get_meeting_transcript_handler)
             .get(
                 "/meetings/:id/summary-status",
                 get_meeting_summary_status_handler,
             )
+            .post("/meetings/:id/summary", save_meeting_summary_handler)
             .get("/meetings/:id", get_meeting_handler)
             .delete("/meetings/:id", delete_meeting_handler)
             .put("/meetings/:id", update_meeting_handler)
@@ -960,8 +990,69 @@ impl SCServer {
             )
             .get("/elements", search_elements)
             .get("/frames/:frame_id/elements", get_frame_elements)
+            .post(
+                "/workflows/rollout",
+                crate::routes::workflow_catalog::rollout,
+            )
+            .get(
+                "/workflows/catalog",
+                crate::routes::workflow_catalog::catalog,
+            )
+            .get(
+                "/workflows/workspace",
+                crate::routes::workflow_workspace::context,
+            )
+            .post(
+                "/workflows/workspace",
+                crate::routes::workflow_workspace::update,
+            )
+            .get(
+                "/workflows/pipeline",
+                crate::routes::workflow_pipeline::context,
+            )
+            .post(
+                "/workflows/pipeline",
+                crate::routes::workflow_pipeline::commit,
+            )
+            .get(
+                "/workflows/context",
+                crate::routes::workflow_catalog::context,
+            )
+            .post(
+                "/workflows/catalog",
+                crate::routes::workflow_catalog::commit,
+            )
+            .post("/workflows/edits", crate::routes::workflow_edits::edit)
+            .post(
+                "/workflows/corrections",
+                crate::routes::workflow_catalog::correct,
+            )
+            .get("/starred-sessions", crate::routes::starred::list)
+            .post("/starred-sessions", crate::routes::starred::save)
+            .get("/workflows", crate::routes::workflows::list_workflows)
+            .get("/workflows/:id", crate::routes::workflows::get_workflow)
             .get("/activity-summary", get_activity_summary)
             .get("/activity-ledger", get_activity_ledger)
+            .get(
+                "/cloud-agents/status",
+                crate::routes::cloud_agents::cloud_agent_status,
+            )
+            .post(
+                "/cloud-agents/:provider/connect",
+                crate::routes::cloud_agents::connect_cloud_agent,
+            )
+            .get(
+                "/cloud-agents/cursor-agents",
+                crate::routes::cloud_agents::list_cursor_cloud_agents,
+            )
+            .get(
+                "/cloud-agents/:provider/codebases",
+                crate::routes::cloud_agents::list_cloud_agent_codebases,
+            )
+            .put(
+                "/cloud-agents/cursor-key",
+                crate::routes::cloud_agents::set_cursor_cloud_key,
+            )
             // Vault routes
             .get("/vault/status", crate::routes::vault::vault_status)
             .post("/vault/lock", crate::routes::vault::vault_lock)
@@ -1014,6 +1105,25 @@ impl SCServer {
         // Build the main router with all routes
         let router = Router::new()
             .merge(server.into_router())
+            // Agent self-improvement lives behind one validated local API so
+            // native Pi and ACP share profile safety, prompt rendering, skill
+            // provenance, optimistic concurrency, and bundled protection.
+            .route(
+                "/agent/learning/chats",
+                axum::routing::post(crate::agent_skills::learning_chats_handler),
+            )
+            .route(
+                "/agent/skills/manage",
+                axum::routing::post(crate::agent_skills::manage_agent_skill_handler),
+            )
+            .route(
+                "/agent/profile/manage",
+                axum::routing::post(crate::agent_profile::manage_profile_handler),
+            )
+            .route(
+                "/agent/self-improvement/context",
+                axum::routing::get(crate::agent_profile::self_improvement_context_handler),
+            )
             // Renderer-agnostic structured outputs are deliberately outside
             // the public OpenAPI surface for now. Consumers define targets;
             // authenticated pipes can discover and fill only their bindings.
@@ -1148,6 +1258,16 @@ impl SCServer {
                 "/v1/web-search",
                 axum::routing::post(crate::routes::web_search::web_search),
             )
+            // User-scoped cloud data reads. The signed-in identity determines
+            // the bucket upstream; callers cannot provide an account or bucket.
+            .route(
+                "/data-sync/devices",
+                get(crate::routes::data_sync_proxy::devices),
+            )
+            .route(
+                "/data-sync/search",
+                get(crate::routes::data_sync_proxy::search),
+            )
             // Blocking connect broker for the harness MCP `screenpipe_connect_app`
             // tool: raise the in-chat connect card and wait for the user's answer.
             .route(
@@ -1170,6 +1290,10 @@ impl SCServer {
             }
             let pipe_routes = Router::new()
                 .route("/", axum::routing::get(crate::pipes_api::list_pipes))
+                .route(
+                    "/bundled/:id/install",
+                    axum::routing::post(crate::pipes_api::install_bundled_pipe),
+                )
                 .route(
                     "/install",
                     axum::routing::post(crate::pipes_api::install_pipe),
@@ -1315,7 +1439,7 @@ impl SCServer {
         // (bundled sidecar → install dirs → PATH).
         {
             let wa_lock = wa.lock().await;
-            if wa_lock.has_session() {
+            if wa_lock.has_session() && !screenpipe_core::background_work::is_suspended() {
                 tracing::info!("whatsapp: found existing session, auto-reconnecting...");
                 if let Err(e) = wa_lock.start_pairing("").await {
                     tracing::warn!("whatsapp: auto-reconnect failed: {:?}", e);
@@ -1411,9 +1535,15 @@ impl SCServer {
                     }
                 }),
             )
+            .layer(Extension(crate::routes::workflows::WorkflowCatalogSource(self.workflow_catalog_dir.clone())))
             .with_state(app_state.clone())
+            .layer(axum::middleware::from_fn(crate::search_only::history_only))
             .layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
+                crate::routes::search::storage_snapshot_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.pipe_query_semaphore.clone(),
                 crate::pipe_permissions_middleware::pipe_backpressure_layer,
             ))
             .layer(axum::middleware::from_fn_with_state(

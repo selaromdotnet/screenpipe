@@ -11,9 +11,13 @@ import { commands } from "@/lib/utils/tauri";
 import { requestPermissionWithFlow } from "@/lib/utils/permission-flow";
 import TrustDisclosure from "./trust-disclosure";
 import { usePlatform } from "@/lib/hooks/use-platform";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { isMicrophoneRequired } from "@/lib/utils/permission-requirements";
 import { motion } from "framer-motion";
 import posthog from "posthog-js";
 import { onboardingFunnel } from "@/lib/analytics/onboarding-funnel";
+import { useGT } from "gt-react";
+
 
 interface PermissionsStepProps {
   handleNextSlide: () => void;
@@ -68,6 +72,7 @@ function PermissionRow({
   distance: number;
   onGrant: () => void;
 }) {
+
   const interactive = focused && !granted;
 
   return (
@@ -118,11 +123,11 @@ function PermissionRow({
       <div className="ml-auto shrink-0">
         {granted ? (
           <span className="font-mono text-[10px] text-muted-foreground">
-            granted
+            Granted
           </span>
         ) : interactive ? (
           <span className="font-mono text-[10px] text-muted-foreground group-hover:text-background/70">
-            grant →
+            Grant →
           </span>
         ) : null}
       </div>
@@ -134,6 +139,9 @@ export default function PermissionsStep({
   handleNextSlide,
   onProgressChange,
 }: PermissionsStepProps) {
+
+  const ui = useGT();
+  const { settings, isSettingsLoaded } = useSettings();
   const { isMac, isLoading: isPlatformLoading } = usePlatform();
   const [statuses, setStatuses] = useState<Record<string, boolean>>({});
   const [requesting, setRequesting] = useState(false);
@@ -145,6 +153,7 @@ export default function PermissionsStep({
   const requestStartedAtRef = useRef<Record<string, number>>({});
   const pollInFlightRef = useRef(false);
   const pollAgainRef = useRef(false);
+  const permissionPolicyEpoch = useRef(0);
   // Accessibility is polled silently (AXIsProcessTrusted) until the user
   // actively requests it. Only then do we switch to the live tccd probe,
   // which enrolls the app in the Accessibility list / can surface the system
@@ -156,16 +165,16 @@ export default function PermissionsStep({
     {
       id: "mic",
       icon: <Mic className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "Capture what you say",
-      subtitle: "Lets Screenpipe transcribe your voice in meetings and calls",
+      title: ui("Capture what you say"),
+      subtitle: ui("Lets Screenpipe transcribe your voice in meetings and calls"),
       check: () => commands.checkMicrophonePermission(),
       request: () => commands.requestPermission("microphone"),
     },
     {
       id: "accessibility",
       icon: <Keyboard className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "Read on-screen text",
-      subtitle: "Lets Screenpipe understand app content without OCR",
+      title: ui("Read on-screen text"),
+      subtitle: ui("Lets Screenpipe understand app content without OCR"),
       // Silent poll until the user asks for it, then the live tccd probe so a
       // grant made in Settings is seen without an app relaunch.
       check: () =>
@@ -181,13 +190,13 @@ export default function PermissionsStep({
     {
       id: "screen",
       icon: <Monitor className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "Capture your screen",
+      title: ui("Capture your screen"),
       subtitle: (
         <>
           Lets Screenpipe index what&apos;s on your screen: windows, docs,
           chats, code. {" "}
           <strong className="font-bold">
-            restart after granting this permission.
+            Restart after granting this permission.
           </strong>
         </>
       ),
@@ -198,8 +207,12 @@ export default function PermissionsStep({
     },
   ];
 
+  const microphoneRequired = isSettingsLoaded && isMicrophoneRequired(settings);
+
   // Filter permissions for this platform
-  const activePermissions = permissions.filter((p) => !p.macOnly || isMac);
+  const activePermissions = permissions.filter((p) =>
+    (!p.macOnly || isMac) && (p.id !== "mic" || microphoneRequired)
+  );
   const activePermissionsRef = useRef(activePermissions);
   activePermissionsRef.current = activePermissions;
 
@@ -235,6 +248,7 @@ export default function PermissionsStep({
     try {
       do {
         pollAgainRef.current = false;
+        const policyEpoch = permissionPolicyEpoch.current;
         const results: Record<string, boolean> = {};
         let nextScreenRestartRequired: boolean | undefined;
         await Promise.all(
@@ -253,6 +267,10 @@ export default function PermissionsStep({
             }
           })
         );
+        if (policyEpoch !== permissionPolicyEpoch.current) {
+          pollAgainRef.current = true;
+          continue;
+        }
         if (nextScreenRestartRequired !== undefined) {
           setScreenRestartRequired(nextScreenRestartRequired);
         }
@@ -303,6 +321,18 @@ export default function PermissionsStep({
     }
   }, [isMac, isPlatformLoading, handleNextSlide]);
 
+  // A mic grant cached before audio was disabled cannot satisfy a new policy.
+  useEffect(() => {
+    permissionPolicyEpoch.current += 1;
+    delete statusesRef.current.mic;
+    setStatuses((previous) => {
+      if (!("mic" in previous)) return previous;
+      const next = { ...previous };
+      delete next.mic;
+      return next;
+    });
+  }, [microphoneRequired]);
+
   // Start polling
   useEffect(() => {
     if (isPlatformLoading || !isMac) return;
@@ -311,26 +341,27 @@ export default function PermissionsStep({
     pollPermissions();
     const interval = setInterval(pollPermissions, 1000);
     return () => clearInterval(interval);
-  }, [isPlatformLoading, isMac, pollPermissions]);
+  }, [isPlatformLoading, isMac, pollPermissions, microphoneRequired]);
 
   // Report per-permission sub-progress for the split progress-bar segment
   useEffect(() => {
     onProgressChange?.(grantedCount, activePermissions.length);
   }, [grantedCount, activePermissions.length, onProgressChange]);
 
-  // Auto-advance when all required permissions granted
+  // Advance only if the required grants still hold after the animation delay.
   useEffect(() => {
-    if (allRequiredGranted && !hasAdvancedRef.current && !isPlatformLoading) {
+    if (!allRequiredGranted || !isSettingsLoaded || hasAdvancedRef.current || isPlatformLoading) return;
+    const timeout = setTimeout(() => {
       hasAdvancedRef.current = true;
       posthog.capture("onboarding_permissions_granted", {
         time_spent_ms: Date.now() - mountTimeRef.current,
-        statuses,
+        statuses: statusesRef.current,
       });
       onboardingFunnel.permissionsGranted();
-      // Small delay so the user sees the last checkmark animate
-      setTimeout(() => handleNextSlide(), 600);
-    }
-  }, [allRequiredGranted, isPlatformLoading, handleNextSlide, statuses]);
+      handleNextSlide();
+    }, 600);
+    return () => clearTimeout(timeout);
+  }, [allRequiredGranted, isSettingsLoaded, isPlatformLoading, handleNextSlide]);
 
   // Handle grant click with immediate refresh
   const handleGrant = async (perm: PermissionDef) => {
@@ -379,7 +410,7 @@ export default function PermissionsStep({
       {/* Branding */}
       <div className="flex flex-col items-center mb-6">
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img className="w-12 h-12 mb-2" src="/128x128.png" alt="screenpipe" />
+        <img className="w-12 h-12 mb-2" src="/128x128.png" alt={ui("Screenpipe")} />
         <h1 className="font-mono text-base font-bold text-foreground">
           Unlock the full experience
         </h1>
@@ -393,9 +424,9 @@ export default function PermissionsStep({
           className="w-full max-w-sm border border-foreground px-5 py-5 text-center"
           data-testid="screen-recording-restart-prompt"
         >
-          <h2 className="font-mono text-sm font-semibold">restart required</h2>
+          <h2 className="font-mono text-sm font-semibold">Restart required</h2>
           <p className="mt-1 font-mono text-xs text-muted-foreground">
-            screenpipe won&apos;t work until you restart.
+            Screenpipe won&apos;t work until you restart.
           </p>
           <button
             type="button"
@@ -407,7 +438,7 @@ export default function PermissionsStep({
             <RefreshCw
               className={`h-3.5 w-3.5 ${restarting ? "animate-spin" : ""}`}
             />
-            {restarting ? "restarting..." : "restart screenpipe"}
+            {restarting ? ui("Restarting...") : ui("Restart screenpipe")}
           </button>
         </div>
       ) : (

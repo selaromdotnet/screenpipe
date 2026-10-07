@@ -15,6 +15,14 @@ export const commands = {
 async activateAppAfterOauth() : Promise<void> {
     await TAURI_INVOKE("activate_app_after_oauth");
 },
+async analyzeWorkflows(days: number | null, profile: JsonValue | null) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("analyze_workflows", { days, profile }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Reconcile the live app + the next-boot config with the current enterprise
  * hidden-UI policy. The frontend calls this right after pushing a freshly
@@ -119,6 +127,22 @@ async calendarResetPermission() : Promise<Result<string, string>> {
 async calendarStatus() : Promise<Result<CalendarStatus, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("calendar_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async cancelStorageMigration(root: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_storage_migration", { root }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async cancelWorkflowVideo(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_workflow_video", { id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -269,6 +293,30 @@ async closeWindow(window: ShowRewindWindow) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async codingWorkspaceCreate(conversationId: string, repositoryPath: string) : Promise<Result<CodingWorkspace, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("coding_workspace_create", { conversationId, repositoryPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async codingWorkspaceGet(conversationId: string) : Promise<Result<CodingWorkspace | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("coding_workspace_get", { conversationId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async codingWorkspacePrepare(conversationId: string, prompt: string, startingPath: string | null) : Promise<Result<CodingWorkspacePreparation, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("coding_workspace_prepare", { conversationId, prompt, startingPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async completeOnboarding() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("complete_onboarding") };
@@ -341,6 +389,14 @@ async copyTextToClipboard(text: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async createWorkflowVideo(id: string, scenes: WorkflowVideoScene[]) : Promise<Result<WorkflowVideoResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_workflow_video", { id, scenes }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async deleteBrainView(id: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_brain_view", { id }) };
@@ -381,6 +437,14 @@ async deleteDeviceLocalData(machineId: string) : Promise<Result<string, string>>
     else return { status: "error", error: e  as any };
 }
 },
+async deleteOriginalStorageDatabase(root: string, generation: string, confirmPermanentDeletion: boolean) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_original_storage_database", { root, generation, confirmPermanentDeletion }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async disableKeychainEncryption() : Promise<Result<KeychainStatus, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("disable_keychain_encryption") };
@@ -396,6 +460,17 @@ async disableKeychainEncryption() : Promise<Result<KeychainStatus, string>> {
 async disableOverlayClickThrough() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("disable_overlay_click_through") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Outputs remain available while reviewing. Explicit discard bounds permanent local storage.
+ */
+async discardWorkflowVideo(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("discard_workflow_video", { id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -432,6 +507,14 @@ async enableOverlayClickThrough() : Promise<Result<null, string>> {
 async ensureWebviewFocus() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("ensure_webview_focus") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ensureWorkflowsRuntime() : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("ensure_workflows_runtime") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -477,6 +560,22 @@ async forceRegenerateSuggestions() : Promise<Result<CachedSuggestions, string>> 
     else return { status: "error", error: e  as any };
 }
 },
+async generateActivityHistory(start: string, end: string, idempotencyKey: string) : Promise<Result<PersistedActivityHistory, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("generate_activity_history", { start, end, idempotencyKey }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async generateWorkflowSkill(workflow: JsonValue, profile: JsonValue | null) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("generate_workflow_skill", { workflow, profile }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Absolute path of the data directory used by the running engine. This is
  * distinct from the app base directory when the user selected a custom
@@ -485,6 +584,14 @@ async forceRegenerateSuggestions() : Promise<Result<CachedSuggestions, string>> 
 async getActiveDataDir() : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_active_data_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getActivityHistory(start: string, end: string) : Promise<Result<PersistedActivityHistory, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_activity_history", { start, end }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -605,8 +712,9 @@ async getEnterpriseInstallMetadata() : Promise<EnterpriseInstallMetadata> {
     return await TAURI_INVOKE("get_enterprise_install_metadata");
 },
 /**
- * Read the enterprise license key from `enterprise.json`.
- * Returns None if no file is found or is invalid.
+ * Read the enterprise license key from deployment config (`enterprise.json`
+ * or the documented Windows registry value) and the user recovery config.
+ * Returns None if no valid key is found.
  */
 async getEnterpriseLicenseKey() : Promise<string | null> {
     return await TAURI_INVOKE("get_enterprise_license_key");
@@ -690,6 +798,15 @@ async getMonitors() : Promise<Result<MonitorDevice[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Return the website UTM attribution already resolved at app startup.
+ *
+ * This is read-only and never triggers another network request. Analytics can
+ * be disabled before the manager is installed, so absence is a normal result.
+ */
+async getOnboardingAttribution() : Promise<Attribution | null> {
+    return await TAURI_INVOKE("get_onboarding_attribution");
+},
 async getOnboardingStatus() : Promise<Result<OnboardingStore, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_onboarding_status") };
@@ -736,13 +853,23 @@ async getScreenpipeAiGatewayUrl() : Promise<Result<string, string>> {
 },
 /**
  * Tauri command: absolute path of the screenpipe base dir (where store.bin
- * lives). Honors SCREENPIPE_DATA_DIR; the webview must use this instead of
- * hardcoding ~/.screenpipe, or it reads/writes a different settings file
- * than the Rust side whenever the override is set.
+ * lives). Honors SCREENPIPE_DATA_DIR at launch and remains stable when startup
+ * selects a different recording folder, so the webview and Rust share a store.
  */
 async getScreenpipeBaseDir() : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_screenpipe_base_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getStorageMigrationActivity() : Promise<StorageMigrationActivity> {
+    return await TAURI_INVOKE("get_storage_migration_activity");
+},
+async getStorageMigrationStatus() : Promise<Result<StorageMigrationStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_storage_migration_status") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -781,6 +908,17 @@ async getSyncStatus() : Promise<Result<SyncStatusResponse, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async getWorkflowsRuntime() : Promise<JsonValue> {
+    return await TAURI_INVOKE("get_workflows_runtime");
+},
+async grokbotConnection(action: string) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("grokbot_connection", { action }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async hideMainWindow() : Promise<void> {
     await TAURI_INVOKE("hide_main_window");
 },
@@ -795,6 +933,14 @@ async hideNotificationPanel() : Promise<Result<null, string>> {
 async hideShortcutReminder() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("hide_shortcut_reminder") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async hideStarredSessions() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("hide_starred_sessions") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -868,8 +1014,8 @@ async installBrainViewTemplateKit(request: InstallBrainViewTemplateKitRequest) :
 },
 /**
  * Install the two built-in screenpipe skills into a supported external agent.
- * Explicit Settings actions still call this narrow command; first-run native
- * background setup shares the same engine skill installer directly.
+ * Explicit Settings actions still call this narrow command; native launch
+ * reconciliation shares the same engine skill installer directly.
  */
 async installExternalAgentSkills(target: string) : Promise<Result<string[], string>> {
     try {
@@ -902,6 +1048,14 @@ async isCapturePaused() : Promise<boolean> {
 },
 async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
+},
+/**
+ * Whether the running local API currently enforces the rolling history window.
+ * This is the authoritative app-wide value shared by every webview and backend
+ * route, so detached windows do not depend on duplicating account hydration.
+ */
+async isHistoryAccessRestricted() : Promise<boolean> {
+    return await TAURI_INVOKE("is_history_access_restricted");
 },
 /**
  * Check if click-through is currently enabled (Windows only)
@@ -982,6 +1136,14 @@ async listChatEntriesByMtime(dir: string) : Promise<Result<ChatDirEntry[], strin
 async listImportedSkills() : Promise<Result<ImportedSkill[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_imported_skills") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listManagedTeamSkills() : Promise<Result<ManagedTeamSkillLocal[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_managed_team_skills") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1094,12 +1256,34 @@ async loadBrainViewCanvas(viewId: string) : Promise<Result<BrainViewCanvasDocume
     else return { status: "error", error: e  as any };
 }
 },
+async loadWorkflowRecording(timestamp: string, appName: string) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_workflow_recording", { timestamp, appName }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Lock sync (clear keys from memory and stop server sync service).
  */
 async lockSync() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("lock_sync") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Apply one provider-owned schedule mutation through a live ACP adapter that
+ * negotiated the Screenpipe schedule extension. This fails closed when the
+ * task, capability, owning session, or provider confirmation disappeared
+ * since the UI's last refresh.
+ */
+async manageProviderAutomation(key: string, action: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("manage_provider_automation", { key, action }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1205,12 +1389,11 @@ async openGoogleCalendarAuthWindow(authUrl: string) : Promise<Result<null, strin
 },
 /**
  * Open the screenpipe.com login page.
- * macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
- * Windows/Linux: in-app WebView that intercepts the screenpipe:// redirect.
+ * Normal login opens the user's default browser and returns through the
+ * versioned app-specific deep-link callback.
  *
- * `fresh_session` is used by "use different account": macOS asks
- * ASWebAuthenticationSession for an ephemeral browser session instead of
- * reusing Safari cookies, and Windows/Linux use a throwaway webview profile.
+ * `fresh_session` is used by "use different account": macOS uses an ephemeral
+ * ASWebAuthenticationSession and Windows/Linux use a throwaway webview profile.
  * Returns the device code when this call started the browser device-code flow,
  * and an empty string for every path that needs no out-of-band confirmation
  * (macOS auth session, embedded WebView fallback).
@@ -1279,6 +1462,14 @@ async openWindowsShellTarget(target: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async openWorkflowCapturedMoment(frameId: number, timestamp: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_workflow_captured_moment", { frameId, timestamp }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Dismiss the current recording incident shown in the overlay.
  */
@@ -1329,6 +1520,18 @@ async ownedBrowserHide() : Promise<Result<null, string>> {
 }
 },
 /**
+ * Move through the selected webview's own navigation history. A missing tab
+ * id addresses the agent-controlled default browser.
+ */
+async ownedBrowserHistory(tabId: string | null, direction: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_history", { tabId, direction }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Navigate the embedded webview to `url`.
  *
  * Frontend restore/reload calls pass the foreground conversation id as
@@ -1362,6 +1565,55 @@ async ownedBrowserResolveSessionAccess(requestId: string, allow: boolean) : Prom
 async ownedBrowserSetBounds(parent: string, x: number, y: number, width: number, height: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("owned_browser_set_bounds", { parent, x, y, width, height }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ownedBrowserTabClearBrowsingData(tabId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_clear_browsing_data", { tabId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ownedBrowserTabClose(tabId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_close", { tabId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ownedBrowserTabHide(tabId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_hide", { tabId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Navigate one user-created browser tab without touching the agent-controlled
+ * default tab. If its native child is not mounted yet, the URL is consumed by
+ * the first bounds update.
+ */
+async ownedBrowserTabNavigate(tabId: string, url: string, owner: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_navigate", { tabId, url, owner }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Position one user-created browser tab. Every tab owns a distinct native
+ * child webview and retains its page state while another tab is visible.
+ */
+async ownedBrowserTabSetBounds(tabId: string, parent: string, x: number, y: number, width: number, height: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_set_bounds", { tabId, parent, x, y, width, height }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1426,6 +1678,19 @@ async piAcpAgentInstallStatus(agentId: string) : Promise<AcpAgentInstallStatus> 
     return await TAURI_INVOKE("pi_acp_agent_install_status", { agentId });
 },
 /**
+ * Launch a built-in agent's own browser login after an explicit user click.
+ * The catalog supplies the argv, the process runs hidden as the desktop user,
+ * and the agent keeps the resulting credential in its own local store.
+ */
+async piAcpExternalLogin(agentId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_acp_external_login", { agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Probe an ACP adapter for its advertised model/mode selectors without a
  * chat: spawn the hidden runtime, let it initialize and create a session,
  * capture the acp_session_config event, and tear everything down. Returns
@@ -1450,6 +1715,18 @@ async piAcpProbeAgent(agent: AcpAgentConfig) : Promise<Result<string, string>> {
 async piAcpReauthenticate(sessionId: string | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pi_acp_reauthenticate", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Change Screenpipe's response policy for ACP permission requests without
+ * pretending it is an adapter-owned session mode.
+ */
+async piAcpSetApprovalMode(sessionId: string | null, approvalMode: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_acp_set_approval_mode", { sessionId, approvalMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1719,6 +1996,24 @@ async piStop(sessionId: string | null) : Promise<Result<PiInfo, string>> {
 }
 },
 /**
+ * Stop and forget an idle Pi session without interrupting in-flight work.
+ *
+ * Chat panels call this when they give up foreground ownership. Keeping every
+ * completed ACP conversation resident leaves a full Bun/Node/agent process
+ * tree behind for each chat. The busy check and removal happen under the pool
+ * lock, so a prompt cannot race between the check and teardown. Sessions that
+ * are still initializing are kept until they report ready; if the panel
+ * already released them, a deferred reap runs after the first prompt can land.
+ */
+async piStopIfIdle(sessionId: string | null) : Promise<Result<PiInfo, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_stop_if_idle", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Update Pi config and restart the chat session so the new model takes effect.
  * Without restart, Pi keeps using the provider/model from its original CLI args.
  *
@@ -1813,7 +2108,23 @@ async redactPiiForFeedback(text: string, settingsJson: string) : Promise<Result<
 }
 },
 /**
+ * Strict contribution redaction. No regex-only fallback, no content-bearing
+ * errors, no capture settings, and no chunk boundaries through identifiers.
+ */
+async redactWorkflowContribution(text: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("redact_workflow_contribution", { text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Tauri command: re-encrypt store.bin after frontend saves.
+ *
+ * Runs on a blocking worker. The previous sync command ran `fsync` of a
+ * ~262KB store on the AppKit main thread and stalled every other IPC
+ * (sampled 2026-08-26: 186% screenpipe-app + 93% Web Content).
  */
 async reencryptStore() : Promise<Result<null, string>> {
     try {
@@ -1855,6 +2166,9 @@ async registerWindowShortcuts() : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async releaseWorkflowRecording(url: string) : Promise<void> {
+    await TAURI_INVOKE("release_workflow_recording", { url });
 },
 async remoteSyncDiscoverHosts() : Promise<Result<DiscoveredHost[], string>> {
     try {
@@ -2051,12 +2365,35 @@ async resizeSearchWindow(width: number, height: number) : Promise<Result<null, s
 }
 },
 /**
+ * Resolve a local AI tool config without replacing a symlink during setup.
+ */
+async resolveAiToolConfigPath(path: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("resolve_ai_tool_config_path", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Restart only after the user explicitly clicks the in-app action. macOS's
  * native Screen Recording sheet includes a "Later" choice; closing that sheet
  * must never be treated as consent to relaunch screenpipe.
  */
 async restartAfterScreenRecordingPermission() : Promise<void> {
     await TAURI_INVOKE("restart_after_screen_recording_permission");
+},
+/**
+ * Restart the app after an explicit user action so an exact short-read
+ * quarantine can be verified in a fresh process before recording resumes.
+ */
+async restartDatabaseVerification() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restart_database_verification") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 /**
  * Banner-click restart. Mirror the auto-update path: gate, stop server, then
@@ -2074,6 +2411,18 @@ async restartForUpdate(timeoutSecs: number | null) : Promise<Result<string, stri
 async resumeGlobalShortcuts() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("resume_global_shortcuts") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Automatic retry preserves capture intent; unlike the user command it must
+ * not turn recording back on after the user stopped it.
+ */
+async retryScreenpipe() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retry_screenpipe") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2154,6 +2503,14 @@ async saveEnterpriseTeamConfig(isAdmin: boolean | null, licenseActive: boolean |
     else return { status: "error", error: e  as any };
 }
 },
+async saveWorkflowSkill(draft: JsonValue) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_workflow_skill", { draft }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Scan the standard locations for skill folders the user could import.
  */
@@ -2175,6 +2532,21 @@ async scanDeviceSkills() : Promise<Result<DeviceSkill[], string>> {
 async searchNavigateToTimeline(timestamp: string, frameId: number | null, searchTerms: string[] | null, searchResultsJson: string | null, searchQuery: string | null, timelineOrigin: string | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("search_navigate_to_timeline", { timestamp, frameId, searchTerms, searchResultsJson, searchQuery, timelineOrigin }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setActivitySyncEnabled(activities: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_activity_sync_enabled", { activities });
+},
+/**
+ * Persist the user's explicit Settings choice. Automatic launch reconciliation
+ * skips opted-out targets until the user explicitly connects them again.
+ */
+async setAiToolAutoConnectOptOut(target: string, optOut: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_ai_tool_auto_connect_opt_out", { target, optOut }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2324,6 +2696,35 @@ async setEnhancedAiSuggestions(enabled: boolean, token: string) : Promise<Result
  */
 async setEnterprisePolicy(hiddenSections: string[], enforceAutoStart: boolean) : Promise<void> {
     await TAURI_INVOKE("set_enterprise_policy", { hiddenSections, enforceAutoStart });
+},
+/**
+ * Request or revoke Enterprise recording access. A webview may always revoke
+ * its current session, but it cannot grant itself access: native code verifies
+ * the supplied key/account credential against both the Enterprise policy and
+ * seat-bearing heartbeat endpoints before setting the process-local grant.
+ *
+ * The grant is never persisted. Every launch must revalidate against the
+ * control plane, and an explicit credential rejection revokes it immediately.
+ */
+async setEnterpriseRecordingAuthorized(authorized: boolean, credentialType: string | null, credential: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_enterprise_recording_authorized", { authorized, credentialType, credential }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Apply the frontend's experimental rollout decision to native history swipes.
+ * The platform implementation keeps every non-Home webview forced off.
+ */
+async setHistorySwipeNavigationEnabled(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_history_swipe_navigation_enabled", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 async setKeepAwake(enabled: boolean) : Promise<Result<null, string>> {
     try {
@@ -2560,6 +2961,17 @@ async startFeedbackUpload(request: FeedbackUploadRequest) : Promise<Result<strin
 }
 },
 /**
+ * Own the stop/convert/restart sequence in the native app even if settings closes.
+ */
+async startStorageMigration(root: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_storage_migration", { root }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Stop recording without killing the server.
  * Pipes, memories, search, and the HTTP API remain accessible.
  */
@@ -2593,6 +3005,19 @@ async suspendGlobalShortcuts() : Promise<Result<null, string>> {
 }
 },
 /**
+ * Apply the exact organization-managed skill desired state. Only directories
+ * written by this command (namespaced + marker-checked) can be refreshed or
+ * pruned; personal skills and unrelated agent configuration are untouched.
+ */
+async syncManagedTeamSkills(skills: ManagedTeamSkill[], pruneUnlisted: boolean) : Promise<Result<ManagedTeamSkillReceipt[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_managed_team_skills", { skills, pruneUnlisted }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Verifies an OpenAI-compatible endpoint with the exact request path and
  * audio encoding used by the recording engine. A successful response is
  * required before the settings UI can activate this engine, so recordings
@@ -2601,6 +3026,14 @@ async suspendGlobalShortcuts() : Promise<Result<null, string>> {
 async testOpenaiCompatibleTranscription(endpoint: string, apiKey: string | null, model: string, headers: { [key in string]: string } | null, rawAudio: boolean) : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("test_openai_compatible_transcription", { endpoint, apiKey, model, headers, rawAudio }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleStarredSessions() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_starred_sessions") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2727,6 +3160,17 @@ async vaultUnlock(password: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Record that a webview renderer's main event loop is responsive.
+ *
+ * The macOS renderer watchdog compares this monotonic heartbeat with the
+ * moment a window was shown. If WebKit wedges while submitting a paint to its
+ * GPU process, JavaScript cannot advance its event loop and the native shell
+ * can rebuild the stale UI without restarting capture.
+ */
+async webviewRendererHeartbeat() : Promise<void> {
+    await TAURI_INVOKE("webview_renderer_heartbeat");
+},
+/**
  * Write the exclusion list atomically (write-to-tmp + rename) so the
  * engine's 500 ms mtime poll never observes a half-written file. The
  * engine picks up the new list on the next tick subject to its
@@ -2758,7 +3202,7 @@ async writeBrowserLogs(entries: BrowserLogEntry[]) : Promise<void> {
 
 /** user-defined types **/
 
-export type AIPreset = { id: string; prompt: string; provider: AIProviderType; acpAgent?: AcpAgentPresetConfig | null; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
+export type AIPreset = { id: string; prompt: string; provider: AIProviderType; acpAgent?: AcpAgentPresetConfig | null; url?: string; model?: string; defaultPreset: boolean; enterpriseManaged?: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
 export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "acp" | "pi" | "anthropic"
 export type AcpAgentConfig = {
 /**
@@ -2791,6 +3235,11 @@ config?: { [key in string]: string };
  */
 modeId?: string | null;
 /**
+ * Screenpipe-owned permission response policy. `allow-all` approves each
+ * adapter request; omitted or `ask` keeps the normal approval cards.
+ */
+approvalMode?: string | null;
+/**
  * Send the agent's model calls through Screenpipe Cloud instead of the
  * user's own provider account. Only honoured for agents whose catalog
  * entry declares `cloudRouting`; a closed agent (Cursor, Copilot) talks to
@@ -2819,8 +3268,21 @@ config?: { [key in string]: string };
 /**
  * Default session mode id, applied after every session/new.
  */
-modeId?: string | null }
+modeId?: string | null;
+/**
+ * Screenpipe-owned ACP permission response policy (`ask` or `allow-all`).
+ */
+approvalMode?: string | null;
+/**
+ * Send this agent's model calls through Screenpipe Cloud. `None` keeps
+ * presets saved before this choice on the agent's own provider account.
+ */
+useScreenpipeCloud?: boolean | null }
+export type ActivityHistoryCoverage = { start: string; end: string }
+export type ActivityHistoryEntry = { id: string; kind: string; meeting_id: number | null; start_at: string; end_at: string; title: string; summary: string; evidence: ActivityHistoryEvidence[] }
+export type ActivityHistoryEvidence = { kind: string; at: string; frame_id: number | null; meeting_id: number | null; app_name: string | null; label: string }
 export type AecMode = "off" | "screenpipe" | "macos" | "windows"
+export type Attribution = { utmSource: string | null; utmMedium: string | null; utmCampaign: string | null; utmContent: string | null; utmTerm: string | null }
 export type AudioDeviceInfo = { name: string; isDefault: boolean;
 /**
  * True for a Bluetooth *input* device that is also a combo headset (the
@@ -2856,8 +3318,8 @@ error: string | null;
 sinceEpochSecs: number;
 /**
  * True when this CPU lacks AVX2 (pre-2013 x86-64 / Atom-line): local
- * whisper/qwen3 STT is disabled at runtime (their kernels are
- * AVX2-compiled); parakeet + cloud engines still work. Drives the
+ * Whisper (and non-Windows Qwen) STT is disabled at runtime because its
+ * kernels are AVX2-compiled; Windows ONNX Qwen, Parakeet, and cloud engines work. Drives the
  * "compatibility mode" notice in onboarding/settings.
  */
 cpuCompatMode: boolean }
@@ -2929,6 +3391,8 @@ export type ChatGptOAuthStatus = { logged_in: boolean;
  * keychain failure, timeout, etc.).
  */
 error: string | null }
+export type CodingWorkspace = { version: number; conversationId: string; repoRoot: string; gitCommonDir: string; worktreePath: string; branch: string; baseCommit: string; sourceDirty: boolean; createdAt: string }
+export type CodingWorkspacePreparation = { status: string; workspace: CodingWorkspace | null; candidates: string[]; reason: string | null; routeSessionId: string | null }
 export type Credits = { amount: number }
 /**
  * A skill folder discovered somewhere on the user's device.
@@ -2963,6 +3427,14 @@ export type DiscoveredHost = { host: string; port: number; user: string | null; 
  * Only set when `HostName` resolves to an IP different from the alias.
  */
 alias?: string | null }
+/**
+ * One strict hostname rule used by browser capture allowlists and blocklists.
+ *
+ * `domain` is normalized by the capture policy before matching. The rule
+ * always matches the domain itself; `include_subdomains` extends the match to
+ * descendant hosts, except descendants rooted at `excluded_subdomains`.
+ */
+export type DomainRule = { domain: string; includeSubdomains?: boolean; excludedSubdomains?: string[] }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
 export type EngineEvent = { name: string; data: JsonValue }
 export type EnterpriseHostIdentity = { machine_id_hash: string | null; os_user_id_hash: string | null }
@@ -2994,6 +3466,40 @@ export type LoginMode = "sign-in" | "sign-up"
  * from drifting away from the values enforced by the capture engine.
  */
 export type LowDiskGuardConfig = { thresholdBytes: number; checkIntervalSeconds: number }
+/**
+ * A reviewed organization skill delivered by the Enterprise policy endpoint.
+ * Package files contain no credentials or device-specific filesystem paths.
+ */
+export type ManagedTeamSkill = { artifact_id: string;
+/**
+ * Desired-state revision. Assignment changes bump this value.
+ */
+version: number;
+/**
+ * Immutable package release.
+ */
+release_version: number; name: string; description?: string; package: ManagedTeamSkillPackage; destinations?: string[] }
+/**
+ * Read-only summary rendered in Settings. Organization-managed skills are
+ * deliberately separate from user-imported skills and cannot be removed there.
+ */
+export type ManagedTeamSkillLocal = { artifact_id: string; version: number; release_version: number; digest: string; name: string; description: string; file_count: number; discovery_chars: number; activation_chars: number; has_scripts: boolean; destinations: string[] }
+/**
+ * A portable Agent Skills directory. The server freezes the exact text files;
+ * each device verifies the per-file and aggregate digests before installation.
+ */
+export type ManagedTeamSkillPackage = { format: string; package_version: number; entrypoint: string; digest: string; name: string; description: string; files: ManagedTeamSkillPackageFile[]; context: ManagedTeamSkillPackageContext; risk: ManagedTeamSkillPackageRisk }
+export type ManagedTeamSkillPackageContext = { discovery_chars: number; activation_chars: number }
+export type ManagedTeamSkillPackageFile = { path: string; content: string; sha256: string; bytes: number }
+export type ManagedTeamSkillPackageRisk = { has_scripts: boolean }
+/**
+ * Per-destination receipt from the most recent managed sync attempt.
+ */
+export type ManagedTeamSkillReceipt = { artifact_id: string; version: number; release_version: number; digest: string; destination: string;
+/**
+ * `installed` or `error`. Errors never prevent the other destinations.
+ */
+status: string; detail?: string | null }
 export type MeetingExportSummary = { job_id: string; output_path: string; frame_count: number; audio_chunk_count: number; duration_secs: number; file_size_bytes: number }
 export type MonitorDevice = { id: number; stableId: string; name: string; isDefault: boolean; width: number; height: number }
 export type NotificationActionEvent = { actionType: string | null; rawJson: string; payload: JsonValue }
@@ -3014,7 +3520,13 @@ export type OnboardingStore = { isCompleted: boolean; completedAt: string | null
  * Current step in onboarding flow (login, intro, usecases, status)
  * Used to resume after app restart (e.g., after granting permissions)
  */
-currentStep?: string | null }
+currentStep?: string | null; firstRunSummaryPhase?: string; firstRunSummaryStartedAt?: string | null; firstRunSummaryChatId?: string | null; firstRunSummaryNotificationSentAt?: string | null; firstRunSummaryNotificationId?: string | null; firstRunSummaryError?: string | null; firstRunSummaryTelemetryVersion?: number;
+/**
+ * Written only when this app version creates the install's first
+ * onboarding record. Existing records deserialize to false, and reset
+ * clears it, so onboarding replay can never enter the experiment.
+ */
+trialActivationFreshInstall?: boolean }
 /**
  * Snapshot of a pending update, exposed to the frontend via
  * `get_pending_update`. The banner queries this on mount so it can hydrate
@@ -3028,7 +3540,13 @@ downloaded: boolean;
 /**
  * True when download failed with 401/403 — user must sign in.
  */
-auth_required: boolean }
+auth_required: boolean;
+/**
+ * True when the privileged persistence supervisor must apply the complete
+ * system package rather than the ordinary Tauri app-only artifact.
+ */
+persistent: boolean }
+export type PersistedActivityHistory = { entries: ActivityHistoryEntry[]; coverage: ActivityHistoryCoverage[] }
 export type PiBackend = "acp"
 export type PiCheckResult = { available: boolean; path: string | null }
 export type PiExtensionPackage = { source: string; scope: string; filtered: boolean; installed: boolean;
@@ -3043,8 +3561,9 @@ acpCompatible: boolean }
 export type PiImageContent = { type: string; mimeType: string; data: string }
 export type PiInfo = { running: boolean;
 /**
- * True while this session has a prompt, queued follow-up, or pending RPC
- * response. Destructive settings use it to avoid clearing live context.
+ * True while this session is still initializing, or has a prompt, queued
+ * follow-up, or pending RPC response. Destructive settings use it to
+ * avoid clearing live context.
  */
 busy: boolean; projectDir: string | null; pid: number | null; sessionId: string | null;
 /**
@@ -3106,7 +3625,14 @@ allowedTools?: string[] | null;
  * session, set only when reopening a conversation whose agent process
  * is gone. Ignored by the native Pi backend.
  */
-resumeSessionId?: string | null }
+resumeSessionId?: string | null;
+/**
+ * Headless surfaces (activity generation) have no approval card to show,
+ * so their ACP sessions run unattended: the runtime takes the adapter's
+ * allow option instead of stranding the run on a prompt nobody can see,
+ * and chat control is disabled. Ignored by the native Pi backend.
+ */
+unattended?: boolean }
 /**
  * A user prompt that's been enqueued but not yet written to Pi's stdin.
  * Surfaced to the UI so the chat can render "queued" cards while a prior
@@ -3143,9 +3669,21 @@ schedule: string; scheduleLabel: string | null; status: string;
  */
 executionScope: string;
 /**
- * Read-only until the provider exposes a supported lifecycle API.
+ * `read_only` or `in_app` after a live ACP capability negotiation.
  */
-manageability: string; lifecycleNote: string; updatedAtMs: number | null }
+manageability: string;
+/**
+ * Mutations currently supported by a live, capability-negotiated adapter.
+ */
+availableActions?: string[]; lifecycleNote: string;
+/**
+ * Opaque provider revision returned on the next mutation for conflict checks.
+ */
+revision?: string | null; updatedAtMs: number | null }
+/**
+ * Scroll checkpoint frequency, independent of text extraction, image quality and audio.
+ */
+export type RecordingDetail = "auto" | "low_impact" | "balanced" | "more_detail"
 /**
  * A skill offered by the curated registry. Installing one downloads its folder
  * (the directory containing `SKILL.md`) from a public GitHub repo into the
@@ -3298,10 +3836,10 @@ useSystemDefaultAudio: boolean;
  */
 experimentalCoreaudioSystemAudio?: boolean;
 /**
- * Beta ("Smart recording" in the app): during detected meetings, capture
+ * Automatic meeting capture: during detected meetings, capture
  * the meeting app's own audio via a per-process tap plus the microphone
  * that app actually has open (instead of the global mix + assumed-default
- * mic). Default `false`. Takes precedence over everything: it engages in
+ * mic). Default `true`. Takes precedence over everything: it engages in
  * ANY `audio_capture_mode` (continuous or meetings-only) and displaces
  * the configured devices for the meeting's duration. Requires macOS 14.4+
  * or Windows, plus the meeting detector (with `disable_meeting_detector`
@@ -3316,10 +3854,10 @@ experimentalMeetingPiggyback?: boolean;
  * link out of A2DP into SCO, degrading the user's headphone/speaker
  * output quality (48kHz stereo -> 24kHz stereo or mono HFP, depending on
  * hardware) — a macOS/OS-level tradeoff with no external workaround
- * (issue #3750). Default `false`: Bluetooth input devices are only
- * actually opened while a meeting is detected; outside a meeting they
- * stay enabled-but-gated (selected in settings, not streaming) so the
- * Bluetooth link stays in A2DP. Set `true` to always record Bluetooth
+ * (issue #3750). Default `false`: automatically selected Bluetooth inputs
+ * are opened only during meetings, keeping A2DP outside meetings. A
+ * manually selected device or explicit device-start request is exempt.
+ * Set `true` to always record automatically selected Bluetooth
  * mics regardless of meeting state (prior behavior). Has no effect on
  * wired/built-in/unrecognized mics, on Bluetooth output devices, or on a
  * dedicated Bluetooth microphone with no output side of its own (macOS:
@@ -3362,7 +3900,8 @@ deepgramApiKey: string;
 filterMusic: boolean;
 /**
  * Maximum batch duration in seconds for batch transcription.
- * None = use engine-aware defaults (Deepgram=5000s, OpenAI=3000s, Whisper=600s).
+ * None or zero = use the audio engine's default. Overrides apply only to
+ * OpenAI-compatible endpoints, including meeting retranscription.
  * Also controls the max deferral cap during active meetings.
  */
 batchMaxDurationSecs?: number | null;
@@ -3397,10 +3936,9 @@ enableSemanticContext?: boolean;
  */
 semanticContextMode?: SemanticContextMode;
 /**
- * Disable the timeline / rewind feature. When true, the engine skips
- * timeline-only work: warming the hot frame cache from the DB at startup
- * and buffering captured frames/audio into the in-memory hot cache that
- * only the timeline streaming endpoint reads.
+ * Legacy timeline gate retained for managed deployments and compatibility.
+ * Consumer installs migrate visibility to sidebarNavLayout. Screenshot
+ * capture controls cache work through `timeline_cache_disabled`.
  */
 disableTimeline?: boolean;
 /**
@@ -3415,6 +3953,13 @@ useAllMonitors: boolean;
  * Video quality preset: "low", "balanced", "high", "max".
  */
 videoQuality: string;
+/**
+ * Max width (px) of the macOS screen capture that OCR reads. 0 = native;
+ * nonzero values below 1280 are raised to 1280. Stored snapshots use the
+ * smaller of this width and the `videoQuality` width. Other platforms
+ * always capture native.
+ */
+captureMaxWidth?: number;
 /**
  * Maximum width for stored snapshots. Images wider than this are downscaled
  * (preserving aspect ratio) before JPEG encoding. 0 = no limit (store at
@@ -3533,9 +4078,15 @@ ignoredWindows: string[];
  */
 includedWindows: string[];
 /**
- * URLs to exclude from capture.
+ * Browser URLs to exclude from capture. Existing string entries remain
+ * supported; new entries can use explicit structured domain rules.
  */
-ignoredUrls?: string[];
+ignoredUrls?: UrlRule[];
+/**
+ * Strict browser hostname allowlist. Browser windows without a positively
+ * detected matching URL are skipped; native apps follow app/window rules.
+ */
+includedUrls?: DomainRule[];
 /**
  * Automatically detect and skip incognito / private browsing windows.
  */
@@ -3555,15 +4106,15 @@ enhancedIncognitoDetection?: boolean;
 pauseOnDrmContent?: boolean;
 /**
  * Skip persisting clipboard rows/content in the UI recorder. Defaults to
- * `true` (clipboard DB capture OFF) — passwords / API keys / private keys
- * frequently pass through the clipboard. Clipboard operations can still
+ * `false` in enterprise builds and `true` in consumer builds.
+ * Clipboard operations can still
  * wake event-driven capture when `captureOnClipboard` is enabled.
  */
 disableClipboardCapture?: boolean;
 /**
  * Skip persisting keyboard / typed-text rows in the UI recorder.
- * Defaults to `true` (keyboard DB capture OFF). Keyboard events still
- * wake event-driven capture, and the accessibility tree + OCR still
+ * Defaults to `false` in enterprise builds and `true` in consumer builds.
+ * Keyboard events still wake event-driven capture, and the accessibility tree + OCR still
  * capture on-screen text so Rewind/Ask keep working.
  * Opt in to keyboard DB rows via the "Capture keyboard" toggle.
  */
@@ -3595,7 +4146,7 @@ usePiiRemoval: boolean;
  * `frames.accessibility_text`, and `ui_events.text_content`. Raw
  * secrets are gone after the worker processes the row — that's
  * the contract of the user-facing "AI PII removal" toggle.
- * Off by default; capture path is unaffected either way. See
+ * On by default in enterprise builds; capture path is unaffected. See
  * `screenpipe-redact` for the full design.
  */
 asyncPiiRedaction?: boolean;
@@ -3611,15 +4162,12 @@ asyncPiiRedaction?: boolean;
  */
 redactAgentSessionSecrets?: boolean;
 /**
- * Enable image-PII redaction on captured screen frames. When
- * `true`, the `screenpipe_redact::image::worker` runs alongside
- * the text reconciliation worker, scans the `frames` table, runs
- * the RF-DETR-Nano detector, and blacks out detected PII regions
- * in each JPG (atomic overwrite of the source file). Off by
- * default — orthogonal to `async_pii_redaction` (text path),
- * independently togglable. Requires the `screenpipe-redact`
- * crate to be built with one of the `onnx-*` cargo features and
- * the `rfdetr_v8.onnx` model present at `~/.screenpipe/models/`.
+ * Enable image-PII redaction on captured screen frames. The image
+ * worker scans the `frames` table and blacks out detected PII regions
+ * in each JPG (atomic overwrite of the source file), using `pii_backend`.
+ * On by default in enterprise builds, independently of text redaction.
+ * The local backend requires an `onnx-*` cargo feature and the
+ * `rfdetr_v8.onnx` model at `~/.screenpipe/models/`.
  */
 asyncImagePiiRedaction?: boolean;
 /**
@@ -3627,7 +4175,9 @@ asyncImagePiiRedaction?: boolean;
  * BOTH modalities (text + image) because the user-facing
  * "AI PII removal" toggle is one knob.
  *
- * - `"local"` (default): on-device ONNX models. Privacy by
+ * Enterprise builds default to `"tinfoil"`; consumer builds default to `"local"`.
+ *
+ * - `"local"`: on-device ONNX models. Privacy by
  * construction — pixels and text never leave the box. Slower,
  * especially on weak hardware (~1-3 s per text row, ~60-180 ms
  * per frame).
@@ -3729,6 +4279,10 @@ port: number;
  */
 powerMode?: string | null;
 /**
+ * Controls scroll checkpoint frequency without changing text extraction.
+ */
+recordingDetail?: RecordingDetail;
+/**
  * Keep the computer awake while screenpipe is running.
  * Default off so existing installs keep the OS sleep behavior they chose.
  */
@@ -3787,7 +4341,15 @@ listenOnLan?: boolean }) &
  * that the Rust struct doesn't know about. Without this, `save()` would
  * serialize only known fields and silently wipe frontend-only data.
  */
-({ [key in string]: null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue } }) & { aiPresets: AIPreset[]; isLoading: boolean; devMode: boolean; ocrEngine: string; dataDir: string; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; lockVaultShortcut?: string;
+({ [key in string]: null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue } }) & { aiPresets: AIPreset[]; isLoading: boolean;
+/**
+ * Interface language only. "system" follows the OS; never changes capture.
+ */
+uiLocale: string;
+/**
+ * Last resolved PostHog rollout decision, shared with all native surfaces.
+ */
+uiLocalizationEnabled: boolean; devMode: boolean; ocrEngine: string; dataDir: string; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; lockVaultShortcut?: string; starSessionShortcut?: string;
 /**
  * Overlay size: "small" (default), "medium" (1.5x), "large" (2x)
  */
@@ -3826,6 +4388,11 @@ deviceId?: string;
  */
 autoUpdate?: boolean;
 /**
+ * Consumer updater channel selected on this device. Older stores omit it
+ * and therefore remain on the stable channel.
+ */
+updateChannel?: string;
+/**
  * Auto-update store-installed pipes that haven't been locally modified.
  */
 autoUpdatePipes?: boolean;
@@ -3835,14 +4402,14 @@ autoUpdatePipes?: boolean;
  */
 enhancedAI?: boolean;
 /**
- * Explicit consumer opt-in for on-demand remote diagnostic log requests.
+ * Default-enabled on-demand remote diagnostic log requests.
  * Enterprise builds enforce remote log collection separately; this stored
- * value remains false unless a consumer chooses to enable it.
+ * value can be disabled by the user after the one-time default migration.
  */
 remoteLogCollectionEnabled?: boolean;
 /**
- * Account that granted remote log collection consent on this device.
- * Consumer collection is allowed only while this matches the current user.
+ * Account for an explicit enable; None uses the device-wide default.
+ * An explicit account binding must match the current user; None uses the device default.
  */
 remoteLogCollectionUserId?: string | null;
 /**
@@ -3905,9 +4472,15 @@ headless?: boolean;
  * When true, headless mode skips scheduled pipe runs so only recording
  * and the local server continue in the background.
  */
-headlessRecordOnly?: boolean }
+headlessRecordOnly?: boolean;
+/**
+ * Quit stops capture and closes the UI while the existing process serves history.
+ */
+keepSearchAvailableAfterQuit?: boolean }
 export type ShowRewindWindow = "Main" | { Home: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery"
 export type StartExportRecordingResponse = { jobId: string }
+export type StorageMigrationActivity = { root: string | null; busy: boolean; recovering: boolean; message: string; error: string | null; elapsed_seconds: number; completed_records: number | null; total_records: number | null; bytes_saved: number | null; available_bytes: number | null; completed: boolean }
+export type StorageMigrationStatus = { root: string; app_session_id: string; busy: boolean; message: string; error: string | null; pending: boolean; in_place: boolean; completed: boolean; using_new_storage: boolean; generation: string | null; source_bytes: number; migrated_bytes: number | null; bytes_saved: number | null; available_bytes: number | null; can_migrate: boolean; can_cancel: boolean; can_delete_source: boolean; blocked_reason: string | null }
 export type Suggestion = { text: string;
 /**
  * Short preview with real data (e.g. "1h20m in VS Code — auth.rs, api.rs")
@@ -3929,6 +4502,14 @@ export type SyncDeviceInfo = { id: string; deviceId: string; deviceName: string 
  * Sync status response.
  */
 export type SyncStatusResponse = { enabled: boolean; isSyncing: boolean; lastSync: string | null; lastError: string | null; storageUsed: number | null; storageLimit: number | null; deviceCount: number | null; deviceLimit: number | null; syncTier: string | null; machineId: string }
+/**
+ * A browser URL block rule.
+ *
+ * Strings are the legacy `ignoredUrls` format and keep their historical
+ * domain matching behavior. Structured rules provide explicit exact-domain,
+ * subdomain, and exception semantics without introducing a second setting.
+ */
+export type UrlRule = string | DomainRule
 export type User = { id: string | null; name: string | null; email: string | null; image: string | null; token: string | null; clerk_id: string | null; api_key: string | null; credits: Credits | null; stripe_connected: boolean | null; stripe_account_status: string | null; github_username: string | null; bio: string | null; website: string | null; contact: string | null; cloud_subscribed: boolean | null; credits_balance: number | null; app_entitled: boolean | null; subscription_plan: string | null; entitlement: JsonValue | null; enterprise_account: JsonValue | null }
 export type ViewerContent = { kind: "text"; text: string; name: string; path: string; truncated: boolean; total_bytes: number } | { kind: "image"; data_url: string; name: string; path: string } |
 /**
@@ -3949,6 +4530,9 @@ word: string;
  * Optional replacement — if set, the transcribed `word` is replaced with this.
  */
 replace_with?: string | null }
+export type WorkflowVideoFocus = { x: number; y: number; zoom: number }
+export type WorkflowVideoResult = { path: string; captionsPath: string }
+export type WorkflowVideoScene = { title: string; narration: string; image: string | null; pace?: number; focus: WorkflowVideoFocus | null }
 
 /** tauri-specta globals **/
 

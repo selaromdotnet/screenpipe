@@ -75,21 +75,40 @@ fn sqlite_lifecycle_has_one_owner_per_physical_database() {
     let maintenance = production_source(&crate_dir.join("src/db/maintenance.rs"));
     assert!(!maintenance.contains("PRAGMA locking_mode = EXCLUSIVE"));
     assert!(!maintenance.contains("PRAGMA synchronous = OFF"));
+    assert!(
+        !maintenance.contains("wal_checkpoint(RESTART)"),
+        "routine checkpoints must not wait for readers while holding the recording writer lane"
+    );
     assert!(maintenance.contains("online SQLite repair is disabled"));
 
     let setup = production_source(&crate_dir.join("src/db/setup.rs"));
+    assert!(setup.contains("acquire_sqlite_manager_lease"));
+    assert!(!setup.contains("sqlx::Sqlite::database_exists("));
+    assert!(!setup.contains("sqlx::Sqlite::create_database("));
     assert_eq!(
-        setup.matches("capture_pool_options()").count(),
+        setup.matches("wal_checkpoint(RESTART)").count(),
+        1,
+        "startup checkpoints before admitting application traffic"
+    );
+    assert_eq!(
+        setup.matches("crate::storage::bulk::pool_options(").count(),
         2,
         "both capture read and write pools must disable autonomous connection reaping"
     );
     let write_queue = production_source(&crate_dir.join("src/write_queue.rs"));
+    assert!(!write_queue.contains("sqlx::Sqlite::create_database("));
     assert!(write_queue.contains(".idle_timeout(None)"));
     assert!(write_queue.contains(".max_lifetime(None)"));
-    assert!(
-        write_queue.matches("capture_pool_options()").count() >= 2,
-        "the write-pool rebuilder must preserve the capture pool lifecycle policy"
+    let storage_pool = production_source(&crate_dir.join("src/storage/bulk/connection.rs"));
+    assert_eq!(
+        storage_pool
+            .matches("crate::write_queue::capture_pool_options()")
+            .count(),
+        1,
+        "hybrid connection registration must use the shared capture pool policy"
     );
+    assert!(!storage_pool.contains(".idle_timeout("));
+    assert!(!storage_pool.contains(".max_lifetime("));
 
     let secrets = production_source(&repository.join("crates/screenpipe-secrets/src/store.rs"));
     assert!(secrets.contains("SECRETS_DATABASE_FILENAME: &str = \"secrets.sqlite\""));

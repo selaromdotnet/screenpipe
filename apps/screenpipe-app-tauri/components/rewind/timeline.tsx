@@ -18,7 +18,7 @@ import { endOfDay, isSameDay, startOfDay } from "date-fns";
 import { getStartDate } from "@/lib/actions/get-start-date";
 import { useTimelineData } from "@/lib/hooks/use-timeline-data";
 import { useCurrentFrame } from "@/lib/hooks/use-current-frame";
-import { isScreenRecordingOff } from "@/lib/hooks/timeline-empty-state";
+import { isScreenRecordingOff, screenshotsDisabledCta } from "@/lib/hooks/timeline-empty-state";
 import { TimelineSlider } from "@/components/rewind/timeline/timeline";
 import { SearchResultStrip } from "@/components/rewind/search-result-strip";
 import { useMeetings } from "@/lib/hooks/use-meetings";
@@ -36,6 +36,7 @@ import { useAudioPlayback } from "@/lib/hooks/use-audio-playback";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { usePipes, type TemplatePipe } from "@/lib/hooks/use-pipes";
+import type { FrameLoadSuccessDetails } from "@/components/rewind/hooks/use-frame-loading";
 
 import posthog from "posthog-js";
 import { toast } from "@/components/ui/use-toast";
@@ -45,6 +46,15 @@ import { useDateNavigation } from "@/components/rewind/hooks/use-date-navigation
 import { useTimelineKeyboard } from "@/components/rewind/hooks/use-timeline-keyboard";
 import { localFetch } from "@/lib/api";
 import { hydrateSearchResultNavigation } from "@/lib/search-result-navigation";
+import type { AppUser } from "@/lib/app-entitlement";
+import { useEnterpriseBuildStatus } from "@/lib/hooks/use-is-enterprise-build";
+import {
+	shouldRestrictTimelineHistory,
+	useAuthoritativeTimelineHistoryAccess,
+} from "@/lib/hooks/use-timeline-cache";
+import { useGT, useMessages } from "gt-react";
+import { useUiLocale } from "@/lib/i18n/provider";
+
 
 export interface StreamTimeSeriesResponse {
 	timestamp: string;
@@ -75,6 +85,7 @@ export interface DeviceMetadata {
 }
 
 export interface AudioData {
+    captured_at?: string | null;
 	device_name: string;
 	is_input: boolean;
 	transcription: string;
@@ -97,8 +108,19 @@ const easeOutCubic = (x: number): number => {
 };
 
 export default function Timeline({ embedded = false }: { embedded?: boolean }) {
+  const uiLocale = useUiLocale();
+  const ui = useGT();
+  const uiMessages = useMessages();
 	const { isMac } = usePlatform();
 	const { settings } = useSettings();
+	const enterpriseBuild = useEnterpriseBuildStatus();
+	const locallyRestrictedHistory = shouldRestrictTimelineHistory(
+		settings?.user as AppUser | null | undefined,
+		enterpriseBuild.isEnterprise,
+	);
+	const historyAccessRestricted = useAuthoritativeTimelineHistoryAccess(
+		locallyRestrictedHistory,
+	);
 	const { health } = useHealthCheck();
 	const [currentIndex, setCurrentIndex] = useState(0);
 	const [showAudioTranscript, setShowAudioTranscript] = useState(false);
@@ -122,7 +144,11 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 	// Performance tracking refs
 	const timelineOpenedAtRef = useRef<number>(performance.now());
-	const firstFrameDisplayedRef = useRef<boolean>(false);
+	const firstFrameMeasurementStartedAtRef = useRef<number | null>(null);
+	const firstFrameReadyRef = useRef<FrameLoadSuccessDetails | null>(null);
+	const firstFrameMeasuredRef = useRef(false);
+	const firstFrameHadCacheRef = useRef(false);
+	const firstFrameCountRef = useRef(0);
 	const totalLoadingTimeRef = useRef<number>(0);
 	const loadingStartTimeRef = useRef<number | null>(null);
 	const framesViewedRef = useRef<number>(0);
@@ -182,13 +208,24 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 	// Note: audio transcript is now on-demand (opened via subtitle bar click)
 
-	const { currentDate, setCurrentDate, fetchTimeRange, hasDateBeenFetched, onWindowFocus, clearNewFramesCount, clearSentRequestForDate, clearFramesForNavigation, pendingNavigation, setPendingNavigation } =
+	const { currentDate, setCurrentDate, fetchTimeRange, hasDateBeenFetched, onWindowFocus, clearNewFramesCount, clearSentRequestForDate, clearFramesForNavigation, pendingNavigation, setPendingNavigation, hasCachedData } =
 		useTimelineStore();
 
 	const { frames, isLoading, error, message, fetchNextDayData, websocket } =
 		useTimelineData(currentDate, (frame) => {
 			setCurrentFrame(frame);
-		});
+		}, historyAccessRestricted, enterpriseBuild.resolved);
+
+	useEffect(() => {
+		if (!historyAccessRestricted || !currentFrame) return;
+		const timestampMs = new Date(currentFrame.timestamp).getTime();
+		if (
+			!Number.isFinite(timestampMs) ||
+			timestampMs < Date.now() - 24 * 60 * 60 * 1000
+		) {
+			setCurrentFrame(null);
+		}
+	}, [currentFrame, historyAccessRestricted, setCurrentFrame]);
 
 	// Audio-only markers advance the playhead and subtitles, but they have no
 	// image to render. Keep the nearest captured screenshot on the canvas while
@@ -602,8 +639,8 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			if (Number.isNaN(parsed) || parsed < 1) {
 				setPendingNavigation(null);
 				toast({
-					title: "invalid frame ID",
-					description: `"${raw}" is not a valid frame ID. expected a positive integer.`,
+					title: ui("Invalid frame ID"),
+					description: ui("\"{value1}\" is not a valid frame ID. expected a positive integer.", { value1: raw }),
 					variant: "destructive",
 				});
 				return;
@@ -615,21 +652,21 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 				if (data?.timestamp) {
 					setPendingNavigation(null);
 					await navigateToTimestamp(data.timestamp);
-					toast({ title: "jumped to frame", description: `opened frame ${frameId}` });
+					toast({ title: ui("Jumped to frame"), description: ui("Opened frame {value1}", { value1: frameId }) });
 					return;
 				}
 				setPendingNavigation(null);
 				toast({
-					title: "frame not found",
-					description: `could not navigate to frame ${frameId} — it may not exist or server is not ready`,
+					title: ui("Frame not found"),
+					description: ui("Could not navigate to frame {value1} — it may not exist or server is not ready", { value1: frameId }),
 					variant: "destructive",
 				});
 			} catch (error) {
 				console.error("Failed to navigate to frame:", error);
 				setPendingNavigation(null);
 				toast({
-					title: "navigation failed",
-					description: error instanceof Error ? error.message : "could not resolve frame to timestamp",
+					title: ui("Navigation failed"),
+					description: error instanceof Error ? error.message : ui("Could not resolve frame to timestamp"),
 					variant: "destructive",
 				});
 			}
@@ -667,6 +704,69 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	// blocker — the inline spinner on the date control is enough feedback.
 	const hasInitialFrames = frames.length > 0;
 	const showBlockingLoader = isLoading && !hasInitialFrames && !isNavigating;
+	firstFrameHadCacheRef.current = hasCachedData;
+	firstFrameCountRef.current = frames.length;
+
+	const captureFirstDisplayedFrame = useCallback(() => {
+		const startedAt = firstFrameMeasurementStartedAtRef.current;
+		const readyFrame = firstFrameReadyRef.current;
+		if (startedAt === null || !readyFrame || firstFrameMeasuredRef.current) return;
+
+		firstFrameMeasuredRef.current = true;
+		posthog.capture("timeline_time_to_first_frame", {
+			measurement_version: 2,
+			duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+			had_cache: firstFrameHadCacheRef.current,
+			frames_count: firstFrameCountRef.current,
+			frame_id: readyFrame.frameId,
+			load_mode: readyFrame.mode,
+			surface: embedded ? "home" : "overlay",
+		});
+	}, [embedded]);
+
+	const beginFirstFrameMeasurement = useCallback(() => {
+		if (firstFrameMeasuredRef.current) return;
+		firstFrameMeasurementStartedAtRef.current = performance.now();
+		captureFirstDisplayedFrame();
+	}, [captureFirstDisplayedFrame]);
+
+	const handleFirstFrameLoaded = useCallback((details: FrameLoadSuccessDetails) => {
+		firstFrameReadyRef.current = details;
+		captureFirstDisplayedFrame();
+	}, [captureFirstDisplayedFrame]);
+
+	// The embedded Timeline mounts only when its section is opened. The overlay
+	// webview, however, can stay mounted for minutes while its window is hidden,
+	// so only count focused/visible time there. A frame decoded in the background
+	// is immediately ready on focus instead of inheriting the hidden interval.
+	useEffect(() => {
+		if (embedded) {
+			beginFirstFrameMeasurement();
+			return;
+		}
+
+		let disposed = false;
+		const unlisten = listen<boolean>("window-focused", (event) => {
+			if (event.payload) {
+				beginFirstFrameMeasurement();
+			} else if (!firstFrameMeasuredRef.current) {
+				firstFrameMeasurementStartedAtRef.current = null;
+			}
+		});
+
+		void import("@tauri-apps/api/window").then(({ getCurrentWindow }) =>
+			getCurrentWindow().isFocused(),
+		).then((focused) => {
+			if (!disposed && focused) beginFirstFrameMeasurement();
+		}).catch(() => {
+			// The focus event remains authoritative if the initial query is unavailable.
+		});
+
+		return () => {
+			disposed = true;
+			unlisten.then((fn) => fn());
+		};
+	}, [beginFirstFrameMeasurement, embedded]);
 
 
 	// Auto-select first frame when frames arrive and no frame is selected
@@ -689,23 +789,21 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	// Track timeline opened and setup session tracking
 	useEffect(() => {
 		timelineOpenedAtRef.current = performance.now();
-		firstFrameDisplayedRef.current = false;
 		totalLoadingTimeRef.current = 0;
 		framesViewedRef.current = 0;
 		framesFailedRef.current = 0;
 		dateChangesRef.current = 0;
-		
+
 		posthog.capture("timeline_opened");
 
 
-		
 		// Send session summary when timeline closes
 		return () => {
 			const sessionDuration = performance.now() - timelineOpenedAtRef.current;
-			const loadingPercentage = sessionDuration > 0 
-				? (totalLoadingTimeRef.current / sessionDuration) * 100 
+			const loadingPercentage = sessionDuration > 0
+				? (totalLoadingTimeRef.current / sessionDuration) * 100
 				: 0;
-			
+
 			posthog.capture("timeline_loading_time_total", {
 				session_duration_ms: Math.round(sessionDuration),
 				loading_time_ms: Math.round(totalLoadingTimeRef.current),
@@ -716,7 +814,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			});
 		};
 	}, []);
-	
+
 	// Track loading state changes for cumulative loading time
 	useEffect(() => {
 		if (isLoading || showBlockingLoader) {
@@ -732,32 +830,21 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			}
 		}
 	}, [isLoading, showBlockingLoader]);
-	
-	// Track time to first frame
+
+	// Track frames viewed. First-frame latency is recorded by the successful
+	// media-load callback above, not by selecting frame metadata.
 	useEffect(() => {
-		if (currentFrame && !firstFrameDisplayedRef.current) {
-			firstFrameDisplayedRef.current = true;
-			const timeToFirstFrame = performance.now() - timelineOpenedAtRef.current;
-			
-			posthog.capture("timeline_time_to_first_frame", {
-				duration_ms: Math.round(timeToFirstFrame),
-				had_cache: frames.length > 1, // If we have multiple frames, likely from cache
-				frames_count: frames.length,
-			});
-		}
-		
-		// Track frames viewed
 		if (currentFrame) {
 			framesViewedRef.current += 1;
 		}
-	}, [currentFrame, frames.length]);
+	}, [currentFrame]);
 
 	// Send timeline selection context to chat (optionally with a specific pipe)
 	const sendSelectionToChat = useCallback(async (pipe?: TemplatePipe) => {
 		if (!selectionRange) return;
 
-		const startTime = selectionRange.start.toLocaleString();
-		const endTime = selectionRange.end.toLocaleString();
+		const startTime = selectionRange.start.toLocaleString(uiLocale);
+		const endTime = selectionRange.end.toLocaleString(uiLocale);
 
 		// Get OCR/audio context from frames in the selection range
 		const selectedFrames = frames.filter((frame) => {
@@ -833,9 +920,9 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 		});
 
 		if (pipe) {
-			toast({ title: `${pipe.icon} ${pipe.title}`, description: "running scheduled task with selection context" });
+			toast({ title: ui("{value1} {value2}", { value1: pipe.icon, value2: pipe.title }), description: ui("Running scheduled task with selection context") });
 		}
-	}, [selectionRange, frames]);
+	}, [selectionRange, frames, uiLocale]);
 
 	// Wrapper that opens search in separate window (fullscreen) or inline modal (embedded)
 	const openSearch = useCallback((v: boolean) => {
@@ -1073,7 +1160,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	// The same Timeline component is used in both overlay and window mode.
 	// The window sizing/decoration is handled by Rust (window_api.rs).
 
-	// Timeline disabled by the user: render a lightweight placeholder and never
+	// Retain the legacy managed timeline gate: render a placeholder and never
 	// mount CurrentFrameTimeline (which attaches the native Live Text overlay).
 	// This both honors the setting and prevents the VisionKit overlay from
 	// leaking a native selection layer over other windows (e.g. the chat input).
@@ -1088,12 +1175,12 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 					<div className="mx-auto mb-6 w-16 h-16 rounded-full bg-muted/50 border border-border flex items-center justify-center">
 						<MonitorOff className="w-8 h-8 text-muted-foreground" />
 					</div>
-					<h3 className="text-lg font-mono font-semibold uppercase tracking-wide mb-2">
-						Timeline Disabled
+					<h3 className="text-lg font-mono font-semibold normal-case tracking-wide mb-2">
+						Timeline unavailable
 					</h3>
 					<p className="text-sm font-mono text-muted-foreground leading-relaxed">
-						The timeline is turned off in settings. Re-enable it under
-						Display settings to browse your recorded history.
+						Timeline is disabled for this installation. Contact your
+						administrator to change this setting.
 					</p>
 				</div>
 			</div>
@@ -1149,6 +1236,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 							onFrameLoadError={() => {
 								framesFailedRef.current += 1;
 							}}
+							onFrameLoadSuccess={handleFirstFrameLoaded}
 							onFrameUnavailable={async () => {
 								// Get the current frame's frame_id
 								const failedFrameId = frames[currentIndex]?.devices?.[0]?.frame_id;
@@ -1203,7 +1291,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 						/>
 					) : null}
 
-	
+
 					{/* Gate on the *derived* display frame, not the raw selection.
 					    `clearFramesForNavigation` empties the store's `frames` while
 					    `currentFrame` (component state) keeps pointing at the
@@ -1227,6 +1315,29 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 									</h3>
 									<p className="text-muted-foreground mb-6 leading-relaxed">
 										Enable screen recording in settings to start capturing your timeline.
+									</p>
+
+									<button
+										onClick={() => commands.showWindow({ Home: { page: "recording" } })}
+										className="inline-flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-full text-sm font-medium hover:bg-primary/90 transition-colors"
+									>
+										<Settings className="w-4 h-4" />
+										Open settings
+									</button>
+								</div>
+							) : screenshotsDisabledCta(health, uiMessages) ? (
+								<div className="text-center p-8 max-w-md">
+									<div className="mx-auto mb-8 w-24 h-24 flex items-center justify-center">
+										<div className="w-16 h-16 rounded-full bg-muted/50 border border-border flex items-center justify-center">
+											<MonitorOff className="w-8 h-8 text-muted-foreground" />
+										</div>
+									</div>
+
+									<h3 className="text-xl font-semibold text-foreground mb-3">
+										{screenshotsDisabledCta(health, uiMessages)?.headline}
+									</h3>
+									<p className="text-muted-foreground mb-6 leading-relaxed">
+										{screenshotsDisabledCta(health, uiMessages)?.body}
 									</p>
 
 									<button
@@ -1290,6 +1401,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 						currentDate={currentDate}
 						currentTime={currentFrame ? new Date(currentFrame.timestamp) : null}
 						startAndEndDates={startAndEndDates}
+						historyAccessRestricted={historyAccessRestricted}
 						onDateChange={handleDateChange}
 						onJumpToday={handleJumpToday}
 						// Embedded timeline no longer renders a search button
@@ -1331,7 +1443,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 							<button
 								type="button"
 								className="flex items-center gap-1.5 max-w-lg min-w-0 px-3 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 hover:bg-black/80 hover:border-white/20 transition-colors cursor-pointer pointer-events-auto"
-								title={`Open ${openableUrl}`}
+								title={ui("Open {value1}", { value1: openableUrl })}
 								onClick={async (e) => {
 									e.stopPropagation();
 									try {
@@ -1374,12 +1486,12 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 							<button
 								onClick={() => commands.closeWindow("Main")}
 								className="absolute top-4 right-4 p-2 bg-card hover:bg-muted border border-border rounded-md transition-colors z-50"
-								title="Close (Esc)"
+								title={ui("Close (Esc)")}
 							>
 								<X className="w-4 h-4 text-muted-foreground" />
 							</button>
 						)}
-						<div className="bg-card text-foreground p-6 rounded-2xl text-center space-y-3 max-w-md mx-4">
+						<div className="bg-card text-foreground p-6 rounded-lg text-center space-y-3 max-w-md mx-4">
 							<h3 className="font-medium">Loading Timeline</h3>
 							<p className="text-sm text-foreground">
 								Fetching your recorded frames...
@@ -1405,12 +1517,12 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 							<button
 								onClick={() => commands.closeWindow("Main")}
 								className="absolute top-4 right-4 p-2 bg-card hover:bg-muted border border-border rounded-md transition-colors z-50"
-								title="Close (Esc)"
+								title={ui("Close (Esc)")}
 							>
 								<X className="w-4 h-4 text-muted-foreground" />
 							</button>
 						)}
-						<div className="bg-destructive/20 border border-destructive/30 text-foreground p-6 rounded-2xl text-center space-y-4 max-w-md mx-4">
+						<div className="bg-destructive/20 border border-destructive/30 text-foreground p-6 rounded-lg text-center space-y-4 max-w-md mx-4">
 							<div className="flex flex-col items-center gap-2">
 								<AlertCircle className="h-6 w-6 text-destructive" />
 								<h3 className="font-medium text-destructive">Connection Error</h3>
@@ -1496,7 +1608,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 							className="px-1.5 hover:text-white/80 disabled:text-white/30"
 							disabled={searchResultIndex >= searchResults.length - 1}
 							onClick={() => navigateToSearchResult(searchResultIndex + 1)}
-							title="Older match (←)"
+							title={ui("Older match (←)")}
 						>
 							&#9664;
 						</button>
@@ -1512,14 +1624,14 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 							className="px-1.5 hover:text-white/80 disabled:text-white/30"
 							disabled={searchResultIndex <= 0}
 							onClick={() => navigateToSearchResult(searchResultIndex - 1)}
-							title={isMac ? "Newer match (→ or ⌘G)" : "Newer match (→ or Ctrl+G)"}
+							title={isMac ? ui("Newer match (→ or ⌘G)") : ui("Newer match (→ or Ctrl+G)")}
 						>
 							&#9654;
 						</button>
 						<button
 							className="ml-1 text-white/50 hover:text-white/80"
 							onClick={() => clearSearchHighlight()}
-							title="Exit search review (Esc)"
+							title={ui("Exit search review (Esc)")}
 						>
 							<X className="w-3.5 h-3.5" />
 						</button>
@@ -1613,7 +1725,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 											<span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
 											<span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
 										</span>
-										Recording... timeline will appear soon
+										Recording... Timeline will appear soon
 									</div>
 								)}
 							</div>

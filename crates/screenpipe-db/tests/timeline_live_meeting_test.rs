@@ -29,6 +29,64 @@ mod timeline_live_meeting_tests {
         db
     }
 
+    /// A provider reconnect resets its own timestamps and speaker numbering.
+    /// Both turns must survive, while the repeated label stays split across the
+    /// two opaque stream-scoped identities.
+    #[tokio::test]
+    async fn test_reconnected_live_stream_preserves_scoped_speaker_identity() {
+        let db = setup_test_db().await;
+        let base = Utc::now();
+        let meeting_id = db
+            .insert_meeting("zoom.us", "ui_scan", None, None)
+            .await
+            .unwrap();
+
+        for (stream_id, session_speaker_id, captured_at) in [
+            ("stream-a", "live_a", base),
+            ("stream-b", "live_b", base + Duration::seconds(5)),
+        ] {
+            db.insert_meeting_transcript_segment_with_identity(
+                meeting_id,
+                "screenpipe-cloud",
+                Some("nova-3"),
+                &format!("deepgram:{stream_id}:0:0"),
+                "System Audio",
+                "output",
+                stream_id,
+                Some(session_speaker_id),
+                Some("speaker 1"),
+                "provider timestamp zero turn",
+                captured_at,
+            )
+            .await
+            .unwrap();
+        }
+
+        let segments = db
+            .list_meeting_transcript_segments(meeting_id)
+            .await
+            .unwrap();
+        let live_segments: Vec<_> = segments
+            .iter()
+            .filter(|segment| segment.source == "live")
+            .collect();
+
+        assert_eq!(
+            live_segments.len(),
+            2,
+            "neither reconnect turn may be dropped"
+        );
+        assert_eq!(live_segments[0].speaker_name.as_deref(), Some("speaker 1"));
+        assert_eq!(
+            live_segments[0].session_speaker_id.as_deref(),
+            Some("live_a")
+        );
+        assert_eq!(
+            live_segments[1].session_speaker_id.as_deref(),
+            Some("live_b")
+        );
+    }
+
     /// A live meeting segment with no corresponding background transcription must
     /// still appear on the timeline.
     #[tokio::test]
@@ -83,6 +141,12 @@ mod timeline_live_meeting_tests {
         assert!(
             found,
             "live meeting transcript should be surfaced on the timeline"
+        );
+        let turn = &chunks.frames[0].audio_entries[0];
+        assert_eq!(turn.captured_at, Some(base + Duration::seconds(2)));
+        assert!(
+            turn.audio_chunk_id < 0,
+            "live turns have distinct transcript identities"
         );
     }
 
@@ -418,6 +482,13 @@ mod timeline_live_meeting_tests {
             count, 1,
             "mirrored segment must appear on the timeline exactly once (mirror shown, live row deduped)"
         );
+        let turn = &chunks.frames[0].audio_entries[0];
+        assert_eq!(turn.start_time, Some(2.0));
+        assert_eq!(
+            turn.captured_at,
+            Some(base + Duration::seconds(2)),
+            "live capture time already includes the file offset; do not add it twice"
+        );
     }
 
     /// Once the engine-agnostic backfill has resolved a global `speaker_id` on the
@@ -432,16 +503,16 @@ mod timeline_live_meeting_tests {
         // A named global speaker (as the embedding backfill would have created/named).
         let speaker = db.create_speaker_with_name("Chris Ng").await.unwrap();
 
-        // The meeting's covering audio, already identified with that speaker.
+        // The exact mirrored live turn, already identified with that speaker.
         let chunk_id = db
             .insert_audio_chunk("System Audio (output)_meeting.mp4", Some(base))
             .await
             .unwrap();
         db.insert_audio_transcription(
             chunk_id,
-            "identified background line",
+            "audience question",
             0,
-            "",
+            "live",
             &AudioDevice {
                 name: "System Audio".to_string(),
                 device_type: DeviceType::Output,
@@ -468,7 +539,7 @@ mod timeline_live_meeting_tests {
             "output",
             Some("speaker 1"),
             "audience question",
-            base + Duration::seconds(1),
+            base,
         )
         .await
         .unwrap();
@@ -499,9 +570,10 @@ mod timeline_live_meeting_tests {
     }
 
     /// Until a segment is resolved, the Meeting view falls back to Deepgram's
-    /// free-text `speaker_name`, and the backfill maps nothing.
+    /// free-text `speaker_name` even for mic input. A capture source is not a
+    /// speaker identity, and the backfill may have nothing to map yet.
     #[tokio::test]
-    async fn test_meeting_segment_falls_back_to_freetext_speaker() {
+    async fn test_input_meeting_segment_falls_back_to_freetext_speaker() {
         let db = setup_test_db().await;
         let base = Utc::now();
 
@@ -514,8 +586,8 @@ mod timeline_live_meeting_tests {
             "screenpipe-cloud",
             None,
             "deepgram:0:0",
-            "System Audio",
-            "output",
+            "Built-in Mic",
+            "input",
             Some("speaker 2"),
             "unresolved line",
             base,
@@ -607,7 +679,7 @@ mod timeline_live_meeting_tests {
     }
 
     #[tokio::test]
-    async fn test_speaker_backfill_matches_reference_and_breaks_ties_deterministically() {
+    async fn test_speaker_backfill_abstains_on_nearby_turns() {
         let db = setup_test_db().await;
         // This millisecond phase makes julianday() represent +2s as one ULP
         // nearer than -2s, reproducing the old incorrect tie resolution.
@@ -625,8 +697,8 @@ mod timeline_live_meeting_tests {
         let earlier = db.create_speaker_with_name("Earlier").await.unwrap();
         let later = db.create_speaker_with_name("Later").await.unwrap();
 
-        // Equal distance from the segment. The documented tie order picks the
-        // earlier timestamp, then the lower row id when timestamps also match.
+        // Nearby turns are not evidence of who spoke the unresolved turn.
+        // Timestamp or row-id tie breakers cannot establish identity.
         for (text, timestamp, speaker_id) in [
             ("later", base + Duration::seconds(2), later.id),
             ("earlier", base - Duration::seconds(2), earlier.id),
@@ -661,40 +733,19 @@ mod timeline_live_meeting_tests {
         .await
         .unwrap();
 
-        // Reference implementation: the old nearest-row lookup plus explicit
-        // timestamp/id tie breakers. Use integer epoch milliseconds so equal
-        // offsets remain exactly equal before applying those tie breakers.
-        let expected: i64 = sqlx::query_scalar(
-            "SELECT speaker_id FROM audio_transcriptions \
-             WHERE speaker_id IS NOT NULL AND COALESCE(is_input_device, 1) = 0 \
-               AND ABS( \
-                   CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000.0) AS INTEGER) - \
-                   CAST(ROUND(unixepoch(?1, 'subsec') * 1000.0) AS INTEGER) \
-               ) <= 10000 \
-             ORDER BY ABS( \
-                 CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000.0) AS INTEGER) - \
-                 CAST(ROUND(unixepoch(?1, 'subsec') * 1000.0) AS INTEGER) \
-             ), timestamp, id LIMIT 1",
-        )
-        .bind(base)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-
-        assert_eq!(expected, earlier.id);
         assert_eq!(
             db.backfill_meeting_segment_speakers(base - Duration::hours(1), 10.0)
                 .await
                 .unwrap(),
-            1
+            0
         );
-        let actual: i64 = sqlx::query_scalar(
+        let actual: Option<i64> = sqlx::query_scalar(
             "SELECT speaker_id FROM meeting_transcript_segments WHERE item_id = 'tie-segment'",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(actual, expected);
+        assert_eq!(actual, None);
     }
 
     #[tokio::test]

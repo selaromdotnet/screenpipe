@@ -35,8 +35,22 @@ describe("attached context", () => {
 
     expect(content).toContain("[Context from reviewed Screenpipe snapshot:");
     expect(parseAttachedContext(content)).toMatchObject({
-      label: "frozen Screenpipe snapshot",
+      label: "Frozen Screenpipe snapshot",
       message: "Share this to Notion",
+    });
+  });
+
+  it("marks activity history context as an episode rather than generic search", () => {
+    const content = attachContextToUserMessage({
+      message: "What were the takeaways?",
+      context: "Time: 2026-08-18T23:18:59Z to 2026-08-18T23:29:59Z\nActivity: Analyzed agent frustration",
+      source: "activity-history-chat",
+    });
+
+    expect(content).toContain("[Context from activity episode:");
+    expect(parseAttachedContext(content)).toMatchObject({
+      label: "context from activity episode",
+      message: "What were the takeaways?",
     });
   });
 
@@ -50,7 +64,7 @@ describe("attached context", () => {
     const parsed = parseAttachedContext(SNAPSHOT_MESSAGE);
 
     expect(parsed).not.toBeNull();
-    expect(parsed!.label).toBe("frozen Screenpipe snapshot");
+    expect(parsed!.label).toBe("Frozen Screenpipe snapshot");
     // Title, surface and size — enough to recognise it without reading it.
     expect(parsed!.detail).toContain("How I Spend My Time Today");
     expect(parsed!.detail).toContain("Live View");
@@ -69,12 +83,12 @@ describe("attached context", () => {
     expect(screen.queryByText(/screenpipe_share_context/)).toBeNull();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "show attached context" }),
+      screen.getByRole("button", { name: "Show attached context" }),
     );
     expect(screen.getByText(/screenpipe_share_context/)).toBeVisible();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "hide attached context" }),
+      screen.getByRole("button", { name: "Hide attached context" }),
     );
     expect(screen.queryByText(/screenpipe_share_context/)).toBeNull();
   });
@@ -108,6 +122,6 @@ describe("attached context", () => {
     expect(parsed!.message).toBe("");
 
     render(<AttachedContextCard context={parsed!} />);
-    expect(screen.getByText("frozen Screenpipe snapshot")).toBeVisible();
+    expect(screen.getByText("Frozen Screenpipe snapshot")).toBeVisible();
   });
 });

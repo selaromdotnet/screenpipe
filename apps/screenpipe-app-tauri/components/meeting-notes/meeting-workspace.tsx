@@ -6,7 +6,18 @@
 import React from "react";
 import { MemoizedReactMarkdown } from "@/components/markdown";
 import { cn } from "@/lib/utils";
-import { Loader2 } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { AlertTriangle, Check, ChevronDown, Loader2 } from "lucide-react";
+import { useGT } from "gt-react";
+import { msg, useMessages } from "gt-react";
+import { localizeDefinitions } from "@/lib/i18n/definitions";
+
 
 export type MeetingWorkspaceTab = "notes" | "transcript" | "summary";
 
@@ -26,21 +37,21 @@ export const MEETING_READING_COLUMN_CLASS = "w-full";
 // had accumulated several bordered 36px squares that each read as important as
 // the title or the primary action, which is what made the surface feel busy.
 export const MEETING_QUIET_CONTROL_CLASS =
-  "rounded-none border-0 bg-transparent text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground focus-visible:text-foreground";
+  "rounded-md border-0 bg-transparent text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground focus-visible:text-foreground";
 
 // Actions that sit on the tab rule share the tabs' own geometry so the row
 // reads as one band instead of a strip of floating boxes. Shared with the note
 // view now that the meeting actions live here rather than in a footer.
 export const MEETING_RULE_ACTION_CLASS =
-  "flex h-11 shrink-0 items-center gap-2 border-l border-border font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:z-10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground disabled:text-muted-foreground/50 disabled:hover:bg-transparent";
+  "flex h-9 my-1 shrink-0 items-center gap-2 rounded-md font-mono text-[11px] normal-case tracking-[0.12em] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:z-10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground disabled:text-muted-foreground/50 disabled:hover:bg-transparent";
 
 const MEETING_TABS: ReadonlyArray<{
   value: MeetingWorkspaceTab;
   label: string;
 }> = [
-  { value: "notes", label: "notes" },
-  { value: "transcript", label: "transcript" },
-  { value: "summary", label: "summary" },
+  { value: "notes", label: msg("Notes", {}) },
+  { value: "transcript", label: msg("Transcript", {}) },
+  { value: "summary", label: msg("Summary", {}) },
 ];
 
 export function MeetingWorkspaceTabs({
@@ -59,11 +70,14 @@ export function MeetingWorkspaceTabs({
   // fourth pseudo-tab for arrow-key navigation.
   trailing?: React.ReactNode;
 }) {
+
+  const uiMessages = useMessages();
+  const ui = useGT();
   const tabRefs = React.useRef<Array<HTMLButtonElement | null>>([]);
 
   const moveFocus = (index: number) => {
-    const normalized = (index + MEETING_TABS.length) % MEETING_TABS.length;
-    const next = MEETING_TABS[normalized];
+    const normalized = (index + localizeDefinitions(MEETING_TABS, uiMessages).length) % localizeDefinitions(MEETING_TABS, uiMessages).length;
+    const next = localizeDefinitions(MEETING_TABS, uiMessages)[normalized];
     onValueChange(next.value);
     tabRefs.current[normalized]?.focus();
   };
@@ -71,13 +85,13 @@ export function MeetingWorkspaceTabs({
   const tablist = (
     <div
       role="tablist"
-      aria-label="meeting workspace"
+      aria-label={ui("Meeting workspace")}
       className={cn(
-        "flex min-w-0 items-stretch overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+        "flex min-w-0 items-stretch gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
         !trailing && "border-b border-border",
       )}
     >
-      {MEETING_TABS.map((tab, index) => {
+      {localizeDefinitions(MEETING_TABS, uiMessages).map((tab, index) => {
         const selected = value === tab.value;
         const state = tab.value === "summary" ? summaryState : null;
         return (
@@ -105,11 +119,11 @@ export function MeetingWorkspaceTabs({
                 moveFocus(0);
               } else if (event.key === "End") {
                 event.preventDefault();
-                moveFocus(MEETING_TABS.length - 1);
+                moveFocus(localizeDefinitions(MEETING_TABS, uiMessages).length - 1);
               }
             }}
             className={cn(
-              "relative flex h-11 shrink-0 items-center gap-2 border-r border-border px-4 font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground transition-colors focus-visible:z-10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground sm:min-w-32 sm:justify-center",
+              "relative my-1 flex h-9 shrink-0 items-center gap-2 rounded-md px-4 font-mono text-[11px] normal-case tracking-[0.12em] text-muted-foreground transition-colors focus-visible:z-10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground sm:min-w-32 sm:justify-center",
               selected && "bg-foreground text-background",
               !selected && "hover:bg-muted hover:text-foreground",
             )}
@@ -117,7 +131,7 @@ export function MeetingWorkspaceTabs({
             <span>{tab.label}</span>
             {state && (
               <span
-                aria-label={`summary ${state}`}
+                aria-label={ui("Summary {value1}", { value1: state })}
                 className={cn(
                   "h-1.5 w-1.5 shrink-0",
                   state === "working" &&
@@ -153,7 +167,65 @@ export function extractMeetingSummary(markdown: string): string | null {
   if (!latest) return null;
 
   const body = markdown.slice(latest.index + latest[0].length).trim();
-  return body || null;
+  // A refusal is an error outcome, even when an older run saved it under
+  // the Summary heading. Match the server's narrow failure-prefix check.
+  const normalized = body.toLowerCase().replace(/’/g, "'");
+  const failurePrefixes = [
+    "i couldn't produce a reliable summary", "i could not produce a reliable summary",
+    "i couldn't summarize", "i could not summarize", "i can't summarize", "i cannot summarize",
+    "unable to summarize this meeting", "no speech was captured", "no transcript was available",
+  ];
+  return body && !failurePrefixes.some((prefix) => normalized.startsWith(prefix)) ? body : null;
+}
+
+/**
+ * A completed meeting should reopen on its outcome, not its raw capture.
+ * Notes remain the useful fallback when no saved summary exists; Transcript is
+ * still available as an explicit tab, deep link, or source jump.
+ */
+export function preferredMeetingWorkspaceTab(
+  note: string | null | undefined,
+): Exclude<MeetingWorkspaceTab, "transcript"> {
+  return extractMeetingSummary(note ?? "") ? "summary" : "notes";
+}
+
+export async function stopMeetingAndOpenSummary(
+  onStop: () => void | Promise<void>,
+  onValueChange: (value: MeetingWorkspaceTab) => void,
+): Promise<void> {
+  await onStop();
+  onValueChange("summary");
+}
+
+export interface MeetingSummaryRecovery {
+  title: string;
+  detail: string;
+  retryable: boolean;
+  upgrade?: {
+    label: string;
+    onSelect: () => void;
+  };
+  model?: {
+    selectedId: string | null;
+    selectedLabel: string;
+    saving: boolean;
+    options: Array<{
+      id: string;
+      label: string;
+      detail: string;
+      onSelect: () => void;
+    }>;
+    onManage: () => void;
+  };
+}
+
+export function meetingSummarySaveIsVisible(
+  currentNote: string,
+  refreshedNote: string,
+  awaitedNewSummary: boolean,
+): boolean {
+  if (!extractMeetingSummary(refreshedNote)) return false;
+  return !awaitedNewSummary || refreshedNote !== currentNote;
 }
 
 export function MeetingSummarySurface({
@@ -163,6 +235,7 @@ export function MeetingSummarySurface({
   streamedSummary,
   onGenerate,
   canGenerate,
+  recovery,
   activity,
 }: {
   note: string;
@@ -171,15 +244,26 @@ export function MeetingSummarySurface({
   streamedSummary?: string;
   onGenerate: () => void;
   canGenerate: boolean;
+  recovery?: MeetingSummaryRecovery;
   // Replay scrubber and the "related during this meeting" list. They are
   // evidence for the summary — what was on screen and open while it was
   // written — so they belong under it. Under the note editor they sat below a
   // draft of unbounded length, which is a place nobody scrolls to.
   activity?: React.ReactNode;
 }) {
+
+  const ui = useGT();
   const savedSummary = extractMeetingSummary(note);
-  const isStreaming = state === "working" && Boolean(streamedSummary?.trim());
-  const summary = isStreaming ? streamedSummary! : savedSummary;
+  const liveSummary = extractMeetingSummary(`## Summary\n${streamedSummary ?? ""}`);
+  // A Pipe run completes immediately after its final message, while the
+  // meeting-note PUT from that message can still be reaching the API. Keep
+  // the draft that was already on screen through that handoff instead of
+  // briefly replacing it with an older summary (or "no summary yet").
+  const showingLiveSummary =
+    Boolean(liveSummary) && (state === "working" || state === "ready");
+  const isStreaming = state === "working" && showingLiveSummary;
+  const summary = showingLiveSummary ? liveSummary : savedSummary;
+  const attention = state === "attention" ? recovery : undefined;
 
   return (
     <section
@@ -196,7 +280,7 @@ export function MeetingSummarySurface({
             role={state === "working" ? "status" : undefined}
             aria-live={state === "working" ? "polite" : undefined}
           >
-            <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+            <div className="flex items-center gap-2 font-mono text-[10px] normal-case tracking-[0.14em] text-muted-foreground">
               {state === "working" && (
                 <Loader2
                   className="h-3 w-3 animate-spin motion-reduce:animate-none"
@@ -204,11 +288,17 @@ export function MeetingSummarySurface({
                 />
               )}
               <span>
-                {state === "working" ? "writing summary" : "meeting summary"}
+                {state === "working"
+                  ? ui("Writing summary")
+                  : ui("Meeting summary")}
               </span>
             </div>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              {detail}
+              {attention
+                ? savedSummary
+                  ? ui("The existing summary is unchanged.")
+                  : ui("Generation stopped before a summary was written.")
+                : detail}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -216,23 +306,116 @@ export function MeetingSummarySurface({
                 the tab rule above. This header keeps only the action that is
                 unique to the summary tab: producing one. */}
             {(state === "idle" ||
-              state === "attention" ||
-              state === "ready") && (
+              state === "ready" ||
+              (state === "attention" && attention?.retryable)) && (
               <button
                 type="button"
                 onClick={onGenerate}
                 disabled={!canGenerate}
-                className="h-9 shrink-0 border border-foreground bg-foreground px-3 font-mono text-[10px] uppercase tracking-[0.12em] text-background transition-colors hover:bg-background hover:text-foreground disabled:border-border disabled:bg-muted disabled:text-muted-foreground"
+                className="h-9 shrink-0 rounded-md border border-foreground bg-foreground px-3 font-mono text-[10px] normal-case tracking-[0.12em] text-background transition-colors hover:bg-background hover:text-foreground disabled:border-border disabled:bg-muted disabled:text-muted-foreground"
               >
                 {state === "attention"
-                  ? "retry"
+                  ? ui("Retry")
                   : state === "ready"
-                    ? "summarize again"
-                    : "generate"}
+                    ? ui("Summarize again")
+                    : ui("Generate")}
               </button>
             )}
           </div>
         </div>
+
+        {attention && (
+          <div
+            role="alert"
+            data-testid="meeting-summary-recovery"
+            className="mb-8 rounded-lg border border-border bg-muted/30 p-5"
+          >
+            <div className="flex items-start gap-3">
+              <AlertTriangle
+                className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-300"
+                aria-hidden="true"
+              />
+              <div className="min-w-0 flex-1">
+                <h2 className="font-mono text-xs normal-case tracking-[0.12em] text-foreground">
+                  {attention.title}
+                </h2>
+                <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
+                  {attention.detail}
+                </p>
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  {attention.upgrade && (
+                    <button
+                      type="button"
+                      data-testid="meeting-summary-upgrade-button"
+                      onClick={attention.upgrade.onSelect}
+                      className="h-9 rounded-md border border-foreground bg-foreground px-3 font-mono text-[10px] normal-case tracking-[0.12em] text-background transition-colors hover:bg-background hover:text-foreground"
+                    >
+                      {attention.upgrade.label}
+                    </button>
+                  )}
+                  {attention.model && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <button
+                          type="button"
+                          data-testid="meeting-summary-change-model"
+                          disabled={attention.model.saving}
+                          className="flex h-9 items-center gap-2 rounded-md border border-border bg-background px-3 font-mono text-[10px] normal-case tracking-[0.12em] text-foreground transition-colors hover:border-foreground disabled:text-muted-foreground"
+                        >
+                          {attention.model.saving
+                            ? ui("Changing model")
+                            : ui("Change summary model")}
+                          <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                        </button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent
+                        align="start"
+                        className="w-72 rounded-lg"
+                      >
+                        <div className="border-b border-border px-2 py-2">
+                          <p className="font-mono text-[9px] normal-case tracking-[0.12em] text-muted-foreground">
+                            Current summary model
+                          </p>
+                          <p className="mt-1 truncate text-xs text-foreground">
+                            {attention.model.selectedLabel}
+                          </p>
+                        </div>
+                        {attention.model.options.map((option) => (
+                          <DropdownMenuItem
+                            key={option.id}
+                            onSelect={option.onSelect}
+                            className="rounded-sm"
+                          >
+                            <span className="flex min-w-0 flex-1 items-center gap-2">
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-xs">
+                                  {option.label}
+                                </span>
+                                <span className="block truncate text-[10px] text-muted-foreground">
+                                  {option.detail}
+                                </span>
+                              </span>
+                              {option.id === attention.model?.selectedId && (
+                                <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                              )}
+                            </span>
+                          </DropdownMenuItem>
+                        ))}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onSelect={attention.model.onManage}
+                          className="rounded-sm font-mono text-[10px] normal-case tracking-[0.1em]"
+                        >
+                          Manage models &amp; keys
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div
           data-testid="meeting-summary-reading-column"
@@ -240,7 +423,7 @@ export function MeetingSummarySurface({
         >
           {summary ? (
             <div aria-busy={isStreaming}>
-              <MemoizedReactMarkdown className="prose prose-sm max-w-none break-words text-foreground dark:prose-invert prose-headings:font-mono prose-headings:text-xs prose-headings:uppercase prose-headings:tracking-[0.12em] prose-p:leading-7 prose-li:leading-7 [&>*:first-child]:mt-0">
+              <MemoizedReactMarkdown className="prose prose-sm max-w-none flex flex-col items-start break-words text-foreground dark:prose-invert prose-headings:font-mono prose-headings:text-xs prose-headings:normal-case prose-headings:tracking-[0.12em] prose-p:leading-7 prose-li:leading-7 [&>*:first-child]:mt-0">
                 {summary}
               </MemoizedReactMarkdown>
               {isStreaming && (
@@ -263,13 +446,13 @@ export function MeetingSummarySurface({
                 The first section replaces this message as soon as it is ready.
               </p>
             </div>
-          ) : (
+          ) : state === "attention" ? null : (
             <div className="border-l border-border py-2 pl-5">
               <p className="text-sm font-medium text-foreground">
-                no summary yet
+                No summary yet
               </p>
               <p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">
-                Stop the meeting first. screenpipe will keep your notes and
+                Stop the meeting first. Screenpipe will keep your notes and
                 transcript intact while the summary is written.
               </p>
             </div>

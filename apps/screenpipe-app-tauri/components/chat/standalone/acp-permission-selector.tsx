@@ -13,7 +13,7 @@ import {
   ShieldCheck,
   type LucideProps,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -23,6 +23,7 @@ import {
 import { commands, type AIPreset } from "@/lib/utils/tauri";
 import {
   findAcpModeOption,
+  findAcpPermissionBooleanOption,
   findAcpPermissionModeOption,
   hasAcpPermissionModes,
   useAcpSessionConfig,
@@ -32,14 +33,21 @@ import {
 import type { AcpConfigDefaultChange } from "@/components/chat/standalone/acp-config-selector";
 import { acpAdapterInfo } from "@/lib/utils/preset-appearance";
 import { cn } from "@/lib/utils";
+import { useGT } from "gt-react";
+import { localizeDefinitions } from "@/lib/i18n/definitions";
+import { msg, useMessages } from "gt-react";
 
-type ModeSource =
-  { kind: "option"; optionId: string } | { kind: "session-mode" };
+
+type PermissionSource =
+  | { kind: "select"; optionId: string }
+  | { kind: "boolean"; optionId: string }
+  | { kind: "session-mode" };
 
 interface PermissionControl {
-  source: ModeSource;
+  source: PermissionSource;
   currentValue: string;
   values: AcpConfigValue[];
+  hasClientFullAccess: boolean;
 }
 
 interface PermissionPresentation {
@@ -47,6 +55,26 @@ interface PermissionPresentation {
   description: string;
   icon: ComponentType<LucideProps>;
   warning?: boolean;
+}
+
+const CLIENT_FULL_ACCESS_VALUE = "screenpipe-full-access";
+const CLIENT_FULL_ACCESS_OPTION: AcpConfigValue = {
+  value: CLIENT_FULL_ACCESS_VALUE,
+  name: msg("Full access", {}),
+  description: msg("Run every requested tool without asking for approval.", {}),
+};
+
+function withClientFullAccess(values: AcpConfigValue[]): {
+  values: AcpConfigValue[];
+  hasClientFullAccess: boolean;
+} {
+  if (values.some(isUnrestrictedMode)) {
+    return { values, hasClientFullAccess: false };
+  }
+  return {
+    values: [...values, CLIENT_FULL_ACCESS_OPTION],
+    hasClientFullAccess: true,
+  };
 }
 
 function permissionControl(
@@ -60,17 +88,44 @@ function permissionControl(
         : (config?.modes?.currentModeId ?? option.values[0]?.value);
     if (!currentValue) return null;
     return {
-      source: { kind: "option", optionId: option.id },
+      source: { kind: "select", optionId: option.id },
       currentValue,
-      values: option.values,
+      ...withClientFullAccess(option.values),
     };
   }
-  if (findAcpModeOption(config) || !config?.modes || !hasAcpPermissionModes(config))
+  const booleanOption = findAcpPermissionBooleanOption(config);
+  if (booleanOption) {
+    const enabled =
+      booleanOption.currentValue === true ||
+      booleanOption.currentValue === "true";
+    return {
+      source: { kind: "boolean", optionId: booleanOption.id },
+      currentValue: String(enabled),
+      values: [
+        {
+          value: "false",
+          name: msg("Ask for approval", {}),
+          description: msg("Ask before running tools that need approval.", {}),
+        },
+        {
+          value: "true",
+          name: msg("Full access", {}),
+          description: msg("Run every requested tool without asking for approval.", {}),
+        },
+      ],
+      hasClientFullAccess: false,
+    };
+  }
+  if (
+    findAcpModeOption(config) ||
+    !config?.modes ||
+    !hasAcpPermissionModes(config)
+  )
     return null;
   return {
     source: { kind: "session-mode" },
     currentValue: config.modes.currentModeId,
-    values: config.modes.availableModes,
+    ...withClientFullAccess(config.modes.availableModes),
   };
 }
 
@@ -88,59 +143,83 @@ function isUnrestrictedMode(mode: AcpConfigValue): boolean {
 
 function permissionPresentation(mode: AcpConfigValue): PermissionPresentation {
   switch (mode.value) {
+    case CLIENT_FULL_ACCESS_VALUE:
+      return {
+        label: msg("Full access", {}),
+        description:
+          mode.description || msg("Run every requested tool without asking.", {}),
+        icon: ShieldAlert,
+        warning: true,
+      };
+    case "false":
+      return {
+        label: msg("Ask for approval", {}),
+        description:
+          mode.description || msg("Ask before running tools that need approval.", {}),
+        icon: Hand,
+      };
+    case "true":
+      return {
+        label: msg("Full access", {}),
+        description:
+          mode.description ||
+          msg("Run every requested tool without asking for approval.", {}),
+        icon: ShieldAlert,
+        warning: true,
+      };
     case "read-only":
     case "default":
       return {
-        label: "Ask for approval",
+        label: msg("Ask for approval", {}),
         description:
-          mode.description || "Ask before editing files or running commands.",
+          mode.description || msg("Ask before editing files or running commands.", {}),
         icon: Hand,
       };
     case "agent":
       return {
-        label: "Approve for me",
-        description: "Work in this workspace and ask before elevated actions.",
+        label: msg("Approve for me", {}),
+        description: msg("Work in this workspace and ask before elevated actions.", {}),
         icon: ShieldCheck,
       };
     case "acceptEdits":
       return {
-        label: "Approve edits",
+        label: msg("Approve edits", {}),
         description:
-          mode.description || "Automatically approve file edit operations.",
+          mode.description || msg("Automatically approve file edit operations.", {}),
         icon: ShieldCheck,
       };
     case "plan":
       return {
-        label: "Plan only",
-        description: mode.description || "Plan without changing files.",
+        label: msg("Plan only", {}),
+        description: mode.description || msg("Plan without changing files.", {}),
         icon: Shield,
       };
     case "dontAsk":
       return {
-        label: "Don't ask",
+        label: msg("Don't ask", {}),
         description:
-          mode.description || "Deny actions that are not already approved.",
+          mode.description || msg("Deny actions that are not already approved.", {}),
         icon: Shield,
       };
     case "agent-full-access":
       return {
-        label: "Full access",
+        label: msg("Full access", {}),
         description:
-          "Unrestricted access to the internet and any file on your computer.",
+          msg("Unrestricted access to the internet and any file on your computer.", {}),
         icon: ShieldAlert,
         warning: true,
       };
     case "bypassPermissions":
       return {
-        label: "Full access",
-        description: mode.description || "Bypass all permission checks.",
+        label: msg("Full access", {}),
+        description: mode.description || msg("Bypass all permission checks.", {}),
         icon: ShieldAlert,
         warning: true,
       };
     default:
       return {
         label: mode.name,
-        description: mode.description || "Use this agent permission mode.",
+        description: mode.description || msg("Use this agent permission mode.", {}),
         icon: isUnrestrictedMode(mode) ? ShieldAlert : Shield,
         warning: isUnrestrictedMode(mode),
       };
@@ -157,10 +236,10 @@ function isAgentNotRunning(message: string): boolean {
   );
 }
 
-/** An ACP adapter's approval/sandbox modes as a first-class composer control.
- *  The adapter remains authoritative for the available values; shared labels
- *  make equivalent modes consistent across Codex, Claude Code, Pi, Cursor,
- *  and future ACP harnesses. */
+/** ACP approval/sandbox modes as a first-class composer control. Adapter-owned
+ *  values remain authoritative; when an adapter asks the client to approve
+ *  tools but exposes no unrestricted mode, Screenpipe adds its own Full access
+ *  response policy instead of inventing an ACP session mode. */
 export function AcpPermissionSelector({
   sessionId,
   agentId,
@@ -172,6 +251,9 @@ export function AcpPermissionSelector({
   activePreset?: AIPreset | null;
   onPersistDefault?: (change: AcpConfigDefaultChange) => void;
 }) {
+
+  const ui = useGT();
+  const uiMessages = useMessages();
   const live = useAcpSessionConfig((state) =>
     sessionId ? state.sessions[sessionId] : undefined,
   );
@@ -190,46 +272,87 @@ export function AcpPermissionSelector({
 
   const presetConfig = activePreset?.acpAgent?.config ?? {};
   const presetModeId = activePreset?.acpAgent?.modeId ?? null;
-  const selectedValue = liveControl
+  const approvalMode =
+    live?.approvalMode ?? activePreset?.acpAgent?.approvalMode ?? "ask";
+  const adapterSelectedValue = liveControl
     ? liveControl.currentValue
-    : control.source.kind === "option"
+    : control.source.kind !== "session-mode"
       ? (presetConfig[control.source.optionId] ?? control.currentValue)
       : (presetModeId ?? control.currentValue);
+  const selectedValue =
+    approvalMode === "allow-all" && control.hasClientFullAccess
+      ? CLIENT_FULL_ACCESS_VALUE
+      : adapterSelectedValue;
   const selectedMode =
     control.values.find((mode) => mode.value === selectedValue) ??
     control.values[0];
   if (!selectedMode) return null;
-  const selected = permissionPresentation(selectedMode);
+  const selected = localizeDefinitions(permissionPresentation(selectedMode), uiMessages);
   const SelectedIcon = selected.icon;
 
   const apply = async (mode: AcpConfigValue) => {
     setPendingValue(mode.value);
-    const change: AcpConfigDefaultChange =
-      control.source.kind === "option"
-        ? { optionId: control.source.optionId, value: mode.value }
-        : { modeId: mode.value };
+    const isClientFullAccess = mode.value === CLIENT_FULL_ACCESS_VALUE;
+    const executionMode = isClientFullAccess
+      ? control.values.find((value) => value.value === "agent")
+      : null;
+    const adapterMode = executionMode ?? (isClientFullAccess ? null : mode);
+    const approvalChange = control.hasClientFullAccess
+      ? ({ approvalMode: isClientFullAccess ? "allow-all" : "ask" } as const)
+      : {};
+    const change: AcpConfigDefaultChange = adapterMode
+      ? control.source.kind !== "session-mode"
+        ? {
+            optionId: control.source.optionId,
+            value: adapterMode.value,
+            ...approvalChange,
+          }
+        : { modeId: adapterMode.value, ...approvalChange }
+      : { approvalMode: "allow-all" };
     onPersistDefault?.(change);
     try {
-      const result =
-        control.source.kind === "option"
-          ? await commands.piAcpSetConfigOption(
-              sessionId,
-              control.source.optionId,
-              mode.value,
-              null,
-            )
-          : await commands.piAcpSetMode(sessionId, mode.value);
-      if (
-        result.status === "error" &&
-        result.error &&
-        !isAgentNotRunning(result.error)
-      ) {
-        throw new Error(result.error);
+      const checkResult = (result: { status: string; error?: string }) => {
+        if (
+          result.status === "error" &&
+          result.error &&
+          !isAgentNotRunning(result.error)
+        ) {
+          throw new Error(result.error);
+        }
+      };
+      const setAdapterMode = async () => {
+        if (!adapterMode || adapterMode.value === control.currentValue) return;
+        const result =
+          control.source.kind !== "session-mode"
+            ? await commands.piAcpSetConfigOption(
+                sessionId,
+                control.source.optionId,
+                adapterMode.value,
+                control.source.kind === "boolean" ? true : null,
+              )
+            : await commands.piAcpSetMode(sessionId, adapterMode.value);
+        checkResult(result);
+      };
+      const setApprovalMode = async (value: "ask" | "allow-all") => {
+        const result = await commands.piAcpSetApprovalMode(sessionId, value);
+        checkResult(result);
+      };
+
+      if (isClientFullAccess) {
+        // Cursor's plan/ask modes disable tools entirely, so restore its
+        // advertised agent mode before enabling client-side auto-approval.
+        await setAdapterMode();
+        await setApprovalMode("allow-all");
+      } else {
+        if (control.hasClientFullAccess) await setApprovalMode("ask");
+        await setAdapterMode();
       }
       setOpen(false);
     } catch (error) {
-      toast.error(`could not change ${agentName.toLowerCase()} permissions`, {
+      toast({
+        title: ui("Could not change {value1} permissions", { value1: agentName.toLowerCase() }),
         description: String(error),
+        variant: "destructive",
       });
     } finally {
       setPendingValue(null);
@@ -244,7 +367,7 @@ export function AcpPermissionSelector({
           variant="ghost"
           size="sm"
           className={cn(
-            "h-7 max-w-[150px] shrink-0 gap-1.5 rounded-none px-2 text-xs",
+            "h-7 max-w-[150px] shrink-0 gap-1.5 rounded-md px-2 text-xs",
             selected.warning
               ? "text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
               : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
@@ -265,7 +388,7 @@ export function AcpPermissionSelector({
         align="start"
         side="top"
         sideOffset={6}
-        className="w-[360px] space-y-1 rounded-none p-2"
+        className="w-[360px] space-y-1 rounded-lg p-2"
         data-testid="acp-permission-popover"
         onOpenAutoFocus={(event) => {
           event.preventDefault();
@@ -273,10 +396,10 @@ export function AcpPermissionSelector({
         }}
       >
         <p className="px-2 pb-1 pt-0.5 text-xs text-muted-foreground">
-          how should {agentName.toLowerCase()} actions be approved?
+          How should {agentName.toLowerCase()} actions be approved?
         </p>
         {control.values.map((mode) => {
-          const presentation = permissionPresentation(mode);
+          const presentation = localizeDefinitions(permissionPresentation(mode), uiMessages);
           const ModeIcon = presentation.icon;
           const isSelected = mode.value === selectedValue;
           const isPending = mode.value === pendingValue;
@@ -323,12 +446,12 @@ export function AcpPermissionSelector({
               {isPending ? (
                 <Loader2
                   className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground"
-                  aria-label="changing permissions"
+                  aria-label={ui("Changing permissions")}
                 />
               ) : isSelected ? (
                 <Check
                   className="mt-0.5 h-4 w-4 shrink-0"
-                  aria-label="selected"
+                  aria-label={ui("Selected")}
                 />
               ) : null}
             </button>

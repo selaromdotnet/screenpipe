@@ -36,6 +36,8 @@ import { ListeningSticks } from "./listening-sticks";
 import { MEETING_SHELL_CLASS } from "./meeting-workspace";
 import { splitForHighlight } from "./transcript-highlight";
 import { recorderTranscriptionBacklogMessage } from "./transcript-recovery-copy";
+import { useGT } from "gt-react";
+
 
 interface TranscriptPanelProps {
   meeting: MeetingRecord;
@@ -85,10 +87,11 @@ function isNearBottom(el: HTMLDivElement): boolean {
   );
 }
 
-interface LiveTranscriptDelta {
+export interface LiveTranscriptDelta {
   meeting_id: number;
   provider: string;
   model?: string | null;
+  stream_id?: string;
   item_id: string;
   device_name: string;
   device_type: string;
@@ -97,13 +100,16 @@ interface LiveTranscriptDelta {
   captured_at: string;
 }
 
-interface LiveTranscriptFinal {
+export interface LiveTranscriptFinal {
   meeting_id: number;
   provider: string;
   model?: string | null;
   item_id: string;
   device_name: string;
   device_type: string;
+  stream_id?: string;
+  session_speaker_id?: string | null;
+  speaker_name?: string | null;
   transcript: string;
   captured_at: string;
 }
@@ -125,11 +131,13 @@ interface LiveStreamingError {
   occurred_at: string;
 }
 
-interface LiveTranscriptBlock {
+export interface LiveTranscriptBlock {
   key: string;
   itemId: string;
   deviceName: string;
   deviceType: string;
+  sessionSpeakerId?: string | null;
+  speakerName?: string | null;
   provider: string;
   model?: string | null;
   text: string;
@@ -142,6 +150,8 @@ export interface SpeakerBlock {
   key: string;
   speakerId: number | null;
   speakerName: string;
+  /** Provider labels are scoped to one audio stream, not global identities. */
+  speakerKey?: string;
   startMs: number;
   endMs: number;
   text: string;
@@ -152,10 +162,58 @@ export interface SpeakerBlock {
   // audio preview and call /speakers/reassign.
   firstAudioChunkId: number;
   firstAudioFilePath: string;
+  firstAudioStartTimeSecs?: number | null;
+  captureDirection?: string;
 }
 
 const REFRESH_LIVE_MS = 30_000;
 const MAX_LIMIT = 5000;
+const LIVE_TRANSCRIPT_CACHE_PREFIX = "screenpipe-meeting-live-finals:";
+const LIVE_AUTHORITY_WINDOW_MS = 15_000;
+
+function liveTranscriptCacheKey(meetingId: number): string {
+  return `${LIVE_TRANSCRIPT_CACHE_PREFIX}${meetingId}`;
+}
+
+function loadCachedLiveFinals(meetingId: number): LiveTranscriptBlock[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.sessionStorage.getItem(
+      liveTranscriptCacheKey(meetingId),
+    );
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (block): block is LiveTranscriptBlock =>
+            Boolean(block) &&
+            block.final === true &&
+            typeof block.key === "string" &&
+            typeof block.text === "string" &&
+            typeof block.capturedAt === "string",
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function cacheLiveFinals(
+  meetingId: number,
+  blocks: LiveTranscriptBlock[],
+): void {
+  if (typeof window === "undefined") return;
+  const finals = blocks.filter((block) => block.final);
+  if (finals.length === 0) return;
+  try {
+    window.sessionStorage.setItem(
+      liveTranscriptCacheKey(meetingId),
+      JSON.stringify(finals),
+    );
+  } catch {
+    // The DB remains the primary persistence path when web storage is blocked.
+  }
+}
 
 function liveKey(event: {
   item_id: string;
@@ -165,6 +223,85 @@ function liveKey(event: {
   return `${event.device_name}:${event.device_type}:${event.item_id}`;
 }
 
+function sameLiveStream(
+  block: LiveTranscriptBlock,
+  event: Pick<LiveTranscriptDelta, "provider" | "device_name" | "device_type">,
+): boolean {
+  return (
+    block.provider === event.provider &&
+    block.deviceName === event.device_name &&
+    block.deviceType === event.device_type
+  );
+}
+
+export function applyLiveDelta(
+  blocks: LiveTranscriptBlock[],
+  event: LiveTranscriptDelta,
+): LiveTranscriptBlock[] {
+  const delta = event.delta.trim();
+  if (!delta) return blocks;
+  const key = liveKey(event);
+  const existing = blocks.find((block) => block.key === key);
+  if (existing?.final) return blocks;
+  if (existing) {
+    return blocks.map((block) =>
+      block.key === key
+        ? {
+            ...block,
+            text: event.replace ? delta : `${block.text}${event.delta}`,
+            capturedAt: event.captured_at,
+          }
+        : block,
+    );
+  }
+
+  // Deepgram may revise the result start while an utterance is still open.
+  // One stream has one active partial: retire its stale key before appending
+  // the replacement so the realtime bubble cannot linger in the transcript.
+  return [
+    ...blocks.filter((block) => block.final || !sameLiveStream(block, event)),
+    {
+      key,
+      itemId: event.item_id,
+      deviceName: event.device_name,
+      deviceType: event.device_type,
+      provider: event.provider,
+      model: event.model,
+      text: delta,
+      capturedAt: event.captured_at,
+      final: false,
+    },
+  ];
+}
+
+export function applyLiveFinal(
+  blocks: LiveTranscriptBlock[],
+  event: LiveTranscriptFinal,
+): LiveTranscriptBlock[] {
+  const transcript = event.transcript.trim();
+  if (!transcript) return blocks;
+  const key = liveKey(event);
+  return [
+    ...blocks.filter(
+      (block) =>
+        block.key !== key && (block.final || !sameLiveStream(block, event)),
+    ),
+    {
+      key,
+      itemId: event.item_id,
+      deviceName: event.device_name,
+      deviceType: event.device_type,
+      sessionSpeakerId: event.session_speaker_id,
+      speakerName: event.speaker_name,
+      provider: event.provider,
+      model: event.model,
+      text: transcript,
+      capturedAt: event.captured_at,
+      final: true,
+    },
+  ];
+}
+
 function normalizeForDedupe(text: string) {
   return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
@@ -172,6 +309,75 @@ function normalizeForDedupe(text: string) {
 function timestampMs(iso: string): number {
   const ms = new Date(iso).getTime();
   return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * Keep provider-final live turns authoritative when the panel is reopened.
+ * Background STT remains available only for gaps outside the live coverage
+ * window; it must not replace a final with newly decoded words or speakers.
+ */
+export function filterBackgroundCoveredByLiveFinals(
+  chunks: MeetingAudioChunk[],
+  liveBlocks: LiveTranscriptBlock[],
+): MeetingAudioChunk[] {
+  const finals = liveBlocks
+    .filter((block) => block.final)
+    .map((block) => ({
+      timestamp: timestampMs(block.capturedAt),
+      deviceName: block.deviceName.trim().toLowerCase(),
+      deviceType: block.deviceType.trim().toLowerCase(),
+    }))
+    .filter((block) => block.timestamp > 0);
+  if (finals.length === 0) return chunks;
+
+  return chunks.filter((chunk) => {
+    if (chunk.source === "live") return true;
+    const timestamp = timestampMs(chunk.timestamp);
+    const deviceName = chunk.deviceName?.trim().toLowerCase() ?? "";
+    const deviceType = chunk.deviceType.trim().toLowerCase();
+    return !finals.some(
+      (final) =>
+        final.deviceType === deviceType &&
+        (!final.deviceName || !deviceName || final.deviceName === deviceName) &&
+        Math.abs(final.timestamp - timestamp) <= LIVE_AUTHORITY_WINDOW_MS,
+    );
+  });
+}
+
+/** Hide cached live copies already present in saved rows of the same device. */
+export function filterLiveAlreadySaved(
+  chunks: MeetingAudioChunk[],
+  liveBlocks: LiveTranscriptBlock[],
+): LiveTranscriptBlock[] {
+  const durableWindowMs = 15_000;
+  const durableBlocks = chunks
+    .map((chunk) => ({
+      timestamp: timestampMs(chunk.timestamp),
+      deviceName: chunk.deviceName?.trim().toLowerCase() ?? "",
+      deviceType: chunk.deviceType.trim().toLowerCase(),
+      text: normalizeForDedupe(chunk.transcription ?? ""),
+    }))
+    .filter((block) => block.timestamp > 0 && block.text.length > 0);
+
+  return liveBlocks.filter((block) => {
+    const normalized = normalizeForDedupe(block.text);
+    const timestamp = timestampMs(block.capturedAt);
+    const deviceName = block.deviceName.trim().toLowerCase();
+    const deviceType = block.deviceType.trim().toLowerCase();
+    const alreadyDurable = durableBlocks.some(
+      (durable) =>
+        durable.deviceType === deviceType &&
+        (!durable.deviceName ||
+          !deviceName ||
+          durable.deviceName === deviceName) &&
+        Math.abs(durable.timestamp - timestamp) <= durableWindowMs &&
+        (durable.text.includes(normalized) ||
+          normalized.includes(durable.text)),
+    );
+    if (normalized && alreadyDurable) return false;
+
+    return true;
+  });
 }
 
 function sortChunks(chunks: MeetingAudioChunk[]): MeetingAudioChunk[] {
@@ -194,6 +400,14 @@ function compareBlocks(a: SpeakerBlock, b: SpeakerBlock): number {
   return a.key.localeCompare(b.key);
 }
 
+function displaySpeakerName(block: SpeakerBlock): string {
+  if (!/^speaker(?:[ _]\d+)?$/i.test(block.speakerName.trim())) return block.speakerName;
+  // A provider's speaker numbers restart on each stream. Avoid presenting
+  // unrelated input/output labels as the same identified person.
+  const source = block.captureDirection === "input" ? "Microphone" : block.captureDirection === "output" ? "Meeting audio" : "Unidentified";
+  return `${source} · ${block.speakerName}`;
+}
+
 function groupBySpeaker(chunks: MeetingAudioChunk[]): SpeakerBlock[] {
   const out: SpeakerBlock[] = [];
   for (const c of sortChunks(chunks)) {
@@ -203,12 +417,17 @@ function groupBySpeaker(chunks: MeetingAudioChunk[]): SpeakerBlock[] {
     if (ts <= 0) continue;
     const speakerName = c.speakerName || (c.isInput ? "me" : "speaker");
     const speakerId = c.speakerId;
+    const speakerKey =
+      speakerId != null
+        ? `speaker:${speakerId}`
+        : c.sessionSpeakerId
+          ? `session:${c.sessionSpeakerId}`
+          : `stream:${c.deviceName || c.deviceType}:${speakerName}`;
     const last = out[out.length - 1];
-    const sameSpeaker =
-      last && last.speakerId === speakerId && last.speakerName === speakerName;
+    const sameSpeaker = last?.speakerKey === speakerKey;
     // Glue if same speaker AND within 30s of last segment — keeps long pauses
     // as paragraph breaks even when the same person is still talking.
-    if (sameSpeaker && ts - last.endMs < 30_000) {
+    if (sameSpeaker && c.audioFilePath === last.firstAudioFilePath && ts - last.endMs < 30_000) {
       last.text = `${last.text} ${text}`;
       last.endMs = ts;
       last.segmentCount += 1;
@@ -217,6 +436,7 @@ function groupBySpeaker(chunks: MeetingAudioChunk[]): SpeakerBlock[] {
         key: `${c.audioChunkId}-${ts}-${out.length}`,
         speakerId,
         speakerName,
+        speakerKey,
         startMs: ts,
         endMs: ts,
         text,
@@ -225,13 +445,15 @@ function groupBySpeaker(chunks: MeetingAudioChunk[]): SpeakerBlock[] {
         final: true,
         firstAudioChunkId: c.audioChunkId,
         firstAudioFilePath: c.audioFilePath,
+        firstAudioStartTimeSecs: c.audioStartTimeSecs,
+        captureDirection: c.deviceType.toLowerCase(),
       });
     }
   }
   return out;
 }
 
-function liveBlockToSpeakerBlock(
+export function liveBlockToSpeakerBlock(
   block: LiveTranscriptBlock,
   index: number,
 ): SpeakerBlock | null {
@@ -241,7 +463,17 @@ function liveBlockToSpeakerBlock(
   return {
     key: `live-${block.key}-${index}`,
     speakerId: null,
-    speakerName: block.deviceType.toLowerCase() === "input" ? "me" : "speaker",
+    speakerName:
+      block.speakerName?.trim() ||
+      (!block.final
+        ? "transcribing"
+        : block.deviceType.toLowerCase() === "input"
+          ? "me"
+          : "speaker"),
+    captureDirection: block.deviceType.toLowerCase(),
+    speakerKey: block.sessionSpeakerId
+      ? `session:${block.sessionSpeakerId}`
+      : `stream:${block.deviceName}:${block.deviceType}:${block.speakerName?.trim() || "unknown"}`,
     startMs,
     endMs: startMs,
     text,
@@ -274,21 +506,21 @@ function liveErrorSummary(message: string | null): string {
     lower.includes("nodename") ||
     lower.includes("dns")
   ) {
-    return "cloud connection failed";
+    return "Cloud connection failed";
   }
   if (lower.includes("screenpipe cloud login")) {
-    return "cloud login required";
+    return "Cloud login required";
   }
   if (lower.includes("daily") && lower.includes("limit")) {
-    return "daily limit reached";
+    return "Daily limit reached";
   }
   if (lower.includes("tls")) {
-    return "secure connection failed";
+    return "Secure connection failed";
   }
   if (lower.includes("websocket")) {
-    return "live stream unavailable";
+    return "Live stream unavailable";
   }
-  return "live transcription failed";
+  return "Live transcription failed";
 }
 
 export function TranscriptPanel({
@@ -301,6 +533,8 @@ export function TranscriptPanel({
   headerActions,
   captureState,
 }: TranscriptPanelProps) {
+
+  const ui = useGT();
   const { isMac } = usePlatform();
   const [chunks, setChunks] = useState<MeetingAudioChunk[]>([]);
   const [loading, setLoading] = useState(false);
@@ -308,7 +542,9 @@ export function TranscriptPanel({
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const [liveBlocks, setLiveBlocks] = useState<LiveTranscriptBlock[]>([]);
+  const [liveBlocks, setLiveBlocks] = useState<LiveTranscriptBlock[]>(() =>
+    loadCachedLiveFinals(meeting.id),
+  );
   const [liveStatus, setLiveStatus] = useState<LiveStreamingStatus | null>(
     null,
   );
@@ -434,7 +670,7 @@ export function TranscriptPanel({
   }, [meeting.id, range.start, range.end, refreshKey]);
 
   useEffect(() => {
-    setLiveBlocks([]);
+    setLiveBlocks(loadCachedLiveFinals(meeting.id));
     setLiveStatus(null);
     setLiveError(null);
   }, [meeting.id]);
@@ -451,34 +687,7 @@ export function TranscriptPanel({
         const delta = event.payload.delta ?? "";
         if (!delta.trim()) return;
         setLiveError(null);
-        const key = liveKey(event.payload);
-        setLiveBlocks((prev) => {
-          const existing = prev.find((b) => b.key === key);
-          if (existing) {
-            return prev.map((b) =>
-              b.key === key
-                ? {
-                    ...b,
-                    text: event.payload.replace ? delta : `${b.text}${delta}`,
-                  }
-                : b,
-            );
-          }
-          return [
-            ...prev,
-            {
-              key,
-              itemId: event.payload.item_id,
-              deviceName: event.payload.device_name,
-              deviceType: event.payload.device_type,
-              provider: event.payload.provider,
-              model: event.payload.model,
-              text: delta,
-              capturedAt: event.payload.captured_at,
-              final: false,
-            },
-          ];
-        });
+        setLiveBlocks((prev) => applyLiveDelta(prev, event.payload));
       },
     );
 
@@ -487,37 +696,12 @@ export function TranscriptPanel({
       (event) => {
         if (cancelled || Number(event.payload.meeting_id) !== meeting.id)
           return;
-        const transcript = (event.payload.transcript ?? "").trim();
-        if (!transcript) return;
+        if (!(event.payload.transcript ?? "").trim()) return;
         setLiveError(null);
-        const key = liveKey(event.payload);
         setLiveBlocks((prev) => {
-          const existing = prev.find((b) => b.key === key);
-          if (existing) {
-            return prev.map((b) =>
-              b.key === key
-                ? {
-                    ...b,
-                    text: transcript,
-                    final: true,
-                  }
-                : b,
-            );
-          }
-          return [
-            ...prev,
-            {
-              key,
-              itemId: event.payload.item_id,
-              deviceName: event.payload.device_name,
-              deviceType: event.payload.device_type,
-              provider: event.payload.provider,
-              model: event.payload.model,
-              text: transcript,
-              capturedAt: event.payload.captured_at,
-              final: true,
-            },
-          ];
+          const next = applyLiveFinal(prev, event.payload);
+          cacheLiveFinals(meeting.id, next);
+          return next;
         });
       },
     );
@@ -586,51 +770,18 @@ export function TranscriptPanel({
     };
   }, [isOpen, meeting.id, range.start, range.end, isLive, refreshKey]);
 
-  const blocks = useMemo(() => groupBySpeaker(chunks), [chunks]);
-  const visibleLiveBlocks = useMemo(() => {
-    const durableText = normalizeForDedupe(
-      chunks.map((c) => c.transcription ?? "").join(" "),
-    );
-    // Cross-device echo suppression. Without headphones the mic ("input"/"me")
-    // picks up the speaker output, so the remote's words arrive on BOTH the
-    // input stream and the clean system-audio ("output"/"speaker") stream.
-    // macOS VoiceProcessingIO AEC does not remove this (it has no downlink
-    // reference), and the engine's cross-device dedup only runs on the deferred
-    // durable path — so during a live meeting both copies reach the UI. The
-    // output capture is the clean source, so drop an input block when most of
-    // its words are covered by a nearby output block.
-    const ECHO_WINDOW_MS = 6000;
-    const outputBlocks = liveBlocks
-      .filter((b) => b.deviceType.toLowerCase() === "output")
-      .map((b) => ({
-        ts: timestampMs(b.capturedAt),
-        norm: normalizeForDedupe(b.text),
-      }));
-    const isInputEchoOfOutput = (
-      block: LiveTranscriptBlock,
-      normalized: string,
-    ) => {
-      if (block.deviceType.toLowerCase() !== "input") return false;
-      const ts = timestampMs(block.capturedAt);
-      const ref = new Set(
-        outputBlocks
-          .filter((o) => Math.abs(o.ts - ts) <= ECHO_WINDOW_MS)
-          .flatMap((o) => o.norm.split(" "))
-          .filter(Boolean),
-      );
-      if (ref.size === 0) return false;
-      const words = normalized.split(" ").filter(Boolean);
-      if (words.length === 0) return false;
-      const covered = words.filter((w) => ref.has(w)).length / words.length;
-      return covered >= 0.6;
-    };
-    return liveBlocks.filter((block) => {
-      const normalized = normalizeForDedupe(block.text);
-      if (normalized.length < 24) return true;
-      if (durableText.includes(normalized.slice(0, 80))) return false;
-      return !isInputEchoOfOutput(block, normalized);
-    });
-  }, [chunks, liveBlocks]);
+  const authoritativeChunks = useMemo(
+    () => filterBackgroundCoveredByLiveFinals(chunks, liveBlocks),
+    [chunks, liveBlocks],
+  );
+  const blocks = useMemo(
+    () => groupBySpeaker(authoritativeChunks),
+    [authoritativeChunks],
+  );
+  const visibleLiveBlocks = useMemo(
+    () => filterLiveAlreadySaved(authoritativeChunks, liveBlocks),
+    [authoritativeChunks, liveBlocks],
+  );
   const visibleLiveSpeakerBlocks = useMemo(
     () =>
       visibleLiveBlocks
@@ -639,7 +790,10 @@ export function TranscriptPanel({
     [visibleLiveBlocks],
   );
   const displayBlocks = useMemo(
-    () => [...blocks, ...visibleLiveSpeakerBlocks].sort(compareBlocks),
+    () =>
+      coalesceFinalSpeakerRuns(
+        [...blocks, ...visibleLiveSpeakerBlocks].sort(compareBlocks),
+      ),
     [blocks, visibleLiveSpeakerBlocks],
   );
   const latestBlockSignal = useMemo(() => {
@@ -774,14 +928,14 @@ export function TranscriptPanel({
       return `${liveErrorSummary(liveError)}. Background recording is still running.`;
     }
     if (chunks.length === 0 && visibleLiveBlocks.length === 0) {
-      if (!isLive) return "no transcript was captured for this meeting";
+      if (!isLive) return "No transcript was captured for this meeting";
       return (
         captureState?.transcriptEmptyCopy ??
         "no transcript yet — audio can take a minute to appear; keep the meeting open"
       );
     }
     if (filteredBlocks.length === 0 && query.trim()) {
-      return `no matches for "${query.trim()}"`;
+      return `No matches for "${query.trim()}"`;
     }
     return null;
   }, [
@@ -821,7 +975,7 @@ export function TranscriptPanel({
         : captureState?.shortLabel || "listening";
   const transcriptStateDetail =
     displayBlocks.length > 0
-      ? `${displayBlocks.length} turn${displayBlocks.length === 1 ? "" : "s"}`
+      ? ui("{value1, plural, one {# turn} other {# turns}}", { value1: displayBlocks.length })
       : null;
   // As a tab surface the transcript sits under the meeting title, chips and
   // tabs, so it must ride the same centered shell — otherwise every turn hugs
@@ -875,9 +1029,9 @@ export function TranscriptPanel({
           <div
             role="separator"
             aria-orientation="horizontal"
-            aria-label="resize transcript panel"
+            aria-label={ui("Resize transcript panel")}
             tabIndex={0}
-            title="drag to resize · double-click to reset"
+            title={ui("Drag to resize · double-click to reset")}
             onPointerDown={handleResizeStart}
             onDoubleClick={handleResizeReset}
             onKeyDown={handleResizeKeyDown}
@@ -903,15 +1057,15 @@ export function TranscriptPanel({
                     setSearchOpen(false);
                   }
                 }}
-                placeholder="search transcript..."
+                placeholder={ui("Search transcript...")}
                 className="min-w-0 flex-1 bg-transparent text-xs px-2 h-7 border border-input focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
               />
             ) : (
               <div className="flex min-w-0 flex-1 items-center gap-2">
                 <span
-                  className="inline-flex min-w-0 items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em] text-foreground"
+                  className="inline-flex min-w-0 items-center gap-2 font-mono text-[10px] normal-case tracking-[0.12em] text-foreground"
                   role="status"
-                  aria-label={`transcript status: ${transcriptState}`}
+                  aria-label={ui("Transcript status: {value1}", { value1: transcriptState })}
                   data-testid="transcript-stream-status"
                 >
                   <span
@@ -940,7 +1094,7 @@ export function TranscriptPanel({
             {query.trim() && (
               <span
                 className="shrink-0 text-[10px] tabular-nums text-muted-foreground"
-                title="matching segments"
+                title={ui("Matching segments")}
               >
                 {filteredBlocks.length}/{displayBlocks.length}
               </span>
@@ -962,9 +1116,13 @@ export function TranscriptPanel({
                     "h-7 w-7 p-0",
                     searchOpen && "bg-accent text-accent-foreground",
                   )}
-                  title={searchOpen ? "hide search" : `search transcript (${isMac ? "⌘F" : "Ctrl+F"})`}
+                  title={
+                    searchOpen
+                      ? ui("Hide search")
+                      : ui("Search transcript ({value1})", { value1: isMac ? "⌘F" : "Ctrl+F" })
+                  }
                   aria-label={
-                    searchOpen ? "hide transcript search" : "search transcript"
+                    searchOpen ? ui("Hide transcript search") : ui("Search transcript")
                   }
                   aria-pressed={searchOpen}
                 >
@@ -980,8 +1138,8 @@ export function TranscriptPanel({
                   size="sm"
                   onClick={onClose}
                   className="h-7 w-7 p-0"
-                  title="close transcript"
-                  aria-label="close transcript"
+                  title={ui("Close transcript")}
+                  aria-label={ui("Close transcript")}
                 >
                   <X className="h-3.5 w-3.5" />
                 </Button>
@@ -1012,7 +1170,7 @@ export function TranscriptPanel({
             {loading && !loaded && (
               <div className="flex items-center justify-center py-8 text-xs text-muted-foreground">
                 <Loader2 className="h-3.5 w-3.5 animate-spin mr-2" />
-                loading transcript…
+                Loading transcript…
               </div>
             )}
 
@@ -1064,8 +1222,8 @@ export function TranscriptPanel({
               size="sm"
               onClick={() => scrollToLatest()}
               className="absolute bottom-3 right-3 h-8 w-8 rounded-full border border-border bg-background/95 p-0 shadow-lg backdrop-blur hover:bg-accent"
-              title="follow live transcript"
-              aria-label="follow live transcript"
+              title={ui("Follow live transcript")}
+              aria-label={ui("Follow live transcript")}
             >
               <ArrowDown className="h-3.5 w-3.5" />
               {hasUnseenLive && (
@@ -1094,10 +1252,12 @@ export const TranscriptRows = React.memo(function TranscriptRows({
   /** Horizontal shell so the turns line up with whatever renders above them. */
   className?: string;
 }) {
+
+  const ui = useGT();
   return (
     <ol
       className={cn("space-y-0.5 pb-10 pt-3", className ?? "px-4")}
-      aria-label="meeting transcript"
+      aria-label={ui("Meeting transcript")}
     >
       {blocks.map((block, index) => (
         <SpeakerParagraph
@@ -1126,14 +1286,26 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
   query: string;
   onSpeakerAssigned: () => void;
 }) {
+
+  const ui = useGT();
   const [showPlayer, setShowPlayer] = useState(false);
   const isSelf = block.speakerName.trim().toLowerCase() === "me";
   return (
     <li
-      className={cn("group", continuation ? "pt-0.5" : "pt-3")}
+      className={cn(
+        "group",
+        continuation ? "pt-0.5" : "pt-3",
+        // A chat citation lands here. A brief outline, not a persistent
+        // selection: the point is to show where an answer came from.
+        "transition-shadow data-[cited=true]:shadow-[inset_2px_0_0_0_hsl(var(--foreground))]",
+      )}
       style={{ contain: "layout paint" }}
       data-testid="transcript-row"
       data-final={block.final ? "true" : "false"}
+      // Landing target for a chat citation: the rail resolves a clock time to
+      // an absolute ms and scrolls the nearest turn into view.
+      data-start-ms={block.startMs}
+      data-end-ms={block.endMs}
     >
       {!continuation && (
         <div className="mb-1.5 flex items-baseline gap-2 px-1">
@@ -1156,13 +1328,13 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
                 )}
                 title={
                   block.speakerId != null
-                    ? `speaker #${block.speakerId} — click to rename or reassign`
-                    : "click to assign a speaker"
+                    ? ui("Speaker #{value1} — click to rename or reassign", { value1: block.speakerId })
+                    : ui("Click to assign a speaker")
                 }
               >
                 <User className="h-3 w-3 text-muted-foreground/70 self-center" />
                 <span data-testid="transcript-speaker">
-                  {block.speakerName}
+                  {displaySpeakerName(block)}
                 </span>
               </span>
             </SpeakerAssignPopover>
@@ -1174,7 +1346,7 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
               )}
             >
               <User className="h-3 w-3 text-muted-foreground/70 self-center" />
-              <span data-testid="transcript-speaker">{block.speakerName}</span>
+              <span data-testid="transcript-speaker">{displaySpeakerName(block)}</span>
             </span>
           )}
           <span
@@ -1187,7 +1359,7 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
       )}
       <div
         className={cn(
-          "relative w-fit max-w-full rounded-2xl px-3 py-2 shadow-[0_1px_0_rgb(0_0_0/0.03)] transition-colors",
+          "relative w-fit max-w-full rounded-lg px-3 py-2 shadow-[0_1px_0_rgb(0_0_0/0.03)] transition-colors",
           isSelf
             ? "bg-foreground/[0.07] dark:bg-foreground/[0.10]"
             : "bg-muted/80",
@@ -1210,8 +1382,8 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
         {!block.final && (
           <span
             className="absolute -right-1 -top-1 flex h-3 w-3 items-center justify-center rounded-full bg-background shadow-sm ring-1 ring-border"
-            title="transcribing partial text"
-            aria-label="transcribing partial text"
+            title={ui("Transcribing partial text")}
+            aria-label={ui("Transcribing partial text")}
           >
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-foreground motion-reduce:animate-none" />
           </span>
@@ -1227,8 +1399,8 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
                 ? "opacity-100"
                 : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
             )}
-            title={showPlayer ? "hide audio" : "play this segment's audio"}
-            aria-label={showPlayer ? "hide audio" : "play this segment's audio"}
+            title={showPlayer ? ui("Hide audio") : ui("Play this segment's audio")}
+            aria-label={showPlayer ? ui("Hide audio") : ui("Play this segment's audio")}
             aria-expanded={showPlayer}
           >
             {showPlayer ? (
@@ -1241,7 +1413,9 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
       </div>
       {showPlayer && block.firstAudioFilePath && (
         <div className="mt-2 max-w-xl">
-          <MediaComponent filePath={block.firstAudioFilePath} />
+          <MediaComponent filePath={block.firstAudioFilePath}
+            startTimeSecs={block.firstAudioStartTimeSecs ?? undefined}
+            customDescription={ui("Meeting audio") + " · " + formatClock(block.startMs)} />
         </div>
       )}
     </li>
@@ -1250,14 +1424,40 @@ export const SpeakerParagraph = React.memo(function SpeakerParagraph({
 
 const SPEAKER_RUN_MAX_GAP_MS = 30_000;
 
+export function coalesceFinalSpeakerRuns(
+  blocks: SpeakerBlock[],
+): SpeakerBlock[] {
+  const merged: SpeakerBlock[] = [];
+  for (const block of blocks) {
+    const previous = merged[merged.length - 1];
+    if (
+      previous?.final &&
+      block.final &&
+      previous.firstAudioFilePath === block.firstAudioFilePath &&
+      isSpeakerContinuation(previous, block)
+    ) {
+      previous.text = `${previous.text} ${block.text}`;
+      previous.endMs = Math.max(previous.endMs, block.endMs);
+      previous.segmentCount += block.segmentCount;
+      continue;
+    }
+    merged.push({ ...block });
+  }
+  return merged;
+}
+
 export function isSpeakerContinuation(
   previous: SpeakerBlock | undefined,
   current: SpeakerBlock | undefined,
 ): boolean {
   if (!previous || !current) return false;
+  const sameSpeaker =
+    previous.speakerKey && current.speakerKey
+      ? previous.speakerKey === current.speakerKey
+      : previous.speakerId === current.speakerId &&
+        previous.speakerName === current.speakerName;
   return (
-    previous.speakerId === current.speakerId &&
-    previous.speakerName === current.speakerName &&
+    sameSpeaker &&
     current.startMs >= previous.endMs &&
     current.startMs - previous.endMs <= SPEAKER_RUN_MAX_GAP_MS
   );
@@ -1265,6 +1465,7 @@ export function isSpeakerContinuation(
 
 /** Body text with case-insensitive `<mark>` runs over search matches. */
 function HighlightedText({ text, query }: { text: string; query: string }) {
+
   const runs = useMemo(() => splitForHighlight(text, query), [text, query]);
   if (runs.length === 1 && !runs[0].match) return <>{runs[0].text}</>;
   return (

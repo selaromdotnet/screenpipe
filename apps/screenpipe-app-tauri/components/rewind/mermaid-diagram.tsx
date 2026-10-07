@@ -1,6 +1,11 @@
+// screenpipe — AI that knows everything you've seen, said, or heard
+// https://screenpipe.com
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import { useGT } from "gt-react";
+import { renderMermaidSvg } from "@/components/rewind/mermaid-sandbox";
+
 
 // Screenpipe brand theme — outlined minimalist (DESIGN.md):
 // white fills, black 1px borders, black text in light mode (inverted in dark).
@@ -123,8 +128,9 @@ interface MermaidDiagramProps {
 }
 
 export function MermaidDiagram({ chart, className }: MermaidDiagramProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [svg, setSvg] = useState<string>("");
+
+  const ui = useGT();
+  const [image, setImage] = useState<{ src: string; text: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isDark, setIsDark] = useState<boolean>(() =>
     typeof document !== "undefined" &&
@@ -144,52 +150,58 @@ export function MermaidDiagram({ chart, className }: MermaidDiagramProps) {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     const renderDiagram = async () => {
-      if (!containerRef.current || !chart.trim()) return;
+      if (!chart.trim()) return;
 
       try {
-        const { default: mermaid } = await import("mermaid");
-
         const theme = isDark ? SCREENPIPE_THEME_DARK : SCREENPIPE_THEME;
-
-        mermaid.initialize({
-          startOnLoad: false,
-          securityLevel: "strict",
-          suppressErrorRendering: true,
-          ...theme,
-        });
-
-        const id = `mermaid-${Math.random().toString(36).substr(2, 9)}`;
-        const { svg: renderedSvg } = await mermaid.render(id, chart.trim());
-        const styled = renderedSvg.replace(
+        // Rendered in a no-network sandbox; see mermaid-sandbox.ts.
+        const rendered = await renderMermaidSvg(chart.trim(), theme);
+        const styled = rendered.svg.replace(
           /<svg([^>]*)>/,
           `<svg$1><style>${themeStyle(isDark)}</style>`,
         );
-        setSvg(styled);
+        if (cancelled) return;
+        setImage({
+          src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(styled)}`,
+          text: rendered.text,
+        });
         setError(null);
       } catch (err) {
+        if (cancelled) return;
         console.error("Mermaid render error:", err);
-        setError(err instanceof Error ? err.message : "Failed to render diagram");
+        setError(err instanceof Error ? err.message : ui("Failed to render diagram"));
       }
     };
 
     renderDiagram();
+    return () => {
+      cancelled = true;
+    };
   }, [chart, isDark]);
 
   if (error) {
     return (
       <div className="border border-destructive/50 bg-destructive/10 p-4 my-2 font-mono text-sm">
-        <p className="text-destructive mb-2">diagram error:</p>
+        <p className="text-destructive mb-2">Diagram error:</p>
         <pre className="text-xs overflow-auto">{chart}</pre>
       </div>
     );
   }
 
+  // An SVG shown as an image never loads anything or runs scripts, so the
+  // diagram stays inert outside the sandbox too.
   return (
-    <div
-      ref={containerRef}
-      className={`my-4 overflow-x-auto ${className || ""}`}
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div className={`not-prose my-4 overflow-x-auto ${className || ""}`}>
+      {image && (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={image.src}
+          alt={image.text ? ui("Diagram: {value1}", { value1: image.text }) : ui("Diagram")}
+          className="h-auto max-w-full"
+        />
+      )}
+    </div>
   );
 }

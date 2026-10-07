@@ -7,12 +7,65 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
   extractMeetingSummary,
+  meetingSummarySaveIsVisible,
   MEETING_QUIET_CONTROL_CLASS,
   MEETING_READING_COLUMN_CLASS,
   MEETING_SHELL_CLASS,
   MeetingSummarySurface,
   MeetingWorkspaceTabs,
+  preferredMeetingWorkspaceTab,
+  stopMeetingAndOpenSummary,
 } from "./meeting-workspace";
+
+it("does not treat a saved refusal as a usable summary", () => {
+  const note = "## Summary\nI couldn't produce a reliable summary for this meeting. The recorded evidence appears mismatched.";
+  expect(extractMeetingSummary(note)).toBeNull();
+  expect(meetingSummarySaveIsVisible("", note, true)).toBe(false);
+  expect(preferredMeetingWorkspaceTab(note)).toBe("notes");
+});
+
+describe("preferred meeting workspace tab", () => {
+  it("opens a completed meeting on its saved outcome", () => {
+    expect(
+      preferredMeetingWorkspaceTab(
+        "## Notes\nPrivate context.\n\n## Summary\nDecision and next step.",
+      ),
+    ).toBe("summary");
+  });
+
+  it("keeps notes primary until a real summary exists", () => {
+    expect(preferredMeetingWorkspaceTab(null)).toBe("notes");
+    expect(preferredMeetingWorkspaceTab("## Summary\n\n")).toBe("notes");
+    expect(preferredMeetingWorkspaceTab("working note")).toBe("notes");
+  });
+});
+
+describe("meeting stop destination", () => {
+  it("opens summary only after the meeting stops successfully", async () => {
+    const onStop = vi.fn(async () => undefined);
+    const onValueChange = vi.fn();
+
+    await stopMeetingAndOpenSummary(onStop, onValueChange);
+
+    expect(onStop).toHaveBeenCalledOnce();
+    expect(onValueChange).toHaveBeenCalledWith("summary");
+    expect(onStop.mock.invocationCallOrder[0]).toBeLessThan(
+      onValueChange.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("keeps the current tab when stopping fails", async () => {
+    const onStop = vi.fn(async () => {
+      throw new Error("stop failed");
+    });
+    const onValueChange = vi.fn();
+
+    await expect(
+      stopMeetingAndOpenSummary(onStop, onValueChange),
+    ).rejects.toThrow("stop failed");
+    expect(onValueChange).not.toHaveBeenCalled();
+  });
+});
 
 describe("meeting shell width contract", () => {
   // The header (title, chips, tabs) used to sit in max-w-5xl while the note
@@ -52,7 +105,7 @@ describe("secondary control treatment", () => {
   });
 
   it("keeps the app's square geometry", () => {
-    expect(MEETING_QUIET_CONTROL_CLASS).toMatch(/\brounded-none\b/);
+    expect(MEETING_QUIET_CONTROL_CLASS).toMatch(/\brounded-md\b/);
   });
 });
 
@@ -67,15 +120,15 @@ describe("meeting workspace tabs", () => {
       />,
     );
 
-    const notes = screen.getByRole("tab", { name: "notes" });
-    const transcript = screen.getByRole("tab", { name: "transcript" });
+    const notes = screen.getByRole("tab", { name: "Notes" });
+    const transcript = screen.getByRole("tab", { name: "Transcript" });
     expect(notes).toHaveAttribute("aria-selected", "true");
     expect(transcript).toHaveAttribute("aria-selected", "false");
 
     fireEvent.keyDown(notes, { key: "ArrowRight" });
     expect(onValueChange).toHaveBeenCalledWith("transcript");
     expect(transcript).toHaveFocus();
-    expect(screen.getByLabelText("summary working")).toBeVisible();
+    expect(screen.getByLabelText("Summary working")).toBeVisible();
   });
 
   // The note-wide copy action shares the tab rule so it is visible from every
@@ -103,11 +156,11 @@ describe("meeting workspace tabs", () => {
     expect(copy.closest('[role="tablist"]')).toBeNull();
 
     // End must land on the last real tab, not the trailing action.
-    fireEvent.keyDown(screen.getByRole("tab", { name: "notes" }), {
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Notes" }), {
       key: "End",
     });
     expect(onValueChange).toHaveBeenCalledWith("summary");
-    expect(screen.getByRole("tab", { name: "summary" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Summary" })).toHaveFocus();
   });
 
   // A dot on a tab is a request for attention. Work in flight and failures
@@ -121,7 +174,7 @@ describe("meeting workspace tabs", () => {
         summaryState="working"
       />,
     );
-    expect(screen.getByLabelText("summary working")).toBeVisible();
+    expect(screen.getByLabelText("Summary working")).toBeVisible();
 
     rerender(
       <MeetingWorkspaceTabs
@@ -130,7 +183,7 @@ describe("meeting workspace tabs", () => {
         summaryState="attention"
       />,
     );
-    expect(screen.getByLabelText("summary attention")).toBeVisible();
+    expect(screen.getByLabelText("Summary attention")).toBeVisible();
 
     rerender(
       <MeetingWorkspaceTabs
@@ -163,6 +216,33 @@ describe("meeting workspace tabs", () => {
 });
 
 describe("meeting summary surface", () => {
+  it("waits for the completed run's summary to be visible in the saved note", () => {
+    expect(meetingSummarySaveIsVisible("notes only", "notes only", true)).toBe(
+      false,
+    );
+    expect(
+      meetingSummarySaveIsVisible(
+        "## Summary\nEarlier summary.",
+        "## Summary\nEarlier summary.",
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      meetingSummarySaveIsVisible(
+        "## Summary\nEarlier summary.",
+        "## Summary\nUpdated summary.",
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      meetingSummarySaveIsVisible(
+        "## Summary\nAlready saved.",
+        "## Summary\nAlready saved.",
+        false,
+      ),
+    ).toBe(true);
+  });
+
   it("uses the latest appended summary without including the user's notes", () => {
     const onGenerate = vi.fn();
     const note = [
@@ -199,16 +279,20 @@ describe("meeting summary surface", () => {
     expect(screen.getByTestId("meeting-summary-reading-column")).toHaveClass(
       "select-text",
     );
-    // The shell, not the reading column, bounds the selectable width now.
-    // Selection must still have a width-limited container to paint inside so
-    // it never renders as a full-window horizontal band.
+    const summaryProse = screen
+      .getByTestId("meeting-summary-reading-column")
+      .querySelector(".prose");
+    expect(summaryProse).toHaveClass("flex", "flex-col", "items-start");
+    // The shell bounds the overall reading width while the flex prose root
+    // shrink-wraps each text block. Both are required to keep selection paint
+    // from becoming a full-window horizontal band.
     expect(
       screen
         .getByTestId("meeting-summary-reading-column")
         .closest(".max-w-3xl"),
     ).not.toBeNull();
     expect(screen.queryByText(/private draft/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "summarize again" }));
+    fireEvent.click(screen.getByRole("button", { name: "Summarize again" }));
     expect(onGenerate).toHaveBeenCalledOnce();
   });
 
@@ -268,8 +352,8 @@ describe("meeting summary surface", () => {
       />,
     );
 
-    expect(screen.getByText("no summary yet")).toBeVisible();
-    expect(screen.getByRole("button", { name: "generate" })).toBeDisabled();
+    expect(screen.getByText("No summary yet")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
   });
 
   it("keeps an existing summary visible while a refresh is running", () => {
@@ -284,7 +368,7 @@ describe("meeting summary surface", () => {
     );
 
     expect(screen.getByText("Existing decision.")).toBeVisible();
-    expect(screen.getByRole("status")).toHaveTextContent("writing summary");
+    expect(screen.getByRole("status")).toHaveTextContent("Writing summary");
     expect(screen.getByRole("status")).toHaveTextContent(
       "writing an updated summary",
     );
@@ -301,7 +385,7 @@ describe("meeting summary surface", () => {
       />,
     );
 
-    expect(screen.getByRole("status")).toHaveTextContent("writing summary");
+    expect(screen.getByRole("status")).toHaveTextContent("Writing summary");
     expect(screen.getByText("Draft will appear here")).toBeVisible();
     expect(
       screen.getByTestId("meeting-summary-writing-placeholder"),
@@ -310,7 +394,7 @@ describe("meeting summary surface", () => {
   });
 
   it("replaces the placeholder with the real summary as it streams", () => {
-    render(
+    const { rerender } = render(
       <MeetingSummarySurface
         note={"## Summary\nEarlier summary."}
         state="working"
@@ -329,7 +413,127 @@ describe("meeting summary surface", () => {
       ),
     ).toBeVisible();
     expect(screen.queryByText("Earlier summary.")).not.toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("writing summary");
+    expect(screen.getByRole("status")).toHaveTextContent("Writing summary");
     expect(screen.getByTestId("meeting-summary-stream-cursor")).toBeVisible();
+
+    rerender(
+      <MeetingSummarySurface
+        note={"## Summary\nEarlier summary."}
+        state="ready"
+        detail="saved to this meeting note"
+        streamedSummary="The team **approved** the launch."
+        onGenerate={vi.fn()}
+        canGenerate
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        (_, element) =>
+          element?.textContent === "The team approved the launch.",
+        { selector: "p" },
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText("Earlier summary.")).not.toBeInTheDocument();
+    expect(screen.queryByText("No summary yet")).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("meeting-summary-stream-cursor"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("turns a terminal usage limit into explicit upgrade and model recovery", async () => {
+    const onGenerate = vi.fn();
+    const onUpgrade = vi.fn();
+    const onSelectModel = vi.fn();
+    const onManage = vi.fn();
+    render(
+      <MeetingSummarySurface
+        note="notes only"
+        state="attention"
+        detail="Summary needs attention"
+        onGenerate={onGenerate}
+        canGenerate
+        recovery={{
+          title: "AI usage limit reached",
+          detail:
+            "The configured summary model has no usage left. Choose another model or upgrade.",
+          retryable: false,
+          upgrade: {
+            label: "upgrade to business",
+            onSelect: onUpgrade,
+          },
+          model: {
+            selectedId: "cloud",
+            selectedLabel: "screenpipe cloud · frontier",
+            saving: false,
+            options: [
+              {
+                id: "local",
+                label: "local",
+                detail: "ollama · llama 3.2",
+                onSelect: onSelectModel,
+              },
+            ],
+            onManage,
+          },
+        }}
+      />,
+    );
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("AI usage limit reached");
+    expect(alert).toHaveTextContent("configured summary model");
+    expect(
+      screen.getByText("Generation stopped before a summary was written."),
+    ).toBeVisible();
+    expect(screen.getAllByText(/configured summary model/i)).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByText("No summary yet")).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "upgrade to business" }),
+    );
+    expect(onUpgrade).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: /change summary model/i }),
+      { key: "Enter" },
+    );
+    const localModel = (await screen.findByText("local")).closest(
+      '[role="menuitem"]',
+    );
+    expect(localModel).not.toBeNull();
+    fireEvent.click(localModel!);
+    expect(onSelectModel).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: /change summary model/i }),
+      { key: "Enter" },
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Manage models & keys" }),
+    );
+    expect(onManage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps retry available for a temporary rate limit", () => {
+    const onGenerate = vi.fn();
+    render(
+      <MeetingSummarySurface
+        note="notes only"
+        state="attention"
+        detail="Summary needs attention"
+        onGenerate={onGenerate}
+        canGenerate
+        recovery={{
+          title: "AI is temporarily rate-limited",
+          detail: "Retry in a moment.",
+          retryable: true,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onGenerate).toHaveBeenCalledOnce();
   });
 });

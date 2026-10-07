@@ -58,14 +58,15 @@ bun run test:e2e:first-run-ai-summary:macos
 
 Same local Worker lane, pointed at the post-setup learning window. It proves the
 real app reaches the model through the real Pi command and the real Worker, that
-the forwarded provider request carries the screen and audio excerpts (not just
-app names), and that the model's text — never the deterministic fallback — is
-what lands in the seeded chat.
+the forwarded provider request carries useful work evidence (not just app
+names), and that the model's text — never the deterministic fallback — is what
+lands in the seeded chat. Its matrix covers low-tier parsed-only evidence,
+accessibility fallback when parsed context is unavailable, and transient engine
+failures.
 
-`/activity-summary` is stubbed in the webview: resolving needs >= 10 captured
-frames, which a CI machine with no desktop cannot produce and which is not what
-this spec is testing. The real engine's answers are covered against a live
-engine in `first-run-learning-window.spec.ts`.
+`/activity-summary` is stubbed in the webview because a CI machine has no
+meaningful desktop activity. The real engine's answers and empty reasons are
+covered against a live engine in `first-run-learning-window.spec.ts`.
 
 **Run the macOS HD recording pipeline spec**
 
@@ -236,7 +237,7 @@ bun run coverage:all:check
 ```
 
 This refreshes/checks `e2e/COVERAGE.md`, `../../docs/coverage/CORE.md`, and the
-top-level `../../COVERAGE.md` summary. Core line/branch coverage is tracked
+`../../docs/COVERAGE.md` summary. Core line/branch coverage is tracked
 separately via `cargo llvm-cov`; see `../../docs/coverage/README.md`.
 
 ### Troubleshooting on Windows

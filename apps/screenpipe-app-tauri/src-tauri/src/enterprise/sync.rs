@@ -4,9 +4,10 @@
 
 //! Enterprise telemetry sync.
 //!
-//! Periodically pulls new screen + audio + UI activity from the local screenpipe
-//! API and POSTs it as JSONL to the screenpipe enterprise ingest endpoint,
-//! authenticated with an org license key. Server-side it lands in R2 under
+//! Periodically pulls new screen, interpreted Activities, audio, and UI data
+//! from the local screenpipe API and POSTs it as JSONL to the screenpipe
+//! enterprise ingest endpoint, authenticated with an org license key.
+//! Server-side it lands in R2 under
 //! `enterprise-telemetry/{license_id}/{device_id}/{ts}.jsonl` and feeds the
 //! org's admin chat dashboard.
 //!
@@ -29,7 +30,7 @@
 //!   (15min) so first batch isn't empty
 //! - **Body too large** — paginate via `limit` + advance cursor incrementally
 //! - **Clock skew** — cursor is the *server's* timestamp from frames table, not
-//!   wall-clock; idempotency is by `(device_id, frame_id)` server-side
+//!   wall-clock; explicit backfills use deterministic batch storage keys
 //! - **Graceful shutdown** — task respects cancellation token, drains in flight
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,9 @@ use tracing::{debug, error, info, warn};
 
 #[path = "upload.rs"]
 mod enterprise_upload;
+
+#[path = "backfill.rs"]
+mod backfill;
 use enterprise_upload::{
     upload_direct_readable_batch, upload_direct_write_only_batch, DirectUploadRecordCounts,
     EnterpriseUploadMode,
@@ -99,6 +103,9 @@ pub struct EnterpriseSyncConfig {
     pub license_key: String,
     /// Stable identifier for this physical device (e.g. machine UUID).
     pub device_id: String,
+    /// Present only on a prepared new-install upload. device_id is then the
+    /// database UUID; this value is registration metadata, never a record key.
+    pub stable_device_id: Option<String>,
     /// Hostname / friendly device name (for the admin to recognize).
     pub device_label: String,
     /// Ingest endpoint URL. Defaults to `DEFAULT_INGEST_URL`.
@@ -178,6 +185,7 @@ impl EnterpriseSyncConfig {
         Some(Self {
             license_key,
             device_id,
+            stable_device_id: None,
             device_label,
             ingest_url,
             cursor_path,
@@ -211,6 +219,8 @@ impl EnterpriseSyncConfig {
 /// language portability if we ever read it from JS.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Cursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_id: Option<String>,
     /// ISO-8601 UTC. Latest `frames.timestamp` we have successfully ingested.
     pub last_frame_ts: Option<String>,
     /// ISO-8601 UTC. Latest `audio_transcriptions.timestamp` we've ingested.
@@ -243,11 +253,17 @@ pub struct Cursor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CursorBoundary {
+    /// Recovery-only counter, checkpointed atomically with the acknowledged cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backfill_records: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backfill_images: Option<backfill::ImageProgress>,
     frames: u32,
     audio: u32,
     ui: u32,
     memories: u32,
     parsed: u32,
+    activity_ts: Option<String>,
     /// Feedback supports a true `(updated_at, id)` keyset cursor because its
     /// IDs are stable strings and its local route merges DB and legacy rows.
     feedback_id: Option<String>,
@@ -299,7 +315,41 @@ impl Cursor {
 /// inject a mock without spinning up the real server. Implemented in the
 /// desktop crate against `LocalApiContext`.
 #[async_trait::async_trait]
+pub trait ExportAdmission: Send + Sync {
+    async fn admit(&self) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, EnterpriseSyncError>;
+}
+
+#[async_trait::async_trait]
 pub trait LocalApiClient: Send + Sync {
+    async fn begin_export(&self) -> Result<Option<Box<dyn ExportAdmission>>, EnterpriseSyncError> {
+        Ok(None)
+    }
+
+    async fn initialized_upload_source_id(&self) -> Option<String> {
+        None
+    }
+    /// Desktop-only boundary; headless clients retain their configured identity.
+    async fn device_identity_migration(
+        &self,
+        _legacy_id: &str,
+        _journal: &std::path::Path,
+    ) -> Result<Option<(String, String)>, EnterpriseSyncError> {
+        Ok(None)
+    }
+    async fn commit_device_identity(
+        &self,
+        _legacy_id: &str,
+        _stable_id: &str,
+    ) -> Result<(), EnterpriseSyncError> {
+        Err(EnterpriseSyncError::Configuration(
+            "device settings unavailable".into(),
+        ))
+    }
+    async fn upload_source_id(&self) -> Result<String, EnterpriseSyncError> {
+        Err(EnterpriseSyncError::Configuration(
+            "database source identity unavailable".into(),
+        ))
+    }
     /// Fetch frames + their text at or after `since_ts`, ordered by timestamp
     /// ascending, skipping `boundary_offset` rows at the boundary timestamp.
     async fn fetch_frames_since(
@@ -380,6 +430,14 @@ pub trait LocalApiClient: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Fetch AI-interpreted Activities ending after `since_ts`.
+    async fn fetch_activities_since(
+        &self,
+        _since_ts: Option<&str>,
+    ) -> Result<Vec<ActivityRow>, EnterpriseSyncError> {
+        Ok(Vec::new())
+    }
+
     /// Fetch one frame's full-resolution JPEG by id — the same image the
     /// local `/frames/{id}` route serves, which means capture-time PII
     /// redaction has already been applied when the org policy enables it.
@@ -394,6 +452,89 @@ pub trait LocalApiClient: Send + Sync {
     }
 }
 
+/// Read the exact local image, preserving the local failure classification.
+/// An unclassified 404 is not a durable missing-image acknowledgement: it may
+/// be a routing/read failure and must leave the backfill cursor retryable.
+/// Only bounded diagnostic codes are logged, never the response's paths/text.
+pub async fn fetch_exact_frame_jpeg(
+    http: &reqwest::Client,
+    api_url_base: &str,
+    api_key: Option<&str>,
+    frame_id: i64,
+) -> Result<Option<Vec<u8>>, EnterpriseSyncError> {
+    let mut request = http.get(format!("{api_url_base}/frames/{frame_id}?fallback=false"));
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .bytes()
+            .await
+            .map(|bytes| Some(bytes.to_vec()))
+            .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()));
+    }
+    // The caller's HTTP timeout covers the body as well as response headers.
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?
+    {
+        if body.len() + chunk.len() > 16 * 1024 {
+            body.clear();
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let detail: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let reason = match detail["error_type"].as_str() {
+        Some("snapshot_missing") => "snapshot_missing",
+        Some("frame_media_unavailable") => "frame_media_unavailable",
+        Some("snapshot_read_failed") => "snapshot_read_failed",
+        Some("remote_device") => "remote_device",
+        Some("video_corrupted") => "video_corrupted",
+        Some("ffprobe_not_found") => "ffprobe_not_found",
+        _ => "unclassified_response",
+    };
+    let io_kind = match detail["io_error_kind"].as_str() {
+        Some("PermissionDenied") => "PermissionDenied",
+        Some("NotFound") => "NotFound",
+        Some("WouldBlock") => "WouldBlock",
+        Some("Interrupted") => "Interrupted",
+        Some("TimedOut") => "TimedOut",
+        _ => "unknown",
+    };
+    let terminal = status == reqwest::StatusCode::NOT_FOUND
+        && detail["frame_id"].as_i64() == Some(frame_id)
+        && matches!(reason, "snapshot_missing" | "frame_media_unavailable");
+    let outcome = if terminal {
+        "unavailable"
+    } else {
+        "retry_pending"
+    };
+    warn!(
+        frame_id,
+        status = status.as_u16(),
+        reason,
+        io_kind,
+        outcome,
+        "enterprise exact screenshot read failed"
+    );
+    if terminal {
+        Ok(None)
+    } else {
+        Err(EnterpriseSyncError::LocalApi(format!(
+            "exact screenshot frame={frame_id} status={} reason={reason} io={io_kind}; retry pending",
+            status.as_u16()
+        )))
+    }
+}
+
 // ─── Wire types — what we POST upstream ─────────────────────────────────────
 //
 // The record schema (`TelemetryRecord` + the `*Row` flattenings) is the
@@ -401,13 +542,16 @@ pub trait LocalApiClient: Send + Sync {
 // same types — so it lives in `screenpipe-telemetry-wire`. Re-exported here
 // so the desktop shim keeps importing everything from `ee_sync::`.
 pub use screenpipe_telemetry_wire::{
-    AudioRow, FeedbackRow, FrameRow, MemoryRow, ParsedRow, SnapshotRow, TelemetryRecord, UiEventRow,
+    ActivityRow, AudioRow, FeedbackRow, FrameRow, MemoryRow, ParsedRow, SnapshotRow,
+    TelemetryRecord, UiEventRow,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnterpriseSyncError {
+    #[error("historical screenshots: {0}")]
+    BackfillImages(&'static str),
     #[error("local api request failed: {0}")]
     LocalApi(String),
     #[error("ingest request failed: {0}")]
@@ -502,10 +646,28 @@ pub async fn post_jsonl(
     license_key: &str,
     body: Vec<u8>,
 ) -> Result<(), EnterpriseSyncError> {
-    let resp = client
+    post_jsonl_with_identity(client, url, license_key, body, None, false).await
+}
+
+async fn post_jsonl_with_identity(
+    client: &reqwest::Client,
+    url: &str,
+    license_key: &str,
+    body: Vec<u8>,
+    stable_device_id: Option<&str>,
+    backfill: bool,
+) -> Result<(), EnterpriseSyncError> {
+    let mut request = client
         .post(url)
         .header("X-License-Key", license_key)
-        .header("Content-Type", "application/x-ndjson")
+        .header("Content-Type", "application/x-ndjson");
+    if backfill {
+        request = request.header("X-Screenpipe-Backfill", "1");
+    }
+    if let Some(device) = stable_device_id {
+        request = request.header("X-Screenpipe-Stable-Device-Id", device);
+    }
+    let resp = request
         .body(body)
         .send()
         .await
@@ -540,6 +702,149 @@ pub async fn post_jsonl(
 
 // ─── Sync state machine ─────────────────────────────────────────────────────
 
+/// Adopt only registry metadata. Persist the existing cursor's namespace before
+/// switching settings, so a crash at either boundary can be retried safely.
+async fn migrate_device_identity(
+    cfg: &mut EnterpriseSyncConfig,
+    cursor: &mut Cursor,
+    local: &dyn LocalApiClient,
+    http: &reqwest::Client,
+) -> Result<(), EnterpriseSyncError> {
+    if screenpipe_telemetry_wire::identity::is_stable_device_id(&cfg.device_id) {
+        return Ok(());
+    }
+    let journal = cfg.cursor_path.with_extension("device-migration.json");
+    let Some((stable_id, source_id)) = local
+        .device_identity_migration(&cfg.device_id, &journal)
+        .await?
+    else {
+        return Ok(());
+    };
+    let base = control_plane_base(&cfg.ingest_url)
+        .ok_or_else(|| EnterpriseSyncError::Configuration("invalid control plane URL".into()))?;
+    let response = http.post(format!("{base}/api/enterprise/device-identity-migration"))
+        .header("X-License-Key", &cfg.license_key)
+        .json(&serde_json::json!({"source_id": source_id, "device_id": stable_id, "migrate_from": cfg.device_id}))
+        .send().await.map_err(|e| EnterpriseSyncError::Ingest(e.to_string()))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(EnterpriseSyncError::IngestAuthRejected);
+    }
+    if !response.status().is_success() {
+        return Err(EnterpriseSyncError::Configuration(
+            "device identity migration pending; recordings remain local".into(),
+        ));
+    }
+    let confirmed: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| EnterpriseSyncError::Ingest(e.to_string()))?;
+    // Version 1 servers ignore unknown fields. Never treat that as a migration.
+    if confirmed["version"] != 2
+        || confirmed["migrate_from"] != cfg.device_id
+        || confirmed["source_id"] != source_id
+        || confirmed["device_id"] != stable_id
+    {
+        return Err(EnterpriseSyncError::Configuration(
+            "control plane did not confirm device migration".into(),
+        ));
+    }
+    if local.upload_source_id().await? != source_id {
+        return Err(EnterpriseSyncError::Configuration(
+            "database changed during device migration".into(),
+        ));
+    }
+    let mut next = cursor.clone();
+    if next.source_id.as_deref() != Some(&source_id) {
+        if next.source_id.is_some() || source_id != cfg.device_id {
+            next = Cursor::default();
+        }
+        next.source_id = Some(source_id);
+    }
+    next.save(&cfg.cursor_path)
+        .map_err(|e| EnterpriseSyncError::Configuration(e.to_string()))?;
+    *cursor = next;
+    local
+        .commit_device_identity(&cfg.device_id, &stable_id)
+        .await?;
+    cfg.device_id = stable_id;
+    Ok(())
+}
+
+async fn try_device_identity_migration(
+    cfg: &mut EnterpriseSyncConfig,
+    cursor: &mut Cursor,
+    local: &dyn LocalApiClient,
+    http: &reqwest::Client,
+) -> Result<(), EnterpriseSyncError> {
+    match migrate_device_identity(cfg, cursor, local, http).await {
+        Err(error)
+            if !matches!(error, EnterpriseSyncError::IngestAuthRejected)
+                && local.initialized_upload_source_id().await.as_deref()
+                    == Some(&cfg.device_id)
+                && cursor
+                    .source_id
+                    .as_deref()
+                    .is_none_or(|source| source == cfg.device_id) =>
+        {
+            // A conflict or unavailable control plane must not stop a safe
+            // existing uploader. After a DB reset, this proof fails and the
+            // new data stays local until its fresh namespace is registered.
+            warn!("enterprise device migration deferred: {error}");
+            cursor.source_id = Some(cfg.device_id.clone());
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// New devices register their database source before sending any recordings.
+/// Old installs do not enter this path or create source-identity metadata.
+async fn prepare_upload_identity(
+    cfg: &EnterpriseSyncConfig,
+    local: &dyn LocalApiClient,
+    http: &reqwest::Client,
+) -> Result<EnterpriseSyncConfig, EnterpriseSyncError> {
+    if cfg.stable_device_id.is_some()
+        || !screenpipe_telemetry_wire::identity::is_stable_device_id(&cfg.device_id)
+    {
+        return Ok(cfg.clone());
+    }
+    let source_id = local.upload_source_id().await?;
+    let base = control_plane_base(&cfg.ingest_url)
+        .ok_or_else(|| EnterpriseSyncError::Configuration("invalid control plane URL".into()))?;
+    let response = http
+        .post(format!("{base}/api/enterprise/device-sources"))
+        .header("X-License-Key", &cfg.license_key)
+        .json(&serde_json::json!({"source_id": source_id, "device_id": cfg.device_id}))
+        .send()
+        .await
+        .map_err(|e| EnterpriseSyncError::Ingest(e.to_string()))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(EnterpriseSyncError::IngestAuthRejected);
+    }
+    if !response.status().is_success() {
+        return Err(EnterpriseSyncError::Configuration(
+            "device source registration unavailable; recordings remain local".into(),
+        ));
+    }
+    let registered: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| EnterpriseSyncError::Ingest(e.to_string()))?;
+    if registered["version"] != 1
+        || registered["source_id"] != source_id
+        || registered["device_id"] != cfg.device_id
+    {
+        return Err(EnterpriseSyncError::Configuration(
+            "device source registration did not confirm this database".into(),
+        ));
+    }
+    let mut prepared = cfg.clone();
+    prepared.stable_device_id = Some(cfg.device_id.clone());
+    prepared.device_id = source_id;
+    Ok(prepared)
+}
+
 /// One pass: pull new frames + audio from local API since `cursor`, POST
 /// upstream, advance cursor on success. Pure-ish (depends on injected client +
 /// HTTP client) — easy to test.
@@ -549,7 +854,7 @@ pub async fn run_one_sync(
     local: &dyn LocalApiClient,
     http: &reqwest::Client,
 ) -> Result<SyncTickReport, EnterpriseSyncError> {
-    run_one_sync_inner(cfg, cursor, local, http, true).await
+    run_one_sync_inner(cfg, cursor, local, http, true, None).await
 }
 
 async fn run_one_sync_inner(
@@ -558,9 +863,59 @@ async fn run_one_sync_inner(
     local: &dyn LocalApiClient,
     http: &reqwest::Client,
     include_snapshot: bool,
+    backfill: Option<&backfill::BackfillRequest>,
 ) -> Result<SyncTickReport, EnterpriseSyncError> {
     if let EnterpriseUploadMode::Blocked(reason) = &cfg.upload_mode {
         return Err(EnterpriseSyncError::Configuration(reason.clone()));
+    }
+
+    let prepared = prepare_upload_identity(cfg, local, http).await?;
+    if backfill.is_some_and(|request| request.images_only)
+        && !matches!(
+            prepared.upload_mode,
+            EnterpriseUploadMode::HostedIngest | EnterpriseUploadMode::DirectReadable(_)
+        )
+    {
+        return Err(EnterpriseSyncError::BackfillImages(
+            "screenshot_storage_mode_blocked",
+        ));
+    }
+    if backfill
+        .and_then(|request| request.source_id.as_deref())
+        .is_some_and(|source| source != prepared.device_id)
+    {
+        return Err(EnterpriseSyncError::BackfillImages(
+            "screenshot_source_changed",
+        ));
+    }
+    let export = local.begin_export().await?;
+    let cfg = &prepared;
+    if cfg.stable_device_id.is_none()
+        && cursor.source_id.is_some()
+        && local.upload_source_id().await? != cfg.device_id
+    {
+        return Err(EnterpriseSyncError::Configuration(
+            "database changed during deferred identity migration".into(),
+        ));
+    }
+    if cfg.stable_device_id.is_some() && cursor.source_id.as_deref() != Some(cfg.device_id.as_str())
+    {
+        if backfill.is_some() {
+            if cursor.source_id.is_some() {
+                return Err(EnterpriseSyncError::Configuration(
+                    "backfill database changed; request a new recovery".into(),
+                ));
+            }
+            // Pin this recovery to its database without resetting the admin's
+            // historical start to the normal first-run safety window.
+            cursor.source_id = Some(cfg.device_id.clone());
+            cursor.save(&cfg.cursor_path)?;
+        } else {
+            *cursor = Cursor {
+                source_id: Some(cfg.device_id.clone()),
+                ..Cursor::default()
+            };
+        }
     }
 
     // First-run safeguard: if cursor is empty, backfill SAFE_BACKFILL only —
@@ -596,6 +951,10 @@ async fn run_one_sync_inner(
         cursor.last_parsed_ts = Some(cutoff.to_rfc3339());
         cursor.boundary.parsed = 0;
     }
+    if cursor.boundary.activity_ts.is_none() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(SAFE_BACKFILL).unwrap();
+        cursor.boundary.activity_ts = Some(cutoff.to_rfc3339());
+    }
 
     // Per-stream sync policy is fetched fresh on every tick — the admin can
     // flip toggles in the dashboard and the device picks them up on the next
@@ -603,9 +962,12 @@ async fn run_one_sync_inner(
     // API for its rows; the cursor for that kind stays put, so re-enabling
     // resumes from where the toggle-off happened (capped by SAFE_BACKFILL
     // anyway).
-    let streams = crate::enterprise_policy::current_sync_streams();
+    let mut streams = crate::enterprise_policy::current_sync_streams();
+    if let Some(request) = backfill {
+        streams = request.restrict_streams(streams)?;
+    }
 
-    let frames = if streams.frames {
+    let mut frames = if streams.frames {
         local
             .fetch_frames_since(
                 cursor.last_frame_ts.as_deref(),
@@ -616,7 +978,7 @@ async fn run_one_sync_inner(
     } else {
         Vec::new()
     };
-    let audio = if streams.audio {
+    let mut audio = if streams.audio {
         local
             .fetch_audio_since(
                 cursor.last_audio_ts.as_deref(),
@@ -630,13 +992,16 @@ async fn run_one_sync_inner(
     // UI events are best-effort — a backend that doesn't expose them yet
     // (or blocks the search query) shouldn't kill the whole sync batch.
     // The frame + audio paths are the load-bearing ones.
-    let ui = if streams.ui_events {
+    let mut ui = if streams.ui_events {
         match local
             .fetch_ui_events_since(cursor.last_ui_ts.as_deref(), cursor.boundary.ui, PAGE_LIMIT)
             .await
         {
             Ok(rows) => rows,
             Err(e) => {
+                if backfill.is_some() {
+                    return Err(e);
+                }
                 warn!("enterprise sync: ui fetch failed (skipping): {}", e);
                 Vec::new()
             }
@@ -661,7 +1026,7 @@ async fn run_one_sync_inner(
     // Memories are best-effort too — a client that predates the trait
     // method, or a server without the /memories route, must not kill
     // the frame+audio path. The default trait impl returns empty.
-    let memories = if streams.memories {
+    let mut memories = if streams.memories {
         match local
             .fetch_memories_since(
                 cursor.last_memory_ts.as_deref(),
@@ -672,6 +1037,9 @@ async fn run_one_sync_inner(
         {
             Ok(rows) => rows,
             Err(e) => {
+                if backfill.is_some() {
+                    return Err(e);
+                }
                 warn!("enterprise sync: memory fetch failed (skipping): {}", e);
                 Vec::new()
             }
@@ -690,6 +1058,9 @@ async fn run_one_sync_inner(
         {
             Ok(rows) => rows,
             Err(error) => {
+                if backfill.is_some() {
+                    return Err(error);
+                }
                 warn!(
                     "enterprise sync: feedback fetch failed (skipping): {}",
                     error
@@ -710,7 +1081,7 @@ async fn run_one_sync_inner(
     // Parsed app data is a separate privacy-sensitive stream. It is best
     // effort because parser support is optional and older local servers do
     // not expose content_type=parsed.
-    let parsed = if streams.parsed {
+    let mut parsed = if streams.parsed {
         match local
             .fetch_parsed_since(
                 cursor.last_parsed_ts.as_deref(),
@@ -721,6 +1092,9 @@ async fn run_one_sync_inner(
         {
             Ok(rows) => rows,
             Err(e) => {
+                if backfill.is_some() {
+                    return Err(e);
+                }
                 warn!("enterprise sync: parsed fetch failed (skipping): {}", e);
                 Vec::new()
             }
@@ -728,6 +1102,32 @@ async fn run_one_sync_inner(
     } else {
         Vec::new()
     };
+    let activities = if streams.activities {
+        match local
+            .fetch_activities_since(cursor.boundary.activity_ts.as_deref())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(
+                    "enterprise sync: activity fetch failed (skipping): {}",
+                    error
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if let Some(request) = backfill {
+        request.retain_in_range(&mut frames, |r| &r.timestamp)?;
+        request.retain_in_range(&mut audio, |r| &r.timestamp)?;
+        request.retain_in_range(&mut ui, |r| &r.timestamp)?;
+        request.retain_in_range(&mut memories, |r| &r.created_at)?;
+        request.retain_in_range(&mut parsed, |r| &r.timestamp)?;
+        request.retain_in_range(&mut feedback, |r| &r.updated_at)?;
+    }
 
     if frames.is_empty()
         && audio.is_empty()
@@ -735,17 +1135,27 @@ async fn run_one_sync_inner(
         && snapshots.is_empty()
         && memories.is_empty()
         && parsed.is_empty()
+        && activities.is_empty()
         && feedback.is_empty()
     {
         debug!("enterprise sync: nothing new since last tick");
         return Ok(SyncTickReport::default());
     }
 
-    let mut body = build_jsonl_with_parsed(
+    // A server restart/database replacement during the reads must not label a
+    // mixed batch with the old source's identity or advance its cursor.
+    if cursor.source_id.is_some() && local.upload_source_id().await? != cfg.device_id {
+        return Err(EnterpriseSyncError::Configuration(
+            "database changed during sync; retrying".into(),
+        ));
+    }
+
+    let mut body = screenpipe_telemetry_wire::build_jsonl_with_semantic_streams(
         &cfg.device_id,
         &cfg.device_label,
         &frames,
         &parsed,
+        &activities,
         &audio,
         &ui,
         &snapshots,
@@ -758,6 +1168,21 @@ async fn run_one_sync_inner(
     ));
     let bytes = body.len();
 
+    // The history cursor is the retry checkpoint for images as well as text.
+    // Store this page's images first: the existing server sees them as already
+    // resolved, so it need not accumulate another historical request backlog.
+    let images = if backfill.is_some()
+        && streams.frame_images == crate::enterprise_policy::FrameImagesMode::All
+        && matches!(
+            cfg.upload_mode,
+            EnterpriseUploadMode::HostedIngest | EnterpriseUploadMode::DirectReadable(_)
+        )
+        && !frames.is_empty()
+    {
+        Some(backfill::upload_page_images(cfg, local, http, &frames).await?)
+    } else {
+        None
+    };
     let mut next_cursor = cursor.clone();
     advance_timestamp_boundary(
         &mut next_cursor.last_frame_ts,
@@ -765,6 +1190,9 @@ async fn run_one_sync_inner(
         &frames,
         |row| &row.timestamp,
     );
+    if let Some(latest) = activities.last() {
+        next_cursor.boundary.activity_ts = Some(latest.end_at.clone());
+    }
     advance_timestamp_boundary(
         &mut next_cursor.last_audio_ts,
         &mut next_cursor.boundary.audio,
@@ -794,54 +1222,93 @@ async fn run_one_sync_inner(
         |row| &row.timestamp,
     );
 
-    match &cfg.upload_mode {
-        EnterpriseUploadMode::HostedIngest => {
-            for request_body in split_jsonl_requests(body, HOSTED_INGEST_REQUEST_BYTES) {
-                post_jsonl(http, &cfg.ingest_url, &cfg.license_key, request_body).await?;
+    if !backfill.is_some_and(|request| request.images_only) {
+        match &cfg.upload_mode {
+            EnterpriseUploadMode::HostedIngest => {
+                for request_body in split_jsonl_requests(body, HOSTED_INGEST_REQUEST_BYTES) {
+                    let admission = match &export {
+                        Some(token) => token.admit().await?,
+                        None => None,
+                    };
+                    let upload = post_jsonl_with_identity(
+                        http,
+                        &cfg.ingest_url,
+                        &cfg.license_key,
+                        request_body,
+                        cfg.stable_device_id.as_deref(),
+                        backfill.is_some(),
+                    );
+                    drop(admission);
+                    upload.await?;
+                }
+            }
+            EnterpriseUploadMode::DirectWriteOnly(direct) => {
+                let counts = DirectUploadRecordCounts {
+                    frames: frames.len(),
+                    parsed: parsed.len(),
+                    activities: activities.len(),
+                    audio: audio.len(),
+                    ui: ui.len(),
+                    snapshots: snapshots.len(),
+                    memories: memories.len(),
+                    feedback: feedback.len(),
+                };
+                let admission = match &export {
+                    Some(token) => token.admit().await?,
+                    None => None,
+                };
+                let upload = upload_direct_write_only_batch(
+                    http,
+                    cfg,
+                    direct,
+                    body,
+                    counts,
+                    enterprise_upload::direct_upload_cursors(&next_cursor),
+                );
+                drop(admission);
+                upload.await?;
+            }
+            EnterpriseUploadMode::DirectReadable(direct) => {
+                let counts = DirectUploadRecordCounts {
+                    frames: frames.len(),
+                    parsed: parsed.len(),
+                    activities: activities.len(),
+                    audio: audio.len(),
+                    ui: ui.len(),
+                    snapshots: snapshots.len(),
+                    memories: memories.len(),
+                    feedback: feedback.len(),
+                };
+                let admission = match &export {
+                    Some(token) => token.admit().await?,
+                    None => None,
+                };
+                let upload = upload_direct_readable_batch(
+                    http,
+                    cfg,
+                    direct,
+                    body,
+                    counts,
+                    enterprise_upload::direct_upload_cursors(&next_cursor),
+                    backfill.is_some(),
+                );
+                drop(admission);
+                upload.await?;
+            }
+            EnterpriseUploadMode::Blocked(reason) => {
+                return Err(EnterpriseSyncError::Configuration(reason.clone()));
             }
         }
-        EnterpriseUploadMode::DirectWriteOnly(direct) => {
-            let counts = DirectUploadRecordCounts {
-                frames: frames.len(),
-                parsed: parsed.len(),
-                audio: audio.len(),
-                ui: ui.len(),
-                snapshots: snapshots.len(),
-                memories: memories.len(),
-                feedback: feedback.len(),
-            };
-            upload_direct_write_only_batch(
-                http,
-                cfg,
-                direct,
-                body,
-                counts,
-                enterprise_upload::direct_upload_cursors(&next_cursor),
-            )
-            .await?;
-        }
-        EnterpriseUploadMode::DirectReadable(direct) => {
-            let counts = DirectUploadRecordCounts {
-                frames: frames.len(),
-                parsed: parsed.len(),
-                audio: audio.len(),
-                ui: ui.len(),
-                snapshots: snapshots.len(),
-                memories: memories.len(),
-                feedback: feedback.len(),
-            };
-            upload_direct_readable_batch(
-                http,
-                cfg,
-                direct,
-                body,
-                counts,
-                enterprise_upload::direct_upload_cursors(&next_cursor),
-            )
-            .await?;
-        }
-        EnterpriseUploadMode::Blocked(reason) => {
-            return Err(EnterpriseSyncError::Configuration(reason.clone()));
+    }
+    if backfill.is_some() {
+        let records =
+            frames.len() + audio.len() + ui.len() + parsed.len() + memories.len() + feedback.len();
+        next_cursor.boundary.backfill_records =
+            Some(cursor.boundary.backfill_records.unwrap_or(0) + records as u64);
+        if let Some(images) = images {
+            let total = next_cursor.boundary.backfill_images.get_or_insert_default();
+            total.uploaded += images.uploaded;
+            total.unavailable += images.unavailable;
         }
     }
 
@@ -852,6 +1319,7 @@ async fn run_one_sync_inner(
     Ok(SyncTickReport {
         frames: frames.len(),
         parsed: parsed.len(),
+        activities: activities.len(),
         audio: audio.len(),
         ui: ui.len(),
         snapshots: snapshots.len(),
@@ -889,6 +1357,7 @@ fn advance_timestamp_boundary<T>(
 pub struct SyncTickReport {
     pub frames: usize,
     pub parsed: usize,
+    pub activities: usize,
     pub audio: usize,
     pub ui: usize,
     pub snapshots: usize,
@@ -946,7 +1415,10 @@ pub async fn run_sync_burst(
     let mut include_snapshot = true;
 
     loop {
-        let page = run_one_sync_inner(cfg, cursor, local, http, include_snapshot).await?;
+        if crate::search_only::is_active() {
+            break;
+        }
+        let page = run_one_sync_inner(cfg, cursor, local, http, include_snapshot, None).await?;
         include_snapshot = false;
         let more_pending = page.may_have_more();
         burst.total.add_assign(&page);
@@ -1156,10 +1628,21 @@ pub async fn fulfill_frame_requests(
     if mode == crate::enterprise_policy::FrameImagesMode::Off {
         return report;
     }
-    if !matches!(cfg.upload_mode, EnterpriseUploadMode::HostedIngest) {
-        debug!("frame fulfillment skipped: direct-upload org stays zero-knowledge");
+    if !matches!(
+        cfg.upload_mode,
+        EnterpriseUploadMode::HostedIngest | EnterpriseUploadMode::DirectReadable(_)
+    ) {
+        debug!("frame fulfillment skipped: storage mode does not permit hosted processing");
         return report;
     }
+    let prepared = match prepare_upload_identity(cfg, local, http).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            warn!("frame source registration unavailable: {error}");
+            return report;
+        }
+    };
+    let cfg = &prepared;
     let Some(base) = control_plane_base(&cfg.ingest_url) else {
         warn!(
             "frame fulfillment: cannot derive control plane base from ingest url {}",
@@ -1168,6 +1651,13 @@ pub async fn fulfill_frame_requests(
         return report;
     };
 
+    let guard_source = cfg.stable_device_id.is_some()
+        || uuid::Uuid::parse_str(&cfg.device_id).is_ok_and(|id| id.get_version_num() == 4);
+    if guard_source
+        && local.upload_source_id().await.ok().as_deref() != Some(cfg.device_id.as_str())
+    {
+        return report;
+    }
     let requests_url = format!("{base}/api/enterprise/frame-requests");
     let resp = match http
         .get(&requests_url)
@@ -1235,6 +1725,13 @@ pub async fn fulfill_frame_requests(
         entries.push(entry);
     }
 
+    if guard_source
+        && local.upload_source_id().await.ok().as_deref() != Some(cfg.device_id.as_str())
+    {
+        warn!("frame fulfillment: database changed while fetching images; retry next tick");
+        return report;
+    }
+
     let requested = entries.len();
     let uploads_url = format!("{base}/api/enterprise/frame-uploads");
     let mut uploaded = 0usize;
@@ -1259,7 +1756,7 @@ pub async fn fulfill_frame_requests(
         };
         if !resp.status().is_success() {
             warn!(
-                "frame fulfillment: POST {} -> {}",
+                "frame fulfillment: POST {} -> {}; screenshots remain pending; retry next sync",
                 uploads_url,
                 resp.status()
             );
@@ -1438,10 +1935,18 @@ async fn acknowledge_log_request(
 /// a session even if the ack POST is lost); `None` when there was nothing new.
 /// Best-effort; never panics.
 async fn fulfill_log_requests(
-    cfg: &EnterpriseSyncConfig,
+    cfg: &mut EnterpriseSyncConfig,
     http: &reqwest::Client,
     already_handled: Option<&str>,
 ) -> Option<String> {
+    // This worker owns a separate config from the recording sync loop. Resolve
+    // its policy before polling: the startup clone is Blocked, and later policy
+    // changes must also reach this worker while recording is unavailable.
+    if let Err(error) = cfg.resolve_upload_mode().await {
+        debug!("log-requests: policy resolution failed: {error}");
+        return None;
+    }
+
     // Only strict write-only storage disables remote support logs.
     // Existing readable customer-storage orgs deliberately grant Screenpipe
     // read access so cloud pipes and support workflows continue to work.
@@ -1506,14 +2011,15 @@ async fn fulfill_log_requests(
 }
 
 async fn run_log_request_loop(
-    cfg: EnterpriseSyncConfig,
+    mut cfg: EnterpriseSyncConfig,
     http: reqwest::Client,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut last_log_req: Option<String> = None;
 
     loop {
-        if let Some(handled) = fulfill_log_requests(&cfg, &http, last_log_req.as_deref()).await {
+        if let Some(handled) = fulfill_log_requests(&mut cfg, &http, last_log_req.as_deref()).await
+        {
             last_log_req = Some(handled);
         }
 
@@ -1638,12 +2144,18 @@ async fn run_sync_burst_with_recovery<R: LicenseKeyRecovery + ?Sized>(
         Err(error) => return Err(error),
     }
 
-    match run_sync_burst(cfg, cursor, local, http).await {
+    let result = async {
+        try_device_identity_migration(cfg, cursor, local, http).await?;
+        run_sync_burst(cfg, cursor, local, http).await
+    }
+    .await;
+    match result {
         Err(EnterpriseSyncError::IngestAuthRejected) if !recovered => {
             if !recover_rotated_license_key(cfg, recovery).await {
                 return Err(EnterpriseSyncError::IngestAuthRejected);
             }
             cfg.resolve_upload_mode().await?;
+            try_device_identity_migration(cfg, cursor, local, http).await?;
             run_sync_burst(cfg, cursor, local, http).await
         }
         result => result,
@@ -1688,15 +2200,24 @@ pub async fn run(
     ));
 
     loop {
+        // The independent native policy watcher and support-log poller remain
+        // available while optional data uploads are suspended.
+        if crate::search_only::is_active() {
+            if sleep_or_shutdown(SYNC_INTERVAL, &mut shutdown).await {
+                break;
+            }
+            continue;
+        }
         // Re-resolve before touching local telemetry. Auth rejection recovers
         // and reruns resolution before any local read; other failures preserve
         // the last safe mode.
         let license_key_before_tick = cfg.license_key.clone();
+        let device_id_before_tick = cfg.device_id.clone();
         let result =
             run_sync_burst_with_recovery(&mut cfg, &mut cursor, local.as_ref(), &http, &recovery)
                 .await;
 
-        if cfg.license_key != license_key_before_tick {
+        if cfg.license_key != license_key_before_tick || cfg.device_id != device_id_before_tick {
             // The log poller owns a cloned config, so restart it with the
             // recovered key. Fulfillment state lives server-side.
             log_request_loop.abort();
@@ -1756,6 +2277,14 @@ pub async fn run(
                     );
                 }
                 backoff = BACKOFF_INITIAL;
+
+                // Historical recovery has its own cursor and a bounded work budget.
+                // Live syncing always runs first. Failure here never rewinds it.
+                if let Err(error) =
+                    backfill::fulfill_requests(&cfg, local.as_ref(), &http, &shutdown).await
+                {
+                    warn!("enterprise backfill: will retry: {}", error);
+                }
 
                 // On-demand frame fulfillment — best-effort, gated on the
                 // frame_images stream + hosted mode inside; never affects
@@ -1820,7 +2349,7 @@ pub(crate) async fn sleep_or_shutdown(
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use base64::Engine;
     use enterprise_upload::DirectUploadConfig;
@@ -1830,7 +2359,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn enterprise_log_identifier_is_regex_safe() {
@@ -1921,21 +2450,55 @@ mod tests {
 
     #[tokio::test]
     async fn strict_customer_storage_never_collects_remote_diagnostic_logs() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _mode_env = UploadModeEnvGuard::clear();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/enterprise/storage-binding/mode",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "desired_mode": "direct_upload_write_only" }),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/enterprise/log-requests"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
         let dir = TempDir::new().unwrap();
-        let cfg = direct_test_cfg(
-            &dir,
-            "http://should-not-be-called/ticket".to_string(),
-            "http://should-not-be-called/complete".to_string(),
-        );
+        // A previously readable worker must stop polling when policy changes.
+        let mut cfg = test_cfg(&dir, format!("{}/api/enterprise/ingest", server.uri()));
 
-        let handled = fulfill_log_requests(&cfg, &reqwest::Client::new(), None).await;
+        let handled = fulfill_log_requests(&mut cfg, &enterprise_http_client(), None).await;
 
         assert!(handled.is_none());
+        assert!(matches!(
+            cfg.upload_mode,
+            EnterpriseUploadMode::DirectWriteOnly(_)
+        ));
     }
 
     #[tokio::test]
     async fn readable_customer_storage_keeps_remote_diagnostic_logs_available() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _mode_env = UploadModeEnvGuard::clear();
         let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/enterprise/storage-binding/mode",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "desired_mode": "direct_upload_readable" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/enterprise/log-requests"))
             .respond_with(
@@ -1954,9 +2517,69 @@ mod tests {
         );
         cfg.ingest_url = format!("{}/api/enterprise/ingest", server.uri());
 
-        let handled = fulfill_log_requests(&cfg, &reqwest::Client::new(), None).await;
+        let handled = fulfill_log_requests(&mut cfg, &enterprise_http_client(), None).await;
 
         assert!(handled.is_none());
+    }
+
+    #[tokio::test]
+    async fn log_requests_recover_initially_blocked_policy_after_lookup_failure() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _mode_env = UploadModeEnvGuard::clear();
+        let server = wiremock::MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&dir, format!("{}/api/enterprise/ingest", server.uri()));
+        cfg.upload_mode = EnterpriseUploadMode::Blocked("startup policy unresolved".to_string());
+        let http = enterprise_http_client();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/enterprise/storage-binding/mode",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/enterprise/log-requests"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        assert!(fulfill_log_requests(&mut cfg, &http, None).await.is_none());
+        assert!(matches!(cfg.upload_mode, EnterpriseUploadMode::Blocked(_)));
+        server.verify().await;
+        server.reset().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/enterprise/storage-binding/mode",
+            ))
+            .and(wiremock::matchers::header("x-license-key", "sek_test"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "desired_mode": "hosted_ingest" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/enterprise/log-requests"))
+            .and(wiremock::matchers::header("x-device-id", "dev-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "requested": false })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The log worker recovers without running recording sync or changing keys.
+        assert!(fulfill_log_requests(&mut cfg, &http, None).await.is_none());
+        assert!(matches!(
+            cfg.upload_mode,
+            EnterpriseUploadMode::HostedIngest
+        ));
     }
 
     #[tokio::test]
@@ -2171,6 +2794,20 @@ mod tests {
                 "name": "Ada Lovelace",
                 "observed_name": "Ada"
             })],
+        }
+    }
+
+    fn activity(id: &str, start: &str, end: &str) -> ActivityRow {
+        ActivityRow {
+            activity_id: id.to_string(),
+            activity_kind: "work".to_string(),
+            meeting_id: None,
+            timestamp: end.to_string(),
+            start_at: start.to_string(),
+            end_at: end.to_string(),
+            title: "Prepared enterprise rollout".to_string(),
+            summary: "Reviewed policy and completed the rollout checklist.".to_string(),
+            evidence: Vec::new(),
         }
     }
 
@@ -2399,6 +3036,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("c.json");
         let c = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T10:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:30:00Z".to_string()),
@@ -2443,6 +3081,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("c.json");
         Cursor {
+            source_id: None,
             last_frame_ts: Some("t".to_string()),
             last_audio_ts: None,
             last_ui_ts: None,
@@ -2601,11 +3240,13 @@ mod tests {
         memories_to_yield: Mutex<Vec<Vec<MemoryRow>>>,
         feedback_to_yield: Mutex<Vec<Vec<FeedbackRow>>>,
         parsed_to_yield: Mutex<Vec<Vec<ParsedRow>>>,
+        activities_to_yield: Mutex<Vec<Vec<ActivityRow>>>,
         last_frames_since: Mutex<Option<String>>,
         last_audio_since: Mutex<Option<String>>,
         last_memories_since: Mutex<Option<String>>,
         last_feedback_since: Mutex<Option<String>>,
         last_parsed_since: Mutex<Option<String>>,
+        last_activity_since: Mutex<Option<String>>,
     }
 
     impl MockLocal {
@@ -2616,11 +3257,13 @@ mod tests {
                 memories_to_yield: Mutex::new(Vec::new()),
                 feedback_to_yield: Mutex::new(Vec::new()),
                 parsed_to_yield: Mutex::new(Vec::new()),
+                activities_to_yield: Mutex::new(Vec::new()),
                 last_frames_since: Mutex::new(None),
                 last_audio_since: Mutex::new(None),
                 last_memories_since: Mutex::new(None),
                 last_feedback_since: Mutex::new(None),
                 last_parsed_since: Mutex::new(None),
+                last_activity_since: Mutex::new(None),
             }
         }
 
@@ -2636,6 +3279,11 @@ mod tests {
 
         fn with_parsed(mut self, parsed: Vec<Vec<ParsedRow>>) -> Self {
             self.parsed_to_yield = Mutex::new(parsed);
+            self
+        }
+
+        fn with_activities(mut self, activities: Vec<Vec<ActivityRow>>) -> Self {
+            self.activities_to_yield = Mutex::new(activities);
             self
         }
     }
@@ -2740,6 +3388,7 @@ mod tests {
                 "off".to_string(),
                 "off".to_string(),
             );
+            crate::enterprise_policy::set_activity_sync_enabled(false);
         }
     }
 
@@ -2819,10 +3468,23 @@ mod tests {
                 .pop()
                 .unwrap_or_default())
         }
+        async fn fetch_activities_since(
+            &self,
+            since_ts: Option<&str>,
+        ) -> Result<Vec<ActivityRow>, EnterpriseSyncError> {
+            *self.last_activity_since.lock().unwrap() = since_ts.map(str::to_string);
+            Ok(self
+                .activities_to_yield
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_default())
+        }
     }
 
     fn test_cfg(dir: &TempDir, ingest_url: String) -> EnterpriseSyncConfig {
         EnterpriseSyncConfig {
+            stable_device_id: None,
             license_key: "sek_test".to_string(),
             device_id: "dev-1".to_string(),
             device_label: "louis-mbp".to_string(),
@@ -2951,6 +3613,7 @@ mod tests {
 
     fn initialized_cursor() -> Cursor {
         Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-08-04T00:00:00Z".to_string()),
             last_audio_ts: Some("2026-08-04T00:00:00Z".to_string()),
             last_ui_ts: Some("2026-08-04T00:00:00Z".to_string()),
@@ -3252,6 +3915,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, "http://does-not-matter".into());
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T10:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T10:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T10:00:00Z".to_string()),
@@ -3274,6 +3938,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_run_seeds_cursor_to_recent_window() {
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, "http://does-not-matter".into());
         let mut cursor = Cursor::default();
@@ -3308,6 +3973,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -3360,6 +4026,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-07-27T23:26:23Z".to_string()),
             last_audio_ts: Some("2026-07-27T23:26:23Z".to_string()),
             last_ui_ts: Some("2026-07-27T23:26:23Z".to_string()),
@@ -3406,6 +4073,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-07-31T23:59:59Z".to_string()),
             last_audio_ts: Some("2026-07-31T23:59:59Z".to_string()),
             last_ui_ts: Some("2026-07-31T23:59:59Z".to_string()),
@@ -3461,6 +4129,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-07-31T23:59:59Z".to_string()),
             last_audio_ts: Some("2026-07-31T23:59:59Z".to_string()),
             last_ui_ts: Some("2026-07-31T23:59:59Z".to_string()),
@@ -3512,6 +4181,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", failing_server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-07-27T23:26:23Z".to_string()),
             last_audio_ts: Some("2026-07-27T23:26:23Z".to_string()),
             last_ui_ts: Some("2026-07-27T23:26:23Z".to_string()),
@@ -3574,6 +4244,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let original_cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -3637,6 +4308,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -3682,6 +4354,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -3737,6 +4410,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -3801,6 +4475,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -3856,6 +4531,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_rows_upload_only_when_the_separate_stream_is_enabled() {
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
+        let _restore = RestoreDefaultSyncStreams;
+        crate::enterprise_policy::set_sync_streams(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            "off".to_string(),
+            "off".to_string(),
+        );
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ingest"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
+        let mut cursor = Cursor::default();
+        cursor.boundary.activity_ts = Some("2026-09-02T18:00:00Z".to_string());
+        let local = MockLocal::new(vec![], vec![]).with_activities(vec![vec![activity(
+            "activity-1",
+            "2026-09-02T18:00:00Z",
+            "2026-09-02T18:15:00Z",
+        )]]);
+
+        let disabled_report = run_one_sync(&cfg, &mut cursor, &local, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(disabled_report.activities, 0);
+        assert!(local.last_activity_since.lock().unwrap().is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        crate::enterprise_policy::set_activity_sync_enabled(true);
+        let report = run_one_sync(&cfg, &mut cursor, &local, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(report.activities, 1);
+        assert_eq!(
+            cursor.boundary.activity_ts.as_deref(),
+            Some("2026-09-02T18:15:00Z")
+        );
+        let requests = server.received_requests().await.unwrap();
+        let batch = screenpipe_telemetry_wire::parse_jsonl(&requests[0].body);
+        assert!(matches!(
+            batch.records.as_slice(),
+            [TelemetryRecord::Activity { .. }]
+        ));
+    }
+
+    #[tokio::test]
     async fn direct_upload_success_advances_cursor_after_complete() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -3903,6 +4634,7 @@ mod tests {
             format!("{}/complete", server.uri()),
         );
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -3930,80 +4662,143 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readable_direct_upload_puts_jsonl_body() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/ticket"))
-            .and(wiremock::matchers::body_string_contains(
-                "\"mode\":\"direct_upload_readable\"",
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "ok": true,
-                    "method": "PUT",
-                    "upload_url": format!("{}/blob", server.uri()),
-                    "headers": {
-                        "Content-Type": enterprise_upload::DIRECT_UPLOAD_CONTENT_TYPE,
-                        "x-ms-blob-type": "BlockBlob"
+    async fn direct_upload_completion_auto_cites_only_readable_all_images() {
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
+        let _restore = RestoreDefaultSyncStreams;
+        for (readable, historical) in [(false, false), (false, true), (true, false), (true, true)] {
+            for frame_mode in ["off", "cited", "all"] {
+                let mode_json = format!(
+                    "\"mode\":\"{}\"",
+                    if readable {
+                        "direct_upload_readable"
+                    } else {
+                        "direct_upload_write_only"
                     }
-                })),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/blob"))
-            .and(wiremock::matchers::body_string_contains(
-                "customer-readable",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/complete"))
-            .and(wiremock::matchers::body_string_contains(
-                "\"mode\":\"direct_upload_readable\"",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
+                );
+                crate::enterprise_policy::set_sync_streams(
+                    true,
+                    false,
+                    true,
+                    true,
+                    true,
+                    true,
+                    "off".to_string(),
+                    frame_mode.to_string(),
+                );
+                let server = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path("/ticket"))
+                    .and(wiremock::matchers::body_string_contains(mode_json.clone()))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({
+                            "ok": true,
+                            "method": "PUT",
+                            "upload_url": format!("{}/blob", server.uri()),
+                            "headers": {
+                                "Content-Type": enterprise_upload::DIRECT_UPLOAD_CONTENT_TYPE,
+                                "x-ms-blob-type": "BlockBlob"
+                            }
+                        }),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                    .and(wiremock::matchers::path("/blob"))
+                    .and(wiremock::matchers::body_string_contains(
+                        "customer-readable",
+                    ))
+                    .respond_with(wiremock::ResponseTemplate::new(201))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path("/complete"))
+                    .and(wiremock::matchers::body_string_contains(mode_json.clone()))
+                    .respond_with(wiremock::ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
 
-        let dir = TempDir::new().unwrap();
-        let cfg = readable_direct_test_cfg(
-            &dir,
-            format!("{}/ticket", server.uri()),
-            format!("{}/complete", server.uri()),
-        );
-        let mut cursor = Cursor {
-            last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
-            last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
-            last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
-            last_memory_ts: None,
-            last_feedback_ts: None,
-            last_parsed_ts: None,
-            boundary: CursorBoundary::default(),
-        };
-        let local = MockLocal::new(
-            vec![vec![frame(
-                1,
-                "2026-05-07T10:00:00Z",
-                "Arc",
-                "customer-readable text",
-            )]],
-            vec![vec![]],
-        );
-        let http = reqwest::Client::new();
-        let report = run_one_sync(&cfg, &mut cursor, &local, &http)
-            .await
-            .unwrap();
+                let dir = TempDir::new().unwrap();
+                let make_cfg = if readable {
+                    readable_direct_test_cfg
+                } else {
+                    direct_test_cfg
+                };
+                let mut cfg = make_cfg(
+                    &dir,
+                    format!("{}/ticket", server.uri()),
+                    format!("{}/complete", server.uri()),
+                );
+                cfg.ingest_url = format!("{}/api/enterprise/ingest", server.uri());
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path("/api/enterprise/frame-uploads"))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"stored": [], "unavailable": [1], "failed": []}),
+                    ))
+                    .expect(usize::from(readable && historical && frame_mode == "all") as u64)
+                    .mount(&server)
+                    .await;
+                let mut cursor = Cursor {
+                    source_id: None,
+                    last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
+                    last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
+                    last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
+                    last_memory_ts: None,
+                    last_feedback_ts: None,
+                    last_parsed_ts: None,
+                    boundary: CursorBoundary::default(),
+                };
+                let local = MockLocal::new(
+                    vec![vec![frame(
+                        1,
+                        "2026-05-07T10:00:00Z",
+                        "Arc",
+                        "customer-readable text",
+                    )]],
+                    vec![vec![]],
+                );
+                let http = reqwest::Client::new();
+                let replay: Option<backfill::BackfillRequest> = historical.then(|| serde_json::from_value(serde_json::json!({
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "license_id": "22222222-2222-2222-2222-222222222222",
+                    "device_id": cfg.device_id,
+                    "start_at": "2026-05-07T09:00:00Z", "end_at": "2026-05-07T11:00:00Z", "streams": ["frames"]
+                })).unwrap());
+                let report =
+                    run_one_sync_inner(&cfg, &mut cursor, &local, &http, false, replay.as_ref())
+                        .await
+                        .unwrap();
 
-        assert_eq!(report.frames, 1);
-        assert_eq!(
-            cursor.last_frame_ts.as_deref(),
-            Some("2026-05-07T10:00:00Z")
-        );
+                assert_eq!(report.frames, 1);
+                assert_eq!(
+                    cursor.last_frame_ts.as_deref(),
+                    Some("2026-05-07T10:00:00Z")
+                );
+                let requests = server.received_requests().await.unwrap();
+                let complete = requests
+                    .iter()
+                    .find(|r| r.url.path() == "/complete")
+                    .unwrap();
+                assert_eq!(
+                    complete.headers.contains_key("x-screenpipe-backfill"),
+                    readable && historical
+                );
+                for request in &requests {
+                    if request.url.path() == "/blob" {
+                        assert!(!request.headers.contains_key("x-screenpipe-backfill"));
+                    }
+                }
+                let body: serde_json::Value = serde_json::from_slice(&complete.body).unwrap();
+                if readable && frame_mode == "all" {
+                    assert_eq!(body["frame_ids"], serde_json::json!([1]));
+                } else {
+                    assert!(body.get("frame_ids").is_none());
+                }
+                assert!(!String::from_utf8_lossy(&complete.body).contains("customer-readable text"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -4042,6 +4837,7 @@ mod tests {
             format!("{}/complete", server.uri()),
         );
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -4078,6 +4874,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -4113,6 +4910,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -4154,6 +4952,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -4303,6 +5102,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = test_cfg(&dir, format!("{}/ingest", server.uri()));
         let mut cursor = Cursor {
+            source_id: None,
             last_frame_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_audio_ts: Some("2026-05-07T09:00:00Z".to_string()),
             last_ui_ts: Some("2026-05-07T09:00:00Z".to_string()),
@@ -4434,6 +5234,7 @@ mod tests {
 
     fn frame_test_cfg(server_uri: &str, tmp: &TempDir) -> EnterpriseSyncConfig {
         EnterpriseSyncConfig {
+            stable_device_id: None,
             license_key: "sek_frames".to_string(),
             device_id: "dev-frame-test".to_string(),
             device_label: "frame test".to_string(),
@@ -4442,6 +5243,259 @@ mod tests {
             upload_mode: EnterpriseUploadMode::HostedIngest,
             log_dirs: vec![tmp.path().to_path_buf()],
         }
+    }
+
+    /// Uses the production exact-image reader against an actual HTTP server.
+    struct HttpFrameMock(String);
+
+    #[async_trait::async_trait]
+    impl LocalApiClient for HttpFrameMock {
+        async fn fetch_frames_since(
+            &self,
+            _: Option<&str>,
+            _: u32,
+            _: u32,
+        ) -> Result<Vec<FrameRow>, EnterpriseSyncError> {
+            Ok(vec![])
+        }
+        async fn fetch_audio_since(
+            &self,
+            _: Option<&str>,
+            _: u32,
+            _: u32,
+        ) -> Result<Vec<AudioRow>, EnterpriseSyncError> {
+            Ok(vec![])
+        }
+        async fn fetch_frame_jpeg(&self, id: i64) -> Result<Option<Vec<u8>>, EnterpriseSyncError> {
+            fetch_exact_frame_jpeg(&reqwest::Client::new(), &self.0, Some("test-api-key"), id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_frame_reader_requires_classified_same_frame_absence() {
+        use wiremock::{matchers::*, Mock, MockServer, ResponseTemplate};
+        for (status, detail, terminal) in [
+            (404, serde_json::json!({"error": "Frame not found"}), false),
+            (
+                404,
+                serde_json::json!({"frame_id": 2, "error_type": "snapshot_missing"}),
+                false,
+            ),
+            (
+                404,
+                serde_json::json!({"frame_id": 1, "error_type": "remote_device"}),
+                false,
+            ),
+            (
+                404,
+                serde_json::json!({"frame_id": 1, "error_type": "snapshot_missing"}),
+                true,
+            ),
+            (
+                404,
+                serde_json::json!({"frame_id": 1, "error_type": "frame_media_unavailable"}),
+                true,
+            ),
+            (
+                500,
+                serde_json::json!({"frame_id": 1, "error_type": "snapshot_read_failed", "io_error_kind": "PermissionDenied", "error": "/Users/private/client-tax-return.jpg"}),
+                false,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/frames/1"))
+                .and(query_param("fallback", "false"))
+                .and(header("Authorization", "Bearer test-api-key"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(detail))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = HttpFrameMock(server.uri()).fetch_frame_jpeg(1).await;
+            if terminal {
+                assert!(result.unwrap().is_none());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("retry pending"));
+                assert!(!error.contains("/Users/private"));
+                if status == 500 {
+                    assert!(error.contains("PermissionDenied"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_frame_read_failure_keeps_backfill_pending_until_pixels_upload() {
+        let dir = TempDir::new().unwrap();
+        check_exact_frame_failure(dir.path()).await;
+    }
+
+    // Also invoked by the normal support collector's rotation/redaction test.
+    pub(crate) async fn check_exact_frame_failure(log_dir: &std::path::Path) {
+        use tracing::instrument::WithSubscriber;
+        use wiremock::{matchers::*, Mock, MockServer, ResponseTemplate};
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
+        let _restore = RestoreDefaultSyncStreams;
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".into(),
+            "all".into(),
+        );
+        let server = MockServer::start().await;
+        let attempt = AtomicUsize::new(0);
+        let jpeg = synth_jpeg(160, 90);
+        Mock::given(method("GET")).and(path("/frames/1"))
+            .and(query_param("fallback", "false"))
+            .respond_with(move |_: &wiremock::Request| {
+                if attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                        "frame_id": 1, "error_type": "snapshot_read_failed",
+                        "io_error_kind": "PermissionDenied", "error": "/Users/private/client-tax-return.jpg"
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(jpeg.clone())
+                }
+            }).expect(2).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/enterprise/frame-uploads"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["frames"][0]["frame_id"], 1);
+                assert!(body["frames"][0].get("error").is_none());
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(body["frames"][0]["image_b64"].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 160);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"stored": [1], "unavailable": []}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tmp = TempDir::new().unwrap();
+        let cfg = frame_test_cfg(&server.uri(), &tmp);
+        let rows = vec![frame(1, "2026-01-01T00:00:00Z", "test", "")];
+        let local = HttpFrameMock(server.uri());
+        let http = reqwest::Client::new();
+        let file = std::fs::File::create(log_dir.join("screenpipe-app.2026-10-05.log")).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .finish();
+        let failure = backfill::upload_page_images(&cfg, &local, &http, &rows)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("screenshot_fetch_failed"));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "a failed read must not upload a terminal missing-image status"
+        );
+        let result = backfill::upload_page_images(&cfg, &local, &http, &rows)
+            .await
+            .unwrap();
+        assert_eq!((result.uploaded, result.unavailable), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn historical_images_require_matching_durable_ack_and_preserve_policy_source_gates() {
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
+        let _restore = RestoreDefaultSyncStreams;
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".into(),
+            "all".into(),
+        );
+        let server = wiremock::MockServer::start().await;
+        let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = attempt.clone();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/enterprise/frame-uploads"))
+            .respond_with(move |r: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                assert_eq!(body["frames"][0]["frame_id"], 1);
+                assert!(body["frames"][0]["image_b64"].as_str().unwrap().len() > 100);
+                assert_eq!(body["frames"][1]["error"], "not_found");
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"stored": [2], "unavailable": [1]}))
+                } else {
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"stored": [1], "unavailable": [2]}))
+                }
+            })
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = frame_test_cfg(&server.uri(), &dir);
+        let rows = vec![
+            frame(1, "2026-01-01T00:00:00Z", "test", ""),
+            frame(2, "2026-01-01T00:00:00Z", "test", ""),
+        ];
+        let http = reqwest::Client::new();
+        assert!(backfill::upload_page_images(&cfg, &FrameMock, &http, &rows)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("screenshot_ack_incomplete"));
+        let result = backfill::upload_page_images(&cfg, &FrameMock, &http, &rows)
+            .await
+            .unwrap();
+        assert_eq!((result.uploaded, result.unavailable), (1, 1));
+        let failed = vec![frame(3, "2026-01-01T00:00:00Z", "test", "")];
+        assert!(
+            backfill::upload_page_images(&cfg, &FrameMock, &http, &failed)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("screenshot_fetch_failed")
+        );
+        cfg.device_id = "33333333-3333-4333-8333-333333333333".into();
+        assert!(backfill::upload_page_images(&cfg, &FrameMock, &http, &rows)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("screenshot_source_changed"));
+        cfg.upload_mode =
+            EnterpriseUploadMode::DirectWriteOnly(enterprise_upload::DirectUploadConfig {
+                ticket_url: format!("{}/ticket", server.uri()),
+                complete_url: format!("{}/complete", server.uri()),
+                pinned_hosts: vec![],
+            });
+        assert!(backfill::upload_page_images(&cfg, &FrameMock, &http, &rows)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("screenshot_storage_mode_blocked"));
+        cfg.upload_mode = EnterpriseUploadMode::HostedIngest;
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".into(),
+            "off".into(),
+        );
+        assert!(backfill::upload_page_images(&cfg, &FrameMock, &http, &rows)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("screenshot_policy_disabled"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[test]
@@ -4539,6 +5593,14 @@ mod tests {
 
     #[tokio::test]
     async fn fulfill_frame_requests_end_to_end() {
+        for readable in [false, true] {
+            for frame_mode in ["cited", "all"] {
+                check_frame_fulfillment(readable, frame_mode).await;
+            }
+        }
+    }
+
+    async fn check_frame_fulfillment(readable: bool, frame_mode: &str) {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
         crate::enterprise_policy::set_sync_streams(
             true,
@@ -4548,7 +5610,7 @@ mod tests {
             true,
             true,
             "off".to_string(),
-            "cited".to_string(),
+            frame_mode.to_string(),
         );
 
         let server = wiremock::MockServer::start().await;
@@ -4575,7 +5637,14 @@ mod tests {
             .await;
 
         let tmp = TempDir::new().unwrap();
-        let cfg = frame_test_cfg(&server.uri(), &tmp);
+        let mut cfg = frame_test_cfg(&server.uri(), &tmp);
+        if readable {
+            cfg.upload_mode = EnterpriseUploadMode::DirectReadable(DirectUploadConfig {
+                ticket_url: format!("{}/ticket", server.uri()),
+                complete_url: format!("{}/complete", server.uri()),
+                pinned_hosts: Vec::new(),
+            });
+        }
         let http = reqwest::Client::new();
         let report = fulfill_frame_requests(&cfg, &FrameMock, &http).await;
 
@@ -4619,6 +5688,86 @@ mod tests {
             true,
             "off".to_string(),
             "off".to_string(),
+        );
+    }
+
+    #[tokio::test]
+    async fn readable_frame_upload_failure_retries() {
+        let tmp = TempDir::new().unwrap();
+        check_readable_frame_failure(tmp.path()).await;
+    }
+
+    // Also exercised by diagnostic_logs' real collection/redaction test.
+    pub(crate) async fn check_readable_frame_failure(log_dir: &std::path::Path) {
+        use tracing::instrument::WithSubscriber;
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
+        let _restore = RestoreDefaultSyncStreams;
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            "off".to_string(),
+            "all".to_string(),
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/enterprise/frame-requests"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"frame_ids": [1]})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let attempts = AtomicUsize::new(0);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/enterprise/frame-uploads"))
+            .respond_with(move |_: &wiremock::Request| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    wiremock::ResponseTemplate::new(503)
+                } else {
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"stored": [1], "failed": []}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = frame_test_cfg(&server.uri(), &tmp);
+        cfg.upload_mode = EnterpriseUploadMode::DirectReadable(DirectUploadConfig {
+            ticket_url: format!("{}/ticket", server.uri()),
+            complete_url: format!("{}/complete", server.uri()),
+            pinned_hosts: Vec::new(),
+        });
+        let file = std::fs::File::create(log_dir.join("screenpipe-app.2026-10-01.log")).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .finish();
+        let http = reqwest::Client::new();
+        let failed = fulfill_frame_requests(&cfg, &FrameMock, &http)
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(
+            failed,
+            FrameFulfillReport {
+                requested: 1,
+                uploaded: 0,
+                failed: 1
+            }
+        );
+        let retried = fulfill_frame_requests(&cfg, &FrameMock, &http).await;
+        assert_eq!(
+            retried,
+            FrameFulfillReport {
+                requested: 1,
+                uploaded: 1,
+                failed: 0
+            }
         );
     }
 
@@ -4747,9 +5896,9 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let mut cfg = frame_test_cfg(&server.uri(), &tmp);
-        // Direct-upload orgs keep telemetry out of our cloud; frames must
-        // follow the same promise even with the stream flag on.
-        cfg.upload_mode = EnterpriseUploadMode::DirectReadable(DirectUploadConfig {
+        // Write-only and unresolved/customer-hosted policies must never
+        // send screenshots through our cloud, even with frame_images enabled.
+        cfg.upload_mode = EnterpriseUploadMode::DirectWriteOnly(DirectUploadConfig {
             ticket_url: format!("{}/ticket", server.uri()),
             complete_url: format!("{}/complete", server.uri()),
             pinned_hosts: Vec::new(),
@@ -4757,6 +5906,12 @@ mod tests {
         let http = reqwest::Client::new();
         let report = fulfill_frame_requests(&cfg, &FrameMock, &http).await;
         assert_eq!(report, FrameFulfillReport::default());
+        cfg.upload_mode = EnterpriseUploadMode::Blocked("customer_hosted".to_string());
+        assert_eq!(
+            fulfill_frame_requests(&cfg, &FrameMock, &http).await,
+            FrameFulfillReport::default()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
 
         crate::enterprise_policy::set_sync_streams(
             true,
@@ -4784,3 +5939,7 @@ mod frame_batch_tests {
         assert_eq!(frame_batch_max(FrameImagesMode::All), 200);
     }
 }
+
+#[cfg(test)]
+#[path = "source_identity_tests.rs"]
+mod source_identity_tests;

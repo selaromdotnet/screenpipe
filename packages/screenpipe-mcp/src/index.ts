@@ -30,8 +30,11 @@ import {
   createMcpQualifiedValueReporter,
   resolveMcpClient,
 } from "./qualified-value";
-import { discoverTeamApiBase, discoverTeamToken } from "./team-config";
+import { discoverTeamConfig } from "./team-config";
+import { teamFrameContent, teamFramePath } from "./team-frame";
+import { WORKFLOW_TOOLS, readWorkflowTool, frameAutomationContent, inputEventContent } from "./workflow-tools";
 import { PKG_VERSION } from "./version";
+import { BUNDLED_SKILLS_TOOL, readBundledSkills } from "./bundled-skills";
 import { formatForElementPurpose } from "./element-format";
 import { buildActivitySummaryResult } from "./activity-summary-tool";
 import {
@@ -39,6 +42,7 @@ import {
   normalizeTime,
   normalizeTimeFields,
 } from "./time-normalization";
+import { resolveScreenpipeApiBase } from "./api-base";
 
 initMcpTelemetry({ transport: "stdio" });
 
@@ -67,14 +71,11 @@ for (let i = 0; i < args.length; i++) {
 // screenpipe (e.g. an agent on a VPS reading a synced copy of your data),
 // not just localhost. Priority:
 //   1. --screenpipe-url / --screenpipe-api-url flag
-//   2. SCREENPIPE_API_URL env (set by `screenpipe agent setup --api-url`)
-//   3. --screenpipe-host (+ --port) → http://host:port
-//   4. default http://localhost:<port>
-const SCREENPIPE_API = (
-  baseOverride ||
-  process.env.SCREENPIPE_API_URL ||
-  `http://${host}:${port}`
-).replace(/\/+$/, "");
+//   2. SCREENPIPE_LOCAL_API_URL / PORT from the launching desktop instance
+//   3. SCREENPIPE_API_URL env (set by `screenpipe agent setup --api-url`)
+//   4. --screenpipe-host (+ --port) → http://host:port
+//   5. default http://localhost:<port>
+const SCREENPIPE_API = resolveScreenpipeApiBase({ baseOverride, host, port });
 
 // Discover the local API key, in priority order:
 //
@@ -87,14 +88,13 @@ const SCREENPIPE_API = (
 //   3. CLI via node-adjacent npx — for dev environments that have node but
 //      not the desktop app.
 //   4. CLI via PATH-based npx — last CLI fallback.
-//   5. Direct sqlite3 read of ~/.screenpipe/db.sqlite — plaintext entries
-//      only (encrypted entries need the keychain, which only the CLI can
-//      reach). Kept as a final last-resort for users who have screenpipe
-//      *data* but no working CLI install (rare). Demoted below the CLI
-//      paths because it reimplements logic that lives in `auth_key.rs` and
-//      can silently drift on storage-format changes.
 //
-// If all 5 miss we log a loud stderr warning so it surfaces in the host's
+// The MCP process never opens Screenpipe's SQLite files. The desktop app and
+// CLI own database access, locking, WAL handling, and secret-store decoding;
+// bypassing those boundaries here can race the recorder or drift from the
+// encrypted storage format.
+//
+// If all 4 miss we log a loud stderr warning so it surfaces in the host's
 // MCP log instead of the user just seeing 403s with no explanation.
 async function discoverApiKey(): Promise<string> {
   const envKey = process.env.SCREENPIPE_LOCAL_API_KEY || process.env.SCREENPIPE_API_KEY;
@@ -225,51 +225,7 @@ async function discoverApiKey(): Promise<string> {
     }
   } catch {}
 
-  // 5. Direct sqlite3 read of the secret store (last-resort). Plaintext
-  //    entries only — encrypted ones live behind the keychain, which the
-  //    CLI paths above already cover. Used when the user has screenpipe
-  //    data on disk but no working CLI install.
-  const sqliteCandidates: string[] =
-    process.platform === "win32"
-      ? ["sqlite3.exe", "C:\\Windows\\System32\\sqlite3.exe"]
-      : process.platform === "darwin"
-      ? ["sqlite3", "/usr/bin/sqlite3", "/opt/homebrew/bin/sqlite3", "/usr/local/bin/sqlite3"]
-      : ["sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3"];
-  try {
-    const dbPath = path.join(home, ".screenpipe", "db.sqlite");
-    if (fs.existsSync(dbPath)) {
-      let row: string | null = null;
-      for (const candidate of sqliteCandidates) {
-        if (budgetLeft() <= 0) break;
-        try {
-          const { stdout } = await execFileAsync(
-            candidate,
-            [dbPath, "SELECT hex(nonce), value FROM secrets WHERE key = 'api_auth_key';"],
-            { timeout: Math.min(5000, budgetLeft()), encoding: "utf-8" },
-          );
-          row = String(stdout).trim();
-          break;
-        } catch {
-          // try next candidate
-        }
-      }
-      if (row) {
-        const sepIdx = row.indexOf("|");
-        const nonceHex = sepIdx >= 0 ? row.substring(0, sepIdx) : "";
-        const value = sepIdx >= 0 ? row.substring(sepIdx + 1) : row;
-        const isPlaintext = !nonceHex || /^0+$/.test(nonceHex);
-        if (isPlaintext && value) {
-          const decoded = Buffer.from(value, "base64").toString("utf-8");
-          if (decoded && decoded.startsWith("sp-")) return decoded;
-          if (value.startsWith("sp-")) return value;
-        }
-        // Encrypted — only the CLI paths above can decrypt this; we
-        // already tried them.
-      }
-    }
-  } catch {}
-
-  // All five paths missed. Log loudly to stderr so the host's MCP
+  // All four paths missed. Log loudly to stderr so the host's MCP
   // panel surfaces this instead of the user seeing cryptic 403s from
   // the screenpipe server on every tool call.
   process.stderr.write(
@@ -278,14 +234,14 @@ async function discoverApiKey(): Promise<string> {
       "  - env vars (SCREENPIPE_LOCAL_API_KEY / SCREENPIPE_API_KEY) not set",
       "  - bundled `bun` from screenpipe.app not found at any known install path",
       "  - npx fallback unavailable",
-      "  - direct sqlite3 read of ~/.screenpipe/db.sqlite failed",
       "Fix: set SCREENPIPE_LOCAL_API_KEY in your MCP launcher's env block,",
-      "or install the screenpipe desktop app (https://screenpi.pe).",
+      "or install the screenpipe desktop app (https://screenpi.pe) so its CLI",
+      "can resolve the key without bypassing Screenpipe's database boundary.",
       "",
     ].join("\n"),
   );
-  // This is a user-side misconfiguration (no key set + no desktop app / CLI /
-  // local DB), not a screenpipe defect — the stderr hint above tells the user
+  // This is a user-side misconfiguration (no key set + no desktop app / CLI),
+  // not a screenpipe defect — the stderr hint above tells the user
   // how to fix it. Log it as `info` for activation signal, and throttle to one
   // event per machine per day so a respawning MCP host can't escalate it.
   captureMcpMessage("api key discovery failed", "info", {
@@ -296,7 +252,7 @@ async function discoverApiKey(): Promise<string> {
 }
 
 // API key is resolved LAZILY, never at module load. `discoverApiKey()` can run
-// several subprocess fallbacks (bundled bun, npx, sqlite) that, on a cold cache
+// several subprocess fallbacks (bundled bun and npx) that, on a cold cache
 // or restricted PATH, take many seconds. Running that synchronously at module
 // scope used to block the entire module body from finishing — which meant
 // `main()` (and therefore `server.connect()`) was never reached until discovery
@@ -326,43 +282,27 @@ function ensureApiKey(): Promise<string> {
   return apiKeyDiscovery;
 }
 
-// Enterprise team token — when present, this MCP additionally registers
-// `team-*` tools that query the org-wide telemetry control plane instead of
-// just the local recordings. Same audience: an enterprise admin running
-// screenpipe-mcp inside Claude Desktop / Cursor / Windsurf wants to ask "what
-// did MY machine do" AND "what did MY TEAM do" without juggling two MCPs.
-//
-// TWO independent things get resolved here, both in ./team-config:
-//
-//   TOKEN (discoverTeamToken) — `sk_ent_…`:
-//     1. SCREENPIPE_ENTERPRISE_TOKEN env var (Claude config, terminal)
-//     2. team_api_token in ~/.screenpipe/enterprise.json (written by the
-//        desktop app's Settings → Privacy → Admin Team API Token)
-//
-//   BASE URL (discoverTeamApiBase) — where those tools send their requests:
-//     1. --team-api-url flag
-//     2. SCREENPIPE_TEAM_API_URL env var
-//     3. gateway_url in ~/.screenpipe/enterprise.json
-//     4. the hosted default, https://screenpi.pe/api/enterprise/v1
-//
-// The base is NOT always the hosted API: orgs on the write-only archive tier
-// run their own query gateway inside their network, and the hosted API has no
-// read path to their data — pointing there returns 401. The bearer token is
-// the same `sk_ent_` either way; only the base moves.
-//
-// Empty / missing token → team tools are not registered; non-admin users of
-// screenpipe-mcp see exactly what they see today.
-const TEAM_TOKEN = discoverTeamToken();
-const TEAM_API = discoverTeamApiBase(teamApiOverride);
-
-async function fetchTeam(p: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${TEAM_API}${p}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${TEAM_TOKEN}`,
-      ...(init.headers || {}),
-    },
+// Team calls use the current token and matching gateway from team-config.
+// Keep one snapshot for the whole call so a file update cannot pair a new
+// credential with a gateway cached from the previous configuration.
+async function fetchTeam(
+  p: string,
+  config: ReturnType<typeof discoverTeamConfig>
+): Promise<Response> {
+  const response = await fetch(`${config.apiBase}${p}`, {
+    headers: { Authorization: `Bearer ${config.token}` },
   });
+  if (response.status === 401) {
+    const body = await response.clone().json().catch(() => null);
+    if (body?.error === "token expired") {
+      throw new Error(
+        "Enterprise API token expired. Save a current token in Settings → Privacy → Admin Team API Token. " +
+        "If SCREENPIPE_ENTERPRISE_TOKEN is set in your MCP config, replace it or remove that override " +
+        "to use ~/.screenpipe/enterprise.json, then restart the MCP server."
+      );
+    }
+  }
+  return response;
 }
 
 // Initialize server
@@ -383,10 +323,12 @@ const server = new Server(
 // Tools
 // ---------------------------------------------------------------------------
 const TOOLS: Tool[] = [
+  ...WORKFLOW_TOOLS,
+  BUNDLED_SKILLS_TOOL,
   {
     name: "search-content",
     description:
-      "Search screen text, audio transcriptions, input events, memories, and parsed app data. Returns timestamped results with app context. " +
+      "Search screen text, audio transcriptions, input events, memories, and parsed app data. Returns timestamped results with app context and starred markers. For starred work, set starred_only=true and a time range; no session lookup needed. " +
       "USE WHEN: you need the actual text/content of a moment — quotes, screen text, transcript lines, or compact parsed messages, emails, tasks, documents, and code review — or want to filter by speaker/window. " +
       "DO NOT USE for: broad questions like 'what was I doing?' (use activity-summary, it pre-summarizes apps + windows + transcripts). " +
       "Also DO NOT USE for: targeted UI controls (use search-elements). " +
@@ -397,7 +339,7 @@ const TOOLS: Tool[] = [
       properties: {
         q: {
           type: "string",
-          description: "Full-text search query. Omit to return all content in time range. Avoid for audio — transcriptions are noisy, q filters too aggressively.",
+          description: "Full-text search query. Omit to return all content in time range. Avoid for audio — transcriptions are noisy, q filters too aggressively. For an attached activity episode, its generated title/summary are labels, not query terms: use the exact time range and artifact anchors with q omitted.",
         },
         content_type: {
           type: "string",
@@ -416,6 +358,8 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "ISO 8601, relative time, or local calendar ('today', 'yesterday', 'tomorrow', 'YYYY-MM-DD'). Defaults to now.",
         },
+        starred_only: { type: "boolean", description: "Only captures inside starred intervals. Use for starred work; omit for ordinary searches. Applied before pagination." },
+        starred_session_id: { type: "string", description: "Optional exact session ID already known from activity-summary. Usually use starred_only instead." },
         app_name: { type: "string", description: "Filter by app name (e.g. 'Google Chrome', 'Slack', 'zoom.us'). Case-sensitive." },
         window_name: { type: "string", description: "Filter by window title substring" },
         frame_id: { type: "integer", description: "With content_type='parsed', return parsed data attached to one frame." },
@@ -448,6 +392,36 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "synced-devices",
+    description:
+      "List this signed-in user's Screenpipe devices that have uploaded Data Sync records, including each device name and last sync time. " +
+      "USE WHEN: the user asks what devices are available, names another device, or asks a cross-device question and you need the exact device_name filter. " +
+      "This never accepts an account or bucket identifier; the local app forwards the signed-in user's identity.",
+    annotations: { title: "Synced Devices", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "search-synced-content",
+    description:
+      "Search Data Sync records from this signed-in user's devices. Results include device name, device ID, and timestamp for attribution. " +
+      "USE WHEN: the user asks about another/named device, asks across devices, or local search does not cover the requested machine. " +
+      "For the current machine only, use search-content. Start with a narrow time range and limit=10.",
+    annotations: { title: "Search Synced Content", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string", description: "Case-insensitive substring query. Omit to return all matching records in the window." },
+        device_name: { type: "string", description: "Exact device name from synced-devices." },
+        device_id: { type: "string", description: "Exact device ID from synced-devices." },
+        app_name: { type: "string", description: "Exact app name, case-insensitive." },
+        since: { type: "string", description: "ISO 8601 lower bound." },
+        until: { type: "string", description: "ISO 8601 upper bound." },
+        since_hours_ago: { type: "number", description: "Alternative relative time window in hours." },
+        limit: { type: "integer", description: "Max results (default 50, max 200).", default: 50 },
+      },
+    },
+  },
+  {
     name: "list-meetings",
     description:
       "List detected meetings (Zoom, Teams, Meet, etc.) with id, duration, app, attendees, and note status. " +
@@ -471,6 +445,7 @@ const TOOLS: Tool[] = [
   {
     name: "activity-summary",
     description:
+      "Includes up to ten recent starred intervals for this time range, even without captured content. Stars indicate user intent, not duration or completion. " +
       "Rich activity overview: authoritative active minutes, app/window time, edited document paths, key text, and audio transcriptions, with optional parsed task context when available. " +
       "USE WHEN: any broad question about what the user did — 'what was I doing?', 'how long on X?', 'which apps?', 'recap my morning'. " +
       "This is almost always the right first call for time-range questions — usually sufficient without follow-up searches. " +
@@ -482,6 +457,7 @@ const TOOLS: Tool[] = [
       properties: {
         start_time: { type: "string", description: "ISO 8601, relative (e.g. '3h ago'), or local calendar ('today', 'yesterday', 'tomorrow', 'YYYY-MM-DD')" },
         end_time: { type: "string", description: "ISO 8601, relative (e.g. 'now'), or local calendar ('today', 'yesterday', 'tomorrow', 'YYYY-MM-DD')" },
+        include_starred: { type: "boolean", description: "Include bounded starred-session context (default true; omitted for app/data-restricted reads)." },
         app_name: { type: "string", description: "Optional app name filter to focus on one app" },
         include_parsed_context: {
           type: "boolean",
@@ -536,12 +512,15 @@ const TOOLS: Tool[] = [
     name: "frame-context",
     description:
       "Get full accessibility text, parsed tree nodes, and URLs for a specific frame ID. " +
-      "Use after search-content to get detailed context for a specific moment.",
+      "Use after search-content or get-workflow for a specific moment. Set purpose=automation for paginated nodes preserving exact captured bounds and automation properties; these are historical, not live targets.",
     annotations: { title: "Frame Context", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
       properties: {
         frame_id: { type: "integer", description: "Frame ID from search-content results (content.frame_id field)" },
+        purpose: { type: "string", enum: ["read", "automation"], description: "Automation preserves raw captured node fields, including properties and bounds." },
+        node_offset: { type: "integer", minimum: 0, description: "Automation node pagination offset" },
+        node_limit: { type: "integer", minimum: 1, maximum: 500, default: 100, description: "Automation nodes per response" },
       },
       required: ["frame_id"],
     },
@@ -646,7 +625,7 @@ const TOOLS: Tool[] = [
         priority: {
           type: "string",
           enum: ["high", "normal", "low"],
-          description: "High interrupts and appears in the focused Priority view. Normal (default) and low remain available in All without interrupting.",
+          description: "Every priority appears in the top-right panel. High also appears in the focused Priority view, normal (default) stays in All, and low is toast-only by default.",
           default: "normal",
         },
         timeout_secs: { type: "integer", description: "Auto-dismiss after N seconds (default 20). Use 0 for persistent.", default: 20 },
@@ -1053,15 +1032,44 @@ const TEAM_TOOLS: Tool[] = [
       },
     },
   },
+  {
+    name: "team-frame",
+    description:
+      "Read one PII-redacted team screenshot. Use device_id and frame_id from " +
+      "team-search or team-records. Returns actual JPEG image content when the " +
+      "device has uploaded it, or an explicit unavailable result. Never claim " +
+      "to have seen a frame unless this tool returns image content. " +
+      "Auth: enterprise admin token with read:records.",
+    annotations: { title: "Team Frame", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        device_id: {
+          type: "string",
+          minLength: 1,
+          maxLength: 64,
+          pattern: "^[A-Za-z0-9_-]+$",
+          description: "Device ID from team-search or team-devices.",
+        },
+        frame_id: {
+          type: "integer",
+          minimum: 1,
+          maximum: 999999999999999,
+          description: "Frame ID from team-search or team-records.",
+        },
+      },
+      required: ["device_id", "frame_id"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 // Pipe-output kinds map to /workflows/generated, raw kinds map to /records.
 const SYNTHESIZED_KINDS = new Set(["sop", "skill", "trajectory", "memory", "workflow"]);
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  // Team tools only surface when an enterprise token was discovered at boot.
-  // No token = consumer / non-admin user; their MCP looks identical to today.
-  const tools = TEAM_TOKEN ? [...TOOLS, ...TEAM_TOOLS] : TOOLS;
+  const { token } = discoverTeamConfig(teamApiOverride);
+  const tools = token ? [...TOOLS, ...TEAM_TOOLS] : TOOLS;
   return { tools };
 });
 
@@ -1149,6 +1157,10 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 | 3 | search-elements | Need UI structure: buttons, links, form fields |
 | 4 | frame-context | Need full detail for a specific moment (use frame_id from step 2) |
 
+For another/named device or an across-device question, use synced-devices to
+resolve the device name, then search-synced-content. Keep search-content for the
+current machine. Synced results must be attributed with their device and timestamp.
+
 ## Search Strategy
 
 - **Always provide start_time** — without it, search scans the entire history
@@ -1164,6 +1176,8 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 - "What did I discuss in my meeting?" → list-meetings to find it, then get-meeting with include_transcript=true
 - "When did I last talk to <person>?" → list-meetings with q=<name or email>, NO start_time (q searches all history)
 - "Find when I was on Twitter" → search-content with app_name='Arc' (or the browser name), q='twitter'
+- "What was I doing on my MacBook this morning?" → synced-devices, then search-synced-content with device_name='MacBook' and the requested time window
+- "Find this across my devices" → search-synced-content with the requested time window and no device filter
 - "Remember that I prefer X" → update-memory with content describing the preference
 - "What do you remember about X?" → search-content with content_type='memory', q='X'
 - "Automate X every day / on a schedule" → read the screenpipe://guide/pipes resource, then create-pipe (a scheduled AI automation)
@@ -1173,6 +1187,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 When referencing specific moments in results, create clickable links:
 - Frame: [10:30 AM — Chrome](screenpipe://frame/{frame_id}) — use frame_id from search results
 - Timeline: [meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z) — use exact timestamp from results
+- Chat: [crm](screenpipe://chat/{conversationId}) — use a real conversation id
 Never fabricate IDs or timestamps — only use values from actual results.
 `,
         },
@@ -1288,6 +1303,13 @@ class BackendHttpError extends Error {
   }
 }
 
+function currentMcpClient() {
+  return resolveMcpClient(
+    process.env.SCREENPIPE_MCP_CLIENT,
+    server.getClientVersion()?.name,
+  );
+}
+
 async function fetchAPI(
   endpoint: string,
   options: RequestInit = {}
@@ -1303,6 +1325,7 @@ async function fetchAPI(
         "Content-Type": "application/json",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         "x-screenpipe-client": "mcp",
+        "x-screenpipe-agent": currentMcpClient(),
         ...options.headers,
       },
     });
@@ -1332,11 +1355,7 @@ const qualifiedValue = createMcpQualifiedValueReporter((payload) =>
     method: "POST",
     body: JSON.stringify(payload),
   }),
-  () =>
-    resolveMcpClient(
-      process.env.SCREENPIPE_MCP_CLIENT,
-      server.getClientVersion()?.name,
-    ),
+  currentMcpClient,
 );
 
 // Zone label for a timestamp's HH:MM slice. The server serializes timestamps in
@@ -1388,6 +1407,8 @@ function screenTag(textSource: unknown): string {
 // ---------------------------------------------------------------------------
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === BUNDLED_SKILLS_TOOL.name) return readBundledSkills(args);
 
   if (!args) {
     throw new Error("Missing arguments");
@@ -1518,6 +1539,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: trimmed || "(no logs yet)" }] };
       }
 
+      case "synced-devices": {
+        const response = await callAPI("/data-sync/devices");
+        const data = await response.json();
+        const devices = Array.isArray(data.devices) ? data.devices : [];
+        if (devices.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: data.enabled === false
+                ? "Data Sync is off and no synced devices are available. Enable Data Sync in Screenpipe settings on the devices you want to query."
+                : "No synced devices are available yet. Enable Data Sync and let a device complete its first upload.",
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: devices
+              .map((device: any) =>
+                `${device.device_name} (${device.device_id}) — last synced ${device.last_synced_at}` +
+                `${device.platform ? ` — ${device.platform}` : ""}`
+              )
+              .join("\n"),
+          }],
+        };
+      }
+
+      case "search-synced-content": {
+        const params = new URLSearchParams();
+        for (const key of ["q", "device_name", "device_id", "app_name", "since", "until", "since_hours_ago", "limit"]) {
+          const value = args[key];
+          if (value !== null && value !== undefined && value !== "") {
+            params.set(key, String(value));
+          }
+        }
+        const response = await callAPI(`/data-sync/search?${params.toString()}`);
+        const data = await response.json();
+        const results = Array.isArray(data.results) ? data.results : [];
+        if (results.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: data.enabled === false
+                ? "No matching synced records. Data Sync is currently off, so no new records are uploading."
+                : "No matching synced records. Try a wider time range, confirm the device with synced-devices, or use a broader query.",
+            }],
+          };
+        }
+        const prefix = data.truncated
+          ? "Results are truncated; narrow the device, time range, or query.\n\n"
+          : "";
+        return {
+          content: [{
+            type: "text",
+            text: prefix + results.map((record: any) => {
+              const content = record.text || record.transcription || record.content || "";
+              return `[${record.device || record.device_id || "unknown device"}] ${record.t || "unknown time"}` +
+                `${record.app ? ` — ${record.app}` : ""}\n${truncateMiddle(String(content), DEFAULT_SEARCH_CONTENT_TRUNCATE)}`;
+            }).join("\n\n"),
+          }],
+        };
+      }
+
       case "search-content": {
         const includeFrames = args.include_frames === true;
         const normalized = normalizeTimeFields(args);
@@ -1566,6 +1650,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         for (const result of results) {
           const content = result.content;
           if (!content) continue;
+          if (result.starred) formattedResults.push("[Starred moment]");
 
           if (result.type === "OCR") {
             const tagsStr = content.tags?.length ? `\nTags: ${content.tags.join(", ")}` : "";
@@ -1599,6 +1684,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `${content.timestamp || ""}\n` +
                 `${truncateMiddle(content.text || "", effectiveCap)}`
             );
+          } else if (result.type === "Input") {
+            formattedResults.push(inputEventContent(content, effectiveCap));
           } else if (result.type === "Memory") {
             const tagsStr = content.tags?.length ? ` [${content.tags.join(", ")}]` : "";
             const importance =
@@ -1747,9 +1834,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "Error: frame_id is required" }] };
         }
 
-        const response = await callAPI(`/frames/${frameId}/context`);
+        const response = await callAPI(`/frames/${frameId}/context${args.purpose === "automation" ? "?include_empty=true" : ""}`);
 
         const data = await response.json();
+        if (args.purpose === "automation") return frameAutomationContent(data, args);
         const lines = [`Frame ${data.frame_id} (source: ${data.text_source})`];
 
         if (data.text || data.nodes?.length || data.urls?.length) {
@@ -2237,6 +2325,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "list-workflows":
+      case "get-workflow":
+        return await readWorkflowTool(name, args, callAPI);
+
       case "get-frame-elements": {
         const frameId = args.frame_id as number;
         if (!frameId) {
@@ -2280,16 +2372,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // ---------------------------------------------------------------------
-      // Enterprise team tools — only callable when TEAM_TOKEN is set at boot.
-      // If we got this far without one, the tool wasn't in the listed set the
-      // host saw, but a misbehaving client could still try to call it. Fail
-      // loudly so the host surfaces the misconfiguration.
+      // Resolve again for every call: saved credentials can change while the
+      // host keeps this MCP process and its previously listed tools alive.
       // ---------------------------------------------------------------------
       case "team-search":
       case "team-devices":
-      case "team-records": {
-        if (!TEAM_TOKEN) {
+      case "team-records":
+      case "team-frame": {
+        const teamConfig = discoverTeamConfig(teamApiOverride);
+        if (!teamConfig.token) {
           return {
+            isError: true,
             content: [
               {
                 type: "text",
@@ -2303,10 +2396,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   `their own query gateway use the token their gateway accepts, ` +
                   `and must ALSO point this MCP at that gateway — ` +
                   `SCREENPIPE_TEAM_API_URL=https://<gateway>/api/enterprise/v1 ` +
-                  `(or --team-api-url). Requests currently go to ${TEAM_API}.`,
+                  `(or --team-api-url). Requests currently go to ${teamConfig.apiBase}.`,
               },
             ],
           };
+        }
+        if (name === "team-frame") {
+          const deviceId = args.device_id;
+          const frameId = args.frame_id;
+          const path = teamFramePath(deviceId, frameId);
+          const response = await fetchTeam(path, teamConfig);
+          return teamFrameContent(response, deviceId as string, frameId as number);
         }
         // Map MCP tool name → /api/enterprise/v1 path. team-records also
         // routes synthesized pipe outputs (kind=sop|skill|...) to the
@@ -2327,7 +2427,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
         const query = params.toString();
-        const response = await fetchTeam(`${subpath}${query ? `?${query}` : ""}`);
+        const response = await fetchTeam(`${subpath}${query ? `?${query}` : ""}`, teamConfig);
         const body = await response.text();
         if (!response.ok) {
           throw new Error(

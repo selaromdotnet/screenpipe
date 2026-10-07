@@ -127,6 +127,7 @@ describe("AppEntitlementGate", () => {
     // Production-like env so the dev billing bypass stays off and the gate runs.
     vi.stubEnv("TAURI_ENV_DEBUG", "false");
     vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS", "false");
+    vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_DEV_LOGIN_SKIP", "false");
     mocks.state = { isSettingsLoaded: true, user: null };
     mocks.enterpriseResolutionError = false;
     mocks.windowLabel = "home";
@@ -139,10 +140,41 @@ describe("AppEntitlementGate", () => {
     };
   });
 
+  it("lets the explicit dev login-skip build reach the app without a user", () => {
+    vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_DEV_LOGIN_SKIP", "true");
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+  });
+
+  it("lets the dev login-skip build through with partial tokenless user state", () => {
+    vi.stubEnv("NEXT_PUBLIC_SCREENPIPE_DEV_LOGIN_SKIP", "true");
+    mocks.state.user = { id: "dev-partial-user" };
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(screen.queryByText(/sign in required/i)).not.toBeInTheDocument();
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+  });
+
   afterEach(() => {
     cleanup();
     window.history.replaceState({}, "", "/");
     vi.unstubAllEnvs();
+  });
+
+  it("starts the application without an account when authentication is not required", () => {
+    render(
+      <AppEntitlementGate authenticationStatus="not_required">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 
   it("leaves enterprise authentication on the onboarding login step", () => {
@@ -159,6 +191,104 @@ describe("AppEntitlementGate", () => {
 
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
     expect(screen.queryByText(/enterprise access/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps an ordinary signed-in consumer in onboarding", () => {
+    window.history.replaceState({}, "", "/onboarding");
+    mocks.state.user = baseUser();
+
+    render(
+      <AppEntitlementGate authenticationStatus="logged_out">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/enterprise app required/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("gates a restricted enterprise member as soon as onboarding sign-in resolves", () => {
+    window.history.replaceState({}, "", "/onboarding");
+    mocks.windowLabel = "onboarding";
+
+    const { rerender } = render(
+      <AppEntitlementGate authenticationStatus="logged_out">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+
+    mocks.state.user = baseUser({
+      app_entitled: true,
+      cloud_subscribed: true,
+      subscription_plan: "pro",
+      enterprise_account: {
+        org_name: "Bungalow",
+        role: "member",
+        requires_enterprise_app: true,
+        restrict_consumer_build_access: true,
+      },
+      entitlement: {
+        active: true,
+        plan: "pro",
+        source: "subscription",
+        checked_at: minsAgo(1),
+        features: { app: true, cloud: true },
+      },
+    });
+    rerender(
+      <AppEntitlementGate authenticationStatus="logged_out">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.getByText(/enterprise app required/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
+  });
+
+  it("does not misclassify a cached restricted user before build detection resolves", () => {
+    window.history.replaceState({}, "", "/onboarding");
+    mocks.state.user = baseUser({
+      enterprise_account: {
+        org_name: "Bungalow",
+        role: "member",
+        requires_enterprise_app: true,
+        restrict_consumer_build_access: true,
+      },
+    });
+    mocks.enterprise.isManagedDeploymentResolved = false;
+
+    const { rerender } = render(
+      <AppEntitlementGate authenticationStatus="logged_out">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/enterprise app required/i),
+    ).not.toBeInTheDocument();
+
+    mocks.enterprise = {
+      isManagedDeployment: true,
+      isManagedDeploymentResolved: true,
+      authenticationState: "choice",
+      authenticationError: null,
+      isManagedAuthenticated: false,
+    };
+    rerender(
+      <AppEntitlementGate authenticationStatus="logged_out">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/enterprise app required/i),
+    ).not.toBeInTheDocument();
   });
 
   it("waits for build detection before stopping a gated session", async () => {
@@ -254,7 +384,7 @@ describe("AppEntitlementGate", () => {
     },
   );
 
-  it("resumes recording when a real enterprise gate authenticates", async () => {
+  it("leaves Enterprise stop and resume to native auth", async () => {
     mocks.enterprise = {
       isManagedDeployment: true,
       isManagedDeploymentResolved: true,
@@ -266,13 +396,16 @@ describe("AppEntitlementGate", () => {
     const { rerender } = render(
       <AppEntitlementGate>{protectedApp}</AppEntitlementGate>,
     );
-    await waitFor(() => expect(mocks.stopScreenpipe).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
 
     mocks.enterprise.authenticationState = "authenticated";
     mocks.enterprise.isManagedAuthenticated = true;
     rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    await waitFor(() => expect(mocks.spawnScreenpipe).toHaveBeenCalledWith(null));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+    expect(mocks.spawnScreenpipe).not.toHaveBeenCalled();
     expect(mocks.capture).toHaveBeenCalledWith(
       "enterprise_auth_recording_restored",
       { authentication_state: "authenticated" },
@@ -348,7 +481,8 @@ describe("AppEntitlementGate", () => {
     expect(screen.getByText(/account associated with the enterprise organization/i)).toBeInTheDocument();
     expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
 
-    await waitFor(() => expect(mocks.stopScreenpipe).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: /^sign in$/i }));
     expect(mocks.openLoginWindow).toHaveBeenCalled();
   });
@@ -831,6 +965,32 @@ describe("AppEntitlementGate", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+  });
+
+  it("routes restricted enterprise members away even with a consumer subscription", () => {
+    mocks.state.user = baseUser({
+      app_entitled: true,
+      cloud_subscribed: true,
+      subscription_plan: "pro",
+      enterprise_account: {
+        org_name: "Bungalow",
+        role: "member",
+        requires_enterprise_app: true,
+        restrict_consumer_build_access: true,
+      },
+      entitlement: {
+        active: true,
+        plan: "pro",
+        source: "subscription",
+        checked_at: minsAgo(1),
+        features: { app: true, cloud: true },
+      },
+    });
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(screen.getByText(/enterprise app required/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
   });
 
   it.each(["pro_max", "pro_ultra"] as const)(

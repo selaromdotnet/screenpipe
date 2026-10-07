@@ -34,6 +34,8 @@
 //! section in `AGENTS.md` before touching those.
 
 pub mod activity_ledger;
+pub(crate) mod agent_profile;
+pub(crate) mod agent_skills;
 pub mod analytics;
 pub mod archive;
 mod atomic_file;
@@ -58,13 +60,16 @@ pub mod focus_tracker;
 pub mod frame_linker;
 pub mod frame_linker_actor;
 pub mod hd_recorder;
+pub mod health_identity;
 pub mod high_fps_controller;
+pub mod history_access;
 pub mod hot_frame_cache;
 pub mod live_views;
 pub mod local_chat;
 pub mod logging;
 pub mod mcp_servers_api;
 pub mod meeting_export;
+pub mod meeting_summary;
 pub mod meeting_watcher;
 mod oauth_result_page;
 pub mod permission_monitor;
@@ -79,6 +84,7 @@ pub mod process_priority;
 mod qualified_value;
 pub mod recording_config;
 pub mod recording_coverage;
+pub mod recording_detail;
 mod resource_monitor;
 pub mod retention;
 pub mod routes;
@@ -123,3 +129,4 @@ pub use sleep_monitor::start_sleep_monitor;
 pub use snapshot_compaction::start_snapshot_compaction;
 pub use ui_recorder::{start_ui_recording, UiRecorderConfig, UiRecorderHandle};
 pub use video::{video_quality_to_crf, video_quality_to_jpeg_q, video_quality_to_preset};
+pub mod search_only;

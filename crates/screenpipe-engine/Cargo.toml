@@ -14,15 +14,19 @@ edition = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+screenpipe-fs = { path = "../screenpipe-fs" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+json5 = "0.4.1"
+jsonc-parser = { version = "0.33.2", features = ["cst", "serde_json"] }
+serde_yaml = { workspace = true }
 libc = { workspace = true }
 oasgen = { workspace = true }
 
 screenpipe-events = { path = "../screenpipe-events" }
 screenpipe-screen = { path = "../screenpipe-screen" }
 screenpipe-audio = { path = "../screenpipe-audio" }
-screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
+screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets", "acp"] }
 screenpipe-db = { path = "../screenpipe-db" }
 screenpipe-redact = { path = "../screenpipe-redact", features = ["opf-text"] }
 screenpipe-resource = { path = "../screenpipe-resource" }
@@ -143,8 +147,11 @@ dhat = { version = "0.3", optional = true }
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["functions"] }
+tokio = { workspace = true, features = ["test-util"] }
 chrono-tz = "0.10"
 env_logger = { workspace = true }
+serial_test = "3.2.0"
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tower = { version = "0.4", features = ["util"] }
@@ -165,6 +172,7 @@ criterion = { workspace = true }
 # it, `cargo {check,clippy,build} -p screenpipe-engine` (no --features) fails
 # to compile. Mac/Win release builds layer redact-onnx-{coreml,directml} on top.
 default = ["qwen3-asr", "parakeet", "redact-onnx-cpu"]
+e2e = []
 metal = ["screenpipe-audio/metal"]
 heap-prof = ["dhat"]
 cuda = ["screenpipe-audio/cuda"]

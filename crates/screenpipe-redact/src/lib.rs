@@ -175,6 +175,28 @@ pub trait Redactor: Send + Sync {
     /// trait for logs and human triage.
     fn version(&self) -> u32;
 
+    /// Stable provenance used by generation-scoped storage completion.
+    fn policy_identity(&self) -> String {
+        format!("{}:{}", self.name(), self.version())
+    }
+
+    /// Completion-sensitive storage processing propagates detector failures.
+    /// Composite adapters override this when ordinary reads permit fallback.
+    async fn redact_complete(&self, text: &str) -> Result<RedactionOutput, RedactError> {
+        self.redact(text).await
+    }
+
+    /// Preferred number of inputs for one backend inference call.
+    ///
+    /// The default preserves the historical one-input-at-a-time behavior for
+    /// adapters whose `redact_batch` implementation is only a convenience
+    /// loop (or a sequence of remote requests). Backends with a real batched
+    /// execution path can opt in so [`Pipeline`] coalesces cache misses before
+    /// invoking them.
+    fn preferred_batch_size(&self) -> usize {
+        1
+    }
+
     /// Redact one input. Default impl forwards to `redact_batch` so
     /// implementors can focus on the batch path.
     async fn redact(&self, text: &str) -> Result<RedactionOutput, RedactError> {

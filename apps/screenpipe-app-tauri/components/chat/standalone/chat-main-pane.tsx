@@ -4,7 +4,7 @@
 "use client";
 
 import * as React from "react";
-import { ChevronDown, Settings, Workflow } from "lucide-react";
+import { Settings, Workflow } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SummaryCards } from "@/components/chat/summary-cards";
 import { FirstRunLearningBanner } from "@/components/first-run/learning-banner";
@@ -14,10 +14,13 @@ import { PipeAIIconLarge } from "@/components/pipe-ai-icon";
 import { InlineChatHistory } from "@/components/chat/standalone/inline-chat-history";
 import { ChatMessageList, type ChatMessageListProps } from "@/components/chat/standalone/chat-message-list";
 import type { ConversationMeta } from "@/lib/chat-storage";
-import type { AIPreset } from "@/lib/utils/tauri";
 import { cn } from "@/lib/utils";
 import type { Message } from "@/lib/chat/types";
 import type { ContinuousPipeChatPolicy } from "@/lib/pipe-chat-policy";
+import { useOptionalFirstRunLearningWindow } from "@/components/first-run/learning-window-provider";
+import { hasRenderableAssistantBody } from "@/lib/chat/message-rendering";
+import { useGT } from "gt-react";
+
 
 const CHAT_RAIL_CLASS = "max-w-4xl mx-auto w-full";
 
@@ -27,14 +30,8 @@ type ActivePipeExecution = {
 } | null;
 
 interface ChatMainPaneProps {
-  /** Only the Home webview owns the first-summary lifecycle. */
+  /** Only visible Home presents the first-summary lifecycle owned by the main layout. */
   firstRunLearningEnabled?: boolean;
-  /** Preset the first-run summary is written with, and the token it needs.
-   *  Passed down rather than read here so this pane (and the banner below it)
-   *  stay renderable without a settings provider. */
-  firstRunAiPreset?: AIPreset | null;
-  firstRunUserToken?: string | null;
-  firstRunAiSettingsLoaded?: boolean;
   hideInlineHistory?: boolean;
   showHistory: boolean;
   onCloseHistory: () => void;
@@ -73,8 +70,6 @@ interface ChatMainPaneProps {
    * user's bubble so the transcript is never empty during the preflight.
    */
   pendingSend?: { text: string; displayLabel?: string } | null;
-  isUserScrolledUp: boolean;
-  scrollToBottom: () => void;
 }
 
 export function ChatMainPane({
@@ -110,12 +105,57 @@ export function ChatMainPane({
   homeStarterProps,
   messageListProps,
   pendingSend,
-  isUserScrolledUp,
-  scrollToBottom,
-  firstRunAiPreset,
-  firstRunUserToken,
-  firstRunAiSettingsLoaded,
 }: ChatMainPaneProps) {
+
+  const ui = useGT();
+  const firstRun = useOptionalFirstRunLearningWindow();
+  const learning = firstRun?.learning;
+  const summaryRenderedRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (
+      !firstRunLearningEnabled ||
+      learning?.phase !== "ready" ||
+      !learning.chatId ||
+      conversationId !== learning.chatId ||
+      isLoading ||
+      !messages.some(
+        (message) =>
+          message.role === "assistant" && hasRenderableAssistantBody(message),
+      ) ||
+      summaryRenderedRef.current === learning.chatId
+    ) {
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      summaryRenderedRef.current = learning.chatId;
+      void learning.markSummaryRendered().catch(() => {
+        summaryRenderedRef.current = null;
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [
+    conversationId,
+    firstRunLearningEnabled,
+    isLoading,
+    learning,
+    messages,
+  ]);
+
+  const homeStarter =
+    messages.length === 0 &&
+    !pendingSend &&
+    !isPreparingPrefill &&
+    !activePipeExecution &&
+    !isLoading &&
+    !isStreaming &&
+    hasPresets &&
+    hasValidModel ? (
+      <HomeStarterSurface
+        summaryCardsProps={summaryCardsProps}
+        {...homeStarterProps}
+      />
+    ) : null;
+
   return (
     <div className="flex-1 flex overflow-hidden">
       <InlineChatHistory
@@ -158,21 +198,21 @@ export function ChatMainPane({
                 <div className="min-w-0 flex-1">
                   <p className="text-xs font-medium">
                     {continuousPipeChat.state === "on"
-                      ? "one chat"
+                      ? ui("One chat")
                       : continuousPipeChat.state === "off"
-                        ? "memory paused"
+                        ? ui("Memory paused")
                         : continuousPipeChat.state === "missing"
-                          ? "scheduled task unavailable"
-                          : "checking one-chat memory"}
+                          ? ui("Scheduled task unavailable")
+                          : ui("Checking one-chat memory")}
                   </p>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">
                     {continuousPipeChat.state === "on"
-                      ? "Future runs and your replies share context here."
+                      ? ui("Future runs and your replies share context here.")
                       : continuousPipeChat.state === "off"
-                        ? "Future runs start separate chats. Saved context stays here until you clear it."
+                        ? ui("Future runs start separate chats. Saved context stays here until you clear it.")
                         : continuousPipeChat.state === "missing"
-                          ? "This transcript is kept, but replies are disabled until you reinstall the task."
-                          : "The saved transcript is available while screenpipe checks the current task setting."}
+                          ? ui("This transcript is kept, but replies are disabled until you reinstall the task.")
+                          : ui("The saved transcript is available while screenpipe checks the current task setting.")}
                   </p>
                 </div>
                 <Button
@@ -182,7 +222,7 @@ export function ChatMainPane({
                   className="h-7 shrink-0 px-2 text-[11px]"
                   onClick={onOpenPipeSettings}
                 >
-                  manage
+                  Manage
                 </Button>
               </div>
             )}
@@ -200,7 +240,7 @@ export function ChatMainPane({
               disabledReason &&
               (!hasPresets || !hasValidModel || needsLogin) && (
                 <div className="relative flex flex-col items-center justify-center py-12 space-y-4">
-                  <div className="relative p-6 rounded-2xl border bg-muted/50 border-border/50">
+                  <div className="relative p-6 rounded-lg border bg-muted/50 border-border/50">
                     {needsLogin ? (
                       <PipeAIIconLarge size={48} thinking={false} className="text-muted-foreground" />
                     ) : (
@@ -210,15 +250,15 @@ export function ChatMainPane({
                   <div className="text-center space-y-2">
                     <h3 className="font-semibold tracking-tight">
                       {!hasPresets
-                        ? "No AI Presets"
+                        ? ui("No AI Presets")
                         : !hasValidModel
-                          ? "No Model Selected"
+                          ? ui("No Model Selected")
                           : needsLogin
-                            ? "Login to continue"
-                            : "Setup Required"}
+                            ? ui("Login to continue")
+                            : ui("Setup Required")}
                     </h3>
                     <p className="text-sm text-muted-foreground max-w-sm">
-                      {needsLogin ? "Sign in to use the AI assistant" : disabledReason}
+                      {needsLogin ? ui("Sign in to use the AI assistant") : disabledReason}
                     </p>
                   </div>
                   {needsLogin && (
@@ -239,40 +279,24 @@ export function ChatMainPane({
                   )}
                 </div>
               )}
-            {/* Post-setup learning window. Home is the single owner; the
-                separate Chat webview must not start a second copy from the
-                same onboarding timestamp. It sits on Home's chat because that
-                is where setup lands and where the summary appears once ready.
+            {/* Post-setup learning window presentation. The persistent main
+                layout owns the work and notification; Home only shows its
+                current state where setup lands and the result opens.
 
-                Deliberately NOT gated on `messages.length === 0`. The window
-                owns a ceiling timer, and unmounting the banner kills it: the
-                user sends one message, this subtree goes away mid-wait, and
-                the window never settles — no summary, and no
-                `first_run_learning_resolved`/`_empty` either, so the failure
-                is invisible. Typing is the behaviour we want, so it must not
-                destroy the first-run summary. Measured 2026-08: 69% of users
-                who completed setup produced no learning event at all while
-                staying in the app a median of 9.4 hours. */}
+                Deliberately NOT gated on `messages.length === 0`. The state
+                must remain visible after the user sends a message. Typing is
+                the behaviour we want, so it must not hide the result. */}
             {firstRunLearningEnabled && !activePipeExecution && (
-              <FirstRunLearningBanner
-                aiPreset={firstRunAiPreset}
-                userToken={firstRunUserToken}
-                aiSettingsLoaded={firstRunAiSettingsLoaded}
-              />
+              <FirstRunLearningBanner fallback={homeStarter} />
             )}
-            {messages.length === 0 &&
-              !pendingSend &&
-              !isPreparingPrefill &&
-              !activePipeExecution &&
-              !isLoading &&
-              !isStreaming &&
-              hasPresets &&
-              hasValidModel && (
-                <HomeStarterSurface
-                  summaryCardsProps={summaryCardsProps}
-                  {...homeStarterProps}
-                />
-              )}
+            {!firstRunLearningEnabled && homeStarter}
+            {/* A conversation switch is a hard visual boundary. Remounting the
+                list prevents AnimatePresence from carrying an outgoing chat's
+                exit nodes into the new chat's empty state. */}
+            <ChatMessageList
+              key={conversationId ?? "blank-chat"}
+              {...messageListProps}
+            />
             {/* The message the user just sent, shown from the send frame until
                 the durable row replaces it. Same geometry as a real user row so
                 nothing moves when the swap happens. */}
@@ -282,7 +306,7 @@ export function ChatMainPane({
                 className="relative flex min-w-0 justify-end"
               >
                 <div className="group/message flex min-w-0 max-w-[82%] flex-col items-end">
-                  <div className="relative max-w-full overflow-hidden rounded-xl bg-muted/60 px-4 py-3 text-sm text-foreground">
+                  <div className="relative max-w-full overflow-hidden rounded-lg bg-muted/60 px-4 py-3 text-sm text-foreground">
                     <p className="whitespace-pre-wrap break-words">
                       {pendingSend.displayLabel ?? pendingSend.text}
                     </p>
@@ -290,28 +314,10 @@ export function ChatMainPane({
                 </div>
               </div>
             )}
-            {/* A conversation switch is a hard visual boundary. Remounting the
-                list prevents AnimatePresence from carrying an outgoing chat's
-                exit nodes into the new chat's empty state. */}
-            <ChatMessageList
-              key={conversationId ?? "blank-chat"}
-              {...messageListProps}
-            />
 
             <div ref={messagesEndRef} />
           </div>
         </div>
-
-        {isUserScrolledUp && messages.length > 0 && (
-          <button
-            onClick={scrollToBottom}
-            data-testid="chat-new-content"
-            className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary text-primary-foreground shadow-lg text-xs font-medium hover:bg-primary/90 transition-opacity animate-in fade-in slide-in-from-bottom-2 duration-200"
-          >
-            <ChevronDown className="h-3.5 w-3.5" />
-            new content
-          </button>
-        )}
       </div>
     </div>
   );

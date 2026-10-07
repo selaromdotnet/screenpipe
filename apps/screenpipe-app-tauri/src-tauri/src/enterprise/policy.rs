@@ -16,16 +16,38 @@ use std::sync::{Mutex, RwLock};
 
 static HIDDEN_SECTIONS: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
 static SERVER_POLICY_RECEIVED: AtomicBool = AtomicBool::new(false);
+// A process-local grant set only after the control plane accepts an enterprise
+// credential. It is deliberately not restored from disk: the presence of an
+// `enterprise.json` or registry key proves enrollment intent, not that the key
+// is still valid or that the account remains a member.
+static RECORDING_AUTHORIZED: AtomicBool = AtomicBool::new(false);
 static IMMUTABLE_DEPLOYMENT_APP_UI_HIDDEN: Lazy<bool> =
     Lazy::new(|| env_hides_app_ui() || bundled_enterprise_config_hides_app_ui());
 static PERSISTED_APP_UI_HIDDEN: Lazy<bool> = Lazy::new(user_enterprise_config_hides_app_ui);
+// Tray suppression is a SEPARATE axis from `is_app_ui_hidden()`.
+//
+// Hiding the app UI tears down windows and drops the dock icon but deliberately
+// keeps the menu-bar item, because that tray is the employee's only in-app
+// affordance: it is where pause lives, and it is the only signal that capture is
+// running. An org that also removes the tray gets an app with no UI at all, so
+// this is gated behind an explicit admin decision rather than being implied by
+// the existing hidden-UI policy — a silent change to existing deployments would
+// strip their pause control without anyone asking for it.
+//
+// This is an app-surface policy only. It does not touch, and cannot touch, the
+// macOS screen-recording and microphone indicators: those are drawn by the OS
+// for any capture session and are not suppressible by the app.
+static IMMUTABLE_DEPLOYMENT_TRAY_HIDDEN: Lazy<bool> =
+    Lazy::new(|| env_hides_tray() || bundled_enterprise_config_hides_tray());
+static PERSISTED_TRAY_HIDDEN: Lazy<bool> = Lazy::new(user_enterprise_config_hides_tray);
 static ENFORCE_AUTO_START: Lazy<AtomicBool> =
     Lazy::new(|| AtomicBool::new(read_persisted_enforce_auto_start()));
 static POLICY_UPDATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-/// Per-stream sync policy. Defaults to all-true so an unconfigured device
-/// behaves exactly like before this feature shipped. The frontend pulls the
-/// admin's choices from `GET /api/enterprise/policy` (`syncStreams` field) on
+/// Per-stream sync policy. Established streams preserve their historical
+/// defaults, while richer semantic streams require an explicit opt-in. The
+/// frontend pulls the admin's choices from `GET /api/enterprise/policy`
+/// (`syncStreams` field) on
 /// the 5-min poll and pushes them in via `set_sync_streams`. The sync state
 /// machine in `enterprise_sync::run_one_sync` reads this on every tick.
 /// How many frame images (screenshots) may leave this device — the org's
@@ -100,6 +122,7 @@ impl FeedbackSyncMode {
 pub struct SyncStreams {
     pub frames: bool,
     pub parsed: bool,
+    pub activities: bool,
     pub audio: bool,
     pub ui_events: bool,
     pub memories: bool,
@@ -113,6 +136,7 @@ impl Default for SyncStreams {
         Self {
             frames: true,
             parsed: false,
+            activities: false,
             audio: true,
             ui_events: true,
             memories: true,
@@ -131,6 +155,27 @@ const APP_UI_HIDDEN_SECTIONS: &[&str] = &[
     "managed_background",
     "tray_open_app",
 ];
+
+/// Control-plane section ids that additionally suppress the tray icon.
+///
+/// These ride the existing `hidden_sections` channel rather than a new command
+/// argument, so an admin enabling tray suppression needs no client change and no
+/// binding regeneration. Deliberately NOT part of `APP_UI_HIDDEN_SECTIONS`: a
+/// tray-only policy must not imply the app UI is hidden, or the two axes could
+/// never be reasoned about independently.
+///
+/// # Control-plane contract
+///
+/// The producer of `hidden_sections` is the hosted `/api/enterprise/policy`
+/// endpoint, which is NOT in this repository. Adding a value here does not make
+/// it selectable in the admin UI; that requires a matching change server-side.
+/// This client treats any of the three ids below as equivalent and is a no-op
+/// until the server emits one, so the two sides can ship in any order.
+///
+/// Precedence is unchanged by this axis: an immutable deployment env
+/// (`SCREENPIPE_ENTERPRISE_HIDE_TRAY`) or bundled `hide_tray` still wins over
+/// the server, matching how `app_ui` suppression is enforced.
+const TRAY_HIDDEN_SECTIONS: &[&str] = &["tray", "hide_tray", "tray_icon"];
 
 fn truthy(value: &str) -> bool {
     matches!(
@@ -155,6 +200,18 @@ fn env_hides_app_ui() -> bool {
                 )
             })
             .unwrap_or(false)
+}
+
+/// Managed-deployment escape hatch for suppressing the tray. Separate from
+/// `SCREENPIPE_ENTERPRISE_HIDE_APP` so an org can run the app with no windows
+/// but keep the tray (the existing hidden-UI contract), or go fully
+/// surface-free without changing the other variable's meaning.
+fn env_hides_tray() -> bool {
+    std::env::var("SCREENPIPE_ENTERPRISE_HIDE_TRAY")
+        .ok()
+        .as_deref()
+        .map(truthy)
+        .unwrap_or(false)
 }
 
 fn bundled_enterprise_config_path() -> Option<std::path::PathBuf> {
@@ -285,13 +342,59 @@ fn user_enterprise_config_hides_app_ui() -> bool {
     enterprise_config_hides_app_ui(&user_enterprise_config_path())
 }
 
+/// Read the tray-suppression flag from a deployment or user enterprise config.
+///
+/// Mirrors `enterprise_config_hides_app_ui`: an explicit boolean `hide_tray` on
+/// the bundled (immutable, MDM-pushed) config or the user file. Absence stays
+/// false, so existing deployments keep their tray.
+fn enterprise_config_hides_tray(path: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+
+    json.get("hide_tray")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn bundled_enterprise_config_hides_tray() -> bool {
+    bundled_enterprise_config_path()
+        .as_deref()
+        .map(enterprise_config_hides_tray)
+        .unwrap_or(false)
+}
+
+fn user_enterprise_config_hides_tray() -> bool {
+    enterprise_config_hides_tray(&user_enterprise_config_path())
+}
+
 fn hidden_sections_hide_app_ui(hidden_sections: &HashSet<String>) -> bool {
     APP_UI_HIDDEN_SECTIONS
         .iter()
         .any(|section| hidden_sections.contains(*section))
 }
 
+fn hidden_sections_hide_tray(hidden_sections: &HashSet<String>) -> bool {
+    TRAY_HIDDEN_SECTIONS
+        .iter()
+        .any(|section| hidden_sections.contains(*section))
+}
+
 fn resolve_app_ui_hidden(
+    immutable_deployment_hidden: bool,
+    server_policy_hidden: Option<bool>,
+    persisted_hidden: bool,
+) -> bool {
+    immutable_deployment_hidden || server_policy_hidden.unwrap_or(persisted_hidden)
+}
+
+/// Same precedence as `resolve_app_ui_hidden`: an immutable deployment override
+/// (env var / MDM-pushed bundled config) always wins; otherwise the server's
+/// last answer supersedes the user-file snapshot, including a server `false`.
+fn resolve_tray_hidden(
     immutable_deployment_hidden: bool,
     server_policy_hidden: Option<bool>,
     persisted_hidden: bool,
@@ -342,6 +445,26 @@ pub fn set_enterprise_policy(hidden_sections: Vec<String>, enforce_auto_start: b
     }
 }
 
+/// Update the process-local Enterprise recording grant. This is intentionally
+/// not a Tauri command: webview callers must pass through the native
+/// control-plane verification in `enterprise_recording_access`. Returns true
+/// only for a transition, so concurrent grants cannot each resume capture.
+pub(crate) fn update_recording_authorized(authorized: bool) -> bool {
+    let previous = RECORDING_AUTHORIZED.swap(authorized, Ordering::SeqCst);
+    if previous != authorized {
+        tracing::info!(
+            "enterprise: recording authorization {}",
+            if authorized { "granted" } else { "revoked" }
+        );
+    }
+    previous != authorized
+}
+
+/// Current process-local Enterprise recording grant.
+pub fn recording_authorized() -> bool {
+    RECORDING_AUTHORIZED.load(Ordering::SeqCst)
+}
+
 /// Current startup enrollment policy. The first read restores the last
 /// successfully persisted server decision so enforcement survives an offline
 /// restart. Only an explicit cached boolean `true` enables it.
@@ -369,9 +492,14 @@ pub fn set_sync_streams(
 ) {
     let feedback = FeedbackSyncMode::parse(&feedback);
     let frame_images = FrameImagesMode::parse(&frame_images);
+    let activities = SYNC_STREAMS
+        .read()
+        .map(|guard| guard.activities)
+        .unwrap_or(false);
     let next = SyncStreams {
         frames,
         parsed,
+        activities,
         audio,
         ui_events,
         memories,
@@ -382,9 +510,10 @@ pub fn set_sync_streams(
     if let Ok(mut guard) = SYNC_STREAMS.write() {
         if *guard != next {
             tracing::info!(
-                "enterprise: sync streams updated frames={} parsed={} audio={} ui={} memories={} snapshots={} feedback={} frame_images={}",
+                "enterprise: sync streams updated frames={} parsed={} activities={} audio={} ui={} memories={} snapshots={} feedback={} frame_images={}",
                 frames,
                 parsed,
+                activities,
                 audio,
                 ui_events,
                 memories,
@@ -397,10 +526,20 @@ pub fn set_sync_streams(
     }
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn set_activity_sync_enabled(activities: bool) {
+    if let Ok(mut guard) = SYNC_STREAMS.write() {
+        if guard.activities != activities {
+            tracing::info!("enterprise: activity sync stream updated activities={activities}");
+            guard.activities = activities;
+        }
+    }
+}
+
 /// Snapshot of the current per-stream sync policy. Read by the sync state
-/// machine on every tick. Returns the defaults (all-true) if the lock is
-/// poisoned — fail-open here mirrors the centralized-data master-switch
-/// behavior: the ingest endpoint will still enforce policy server-side.
+/// machine on every tick. Returns the per-stream defaults if the lock is
+/// poisoned; the ingest endpoint still enforces policy server-side.
 //
 // Available under `enterprise-build` (the sync state machine in
 // enterprise_sync::run_one_sync reads it on every tick) and under `test`.
@@ -436,6 +575,29 @@ pub fn is_app_ui_hidden() -> bool {
         *IMMUTABLE_DEPLOYMENT_APP_UI_HIDDEN,
         server_policy_hidden,
         *PERSISTED_APP_UI_HIDDEN,
+    )
+}
+
+/// True when the admin has suppressed the menu-bar tray icon.
+///
+/// Independent of [`is_app_ui_hidden`], and intentionally narrower than "hide
+/// everything": this only removes the app's own menu-bar surface. It does not
+/// and cannot suppress the macOS screen-recording or microphone indicators,
+/// which the OS draws for any capture session, and it never disables the
+/// recording pause control — see `initialize_recording_control_shortcuts` for
+/// the affordance that replaces the tray's Pause item.
+pub fn is_tray_hidden() -> bool {
+    let server_policy_hidden = SERVER_POLICY_RECEIVED.load(Ordering::SeqCst).then(|| {
+        HIDDEN_SECTIONS
+            .read()
+            .map(|guard| hidden_sections_hide_tray(&guard))
+            .unwrap_or(false)
+    });
+
+    resolve_tray_hidden(
+        *IMMUTABLE_DEPLOYMENT_TRAY_HIDDEN,
+        server_policy_hidden,
+        *PERSISTED_TRAY_HIDDEN,
     )
 }
 
@@ -482,6 +644,55 @@ mod tests {
     #[test]
     fn immutable_deployment_override_remains_authoritative() {
         assert!(resolve_app_ui_hidden(true, Some(false), false));
+    }
+
+    #[test]
+    fn tray_and_app_ui_axes_are_independent() {
+        // A tray-only policy must not imply the app UI is hidden, and hiding the
+        // app UI must not implicitly strip the tray. Existing deployments rely on
+        // the second half: hidden UI has always kept the tray.
+        for section in TRAY_HIDDEN_SECTIONS {
+            let hidden = HashSet::from([(*section).to_string()]);
+            assert!(hidden_sections_hide_tray(&hidden), "{section}");
+            assert!(!hidden_sections_hide_app_ui(&hidden), "{section}");
+        }
+
+        for section in APP_UI_HIDDEN_SECTIONS {
+            let hidden = HashSet::from([(*section).to_string()]);
+            assert!(hidden_sections_hide_app_ui(&hidden), "{section}");
+            assert!(!hidden_sections_hide_tray(&hidden), "{section}");
+        }
+    }
+
+    #[test]
+    fn fresh_server_policy_supersedes_persisted_tray_snapshot() {
+        assert!(resolve_tray_hidden(false, None, true));
+        assert!(!resolve_tray_hidden(false, Some(false), true));
+        assert!(resolve_tray_hidden(false, Some(true), false));
+    }
+
+    #[test]
+    fn immutable_deployment_override_keeps_tray_authoritative() {
+        assert!(resolve_tray_hidden(true, Some(false), false));
+    }
+
+    #[test]
+    fn tray_config_requires_explicit_boolean_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enterprise.json");
+
+        for body in [
+            r#"{}"#,
+            r#"{"hide_tray":false}"#,
+            r#"{"hide_tray":"true"}"#,
+            r#"{"hide_app":true}"#,
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert!(!enterprise_config_hides_tray(&path), "body={body}");
+        }
+
+        std::fs::write(&path, r#"{"hide_tray":true}"#).unwrap();
+        assert!(enterprise_config_hides_tray(&path));
     }
 
     #[test]
@@ -548,6 +759,7 @@ mod tests {
         let s = SyncStreams::default();
         assert!(s.frames);
         assert!(!s.parsed);
+        assert!(!s.activities);
         assert!(s.audio);
         assert!(s.ui_events);
         assert!(s.memories);

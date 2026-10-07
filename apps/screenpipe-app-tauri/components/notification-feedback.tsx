@@ -15,11 +15,14 @@ import {
 } from "@/lib/ai-feedback";
 import { qualifiedValue } from "@/lib/analytics/qualified-value";
 import { notificationAnalyticsProperties } from "@/lib/notification-analytics";
+import { useGT } from "gt-react";
+
 
 interface NotificationFeedbackProps {
   notification: FeedbackableNotification;
   submitFeedback?: typeof submitNotificationFeedback;
   variant?: "panel" | "inbox";
+  revealOnHover?: boolean;
 }
 
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -28,7 +31,10 @@ export function NotificationFeedback({
   notification,
   submitFeedback = submitNotificationFeedback,
   variant = "panel",
+  revealOnHover = true,
 }: NotificationFeedbackProps) {
+
+  const ui = useGT();
   const [rating, setRating] = useState<AiFeedbackRating | null>(null);
   const [correction, setCorrection] = useState("");
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -80,11 +86,11 @@ export function NotificationFeedback({
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    width: "24px",
-    height: "24px",
+    width: "20px",
+    height: "20px",
     padding: 0,
     border: "1px solid hsl(var(--border))",
-    borderRadius: 0,
+    borderRadius: "4px",
     background: selected ? "hsl(var(--foreground))" : "transparent",
     color: selected ? "hsl(var(--background))" : "hsl(var(--muted-foreground))",
     cursor: saveState === "saving" ? "wait" : "pointer",
@@ -93,119 +99,139 @@ export function NotificationFeedback({
 
   return (
     <div
-      className="ph-no-capture"
-      style={
-        variant === "inbox"
-          ? { padding: 0, marginTop: "8px" }
-          : { padding: "0 14px 8px 14px" }
+      className={
+        revealOnHover
+          ? "ph-no-capture pointer-events-none grid grid-rows-[0fr] opacity-0 transition-[grid-template-rows,opacity] duration-150 motion-reduce:transition-none group-hover/notif:pointer-events-auto group-hover/notif:grid-rows-[1fr] group-hover/notif:opacity-100 group-focus-within/notif:pointer-events-auto group-focus-within/notif:grid-rows-[1fr] group-focus-within/notif:opacity-100"
+          : "ph-no-capture"
       }
       data-testid="notification-feedback"
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-        <span
-          style={{
-            marginRight: "2px",
-            fontSize: "9px",
-            color: "hsl(var(--muted-foreground))",
-            fontFamily: '"IBM Plex Mono", monospace',
-          }}
+      <div className="min-h-0 overflow-hidden">
+        <div
+          style={
+            variant === "inbox"
+              ? { padding: 0, marginTop: "8px" }
+              : { padding: "0 14px 8px 14px" }
+          }
         >
-          useful?
-        </span>
-        <button
-          type="button"
-          onClick={selectUp}
-          disabled={saveState === "saving"}
-          aria-label="useful notification"
-          aria-pressed={rating === "up"}
-          title="useful"
-          style={iconButtonStyle(rating === "up")}
-        >
-          <ThumbsUp size={12} strokeWidth={1.8} />
-        </button>
-        <button
-          type="button"
-          onClick={selectDown}
-          disabled={saveState === "saving"}
-          aria-label="not useful notification"
-          aria-pressed={rating === "down"}
-          title="not useful"
-          style={iconButtonStyle(rating === "down")}
-        >
-          <ThumbsDown size={12} strokeWidth={1.8} />
-        </button>
-        {saveState === "saved" && rating === "up" && (
-          <span style={{ fontSize: "9px", color: "hsl(var(--muted-foreground))" }}>
-            saved
-          </span>
-        )}
+          {saveState === "saved" ? (
+            <div
+              role="status"
+              style={{
+                fontSize: "9px",
+                color: "hsl(var(--muted-foreground))",
+              }}
+            >
+              Feedback sent
+            </div>
+          ) : (
+            <>
+              <div
+                role="group"
+                aria-label={ui("Notification feedback options")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "4px",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={selectUp}
+                  disabled={saveState === "saving"}
+                  aria-label={ui("Useful notification")}
+                  aria-pressed={rating === "up"}
+                  title={ui("Useful")}
+                  style={iconButtonStyle(rating === "up")}
+                >
+                  <ThumbsUp size={9} strokeWidth={1.8} />
+                </button>
+                <button
+                  type="button"
+                  onClick={selectDown}
+                  disabled={saveState === "saving"}
+                  aria-label={ui("Not useful notification")}
+                  aria-pressed={rating === "down"}
+                  title={ui("Not useful")}
+                  style={iconButtonStyle(rating === "down")}
+                >
+                  <ThumbsDown size={9} strokeWidth={1.8} />
+                </button>
+              </div>
+              {rating === "down" && (
+                <form
+                  onSubmit={sendCorrection}
+                  style={{ display: "flex", gap: "6px", marginTop: "6px" }}
+                >
+                  <input
+                    autoFocus
+                    value={correction}
+                    onChange={(event) => {
+                      setCorrection(event.target.value);
+                      if (saveState !== "idle") setSaveState("idle");
+                    }}
+                    maxLength={500}
+                    placeholder={ui("What should improve?")}
+                    aria-label={ui("What should improve")}
+                    style={{
+                      minWidth: 0,
+                      flex: 1,
+                      height: "28px",
+                      padding: "0 8px",
+                      border: "1px solid hsl(var(--border))",
+                      borderRadius: "4px",
+                      outline: "none",
+                      background: "hsl(var(--background))",
+                      color: "hsl(var(--foreground))",
+                      fontFamily: '"IBM Plex Mono", monospace',
+                      fontSize: "10px",
+                    }}
+                  />
+                  <button
+                    type="submit"
+                    disabled={!correction.trim() || saveState === "saving"}
+                    aria-label={ui("Send feedback")}
+                    title={ui("Send feedback")}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "28px",
+                      height: "28px",
+                      padding: 0,
+                      border: "1px solid hsl(var(--border))",
+                      borderRadius: "4px",
+                      background: correction.trim()
+                        ? "hsl(var(--foreground))"
+                        : "transparent",
+                      color: correction.trim()
+                        ? "hsl(var(--background))"
+                        : "hsl(var(--muted-foreground))",
+                      cursor: correction.trim() ? "pointer" : "default",
+                    }}
+                  >
+                    <Send size={12} strokeWidth={1.8} />
+                  </button>
+                </form>
+              )}
+              {saveState === "error" && (
+                <div
+                  role="alert"
+                  style={{
+                    marginTop: "4px",
+                    fontSize: "9px",
+                    color: "hsl(var(--muted-foreground))",
+                  }}
+                >
+                  Could not save — try again
+                </div>
+              )}
+            </>
+          )}
+        </div>
       </div>
-
-      {rating === "down" && (
-        <form
-          onSubmit={sendCorrection}
-          style={{ display: "flex", gap: "6px", marginTop: "6px" }}
-        >
-          <input
-            autoFocus
-            value={correction}
-            onChange={(event) => {
-              setCorrection(event.target.value);
-              if (saveState !== "idle") setSaveState("idle");
-            }}
-            maxLength={500}
-            placeholder="what should improve?"
-            aria-label="what should improve"
-            style={{
-              minWidth: 0,
-              flex: 1,
-              height: "28px",
-              padding: "0 8px",
-              border: "1px solid hsl(var(--border))",
-              borderRadius: 0,
-              outline: "none",
-              background: "hsl(var(--background))",
-              color: "hsl(var(--foreground))",
-              fontFamily: '"IBM Plex Mono", monospace',
-              fontSize: "10px",
-            }}
-          />
-          <button
-            type="submit"
-            disabled={!correction.trim() || saveState === "saving"}
-            aria-label="send feedback"
-            title="send feedback"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: "28px",
-              height: "28px",
-              padding: 0,
-              border: "1px solid hsl(var(--border))",
-              borderRadius: 0,
-              background: correction.trim() ? "hsl(var(--foreground))" : "transparent",
-              color: correction.trim()
-                ? "hsl(var(--background))"
-                : "hsl(var(--muted-foreground))",
-              cursor: correction.trim() ? "pointer" : "default",
-            }}
-          >
-            <Send size={12} strokeWidth={1.8} />
-          </button>
-        </form>
-      )}
-
-      {saveState === "saved" && rating === "down" && (
-        <div style={{ marginTop: "4px", fontSize: "9px", color: "hsl(var(--muted-foreground))" }}>
-          saved for the next run
-        </div>
-      )}
-      {saveState === "error" && (
-        <div role="alert" style={{ marginTop: "4px", fontSize: "9px", color: "hsl(var(--muted-foreground))" }}>
-          could not save — try again
-        </div>
-      )}
     </div>
   );
 }

@@ -19,12 +19,14 @@ pub mod presets;
 pub mod profile;
 pub mod search;
 pub mod service;
+pub mod starred;
 pub mod status;
 pub(crate) mod store_file;
 pub mod survey;
 pub mod sync;
 pub mod team;
 pub mod team_pipes;
+pub mod team_skills;
 pub mod vault;
 pub mod view;
 pub mod vision;
@@ -36,8 +38,22 @@ use screenpipe_audio::{
     audio_manager::builder::TranscriptionMode,
     core::engine::AudioTranscriptionEngine as CoreAudioTranscriptionEngine,
 };
+use screenpipe_config::{DomainRule, UrlRule};
 use screenpipe_core::Language;
 use std::path::{Path, PathBuf};
+
+fn parse_domain_rule(value: &str) -> Result<DomainRule, String> {
+    let (domain, include_subdomains) = match value.strip_suffix(":subdomains") {
+        Some(domain) => (domain, true),
+        None => (value, false),
+    };
+    let domain = screenpipe_a11y::url_filter::normalize_rule_hostname(domain)?;
+    Ok(DomainRule {
+        domain,
+        include_subdomains,
+        excluded_subdomains: Vec::new(),
+    })
+}
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum CliAudioTranscriptionEngine {
@@ -66,17 +82,13 @@ pub enum CliAudioTranscriptionEngine {
     Disabled,
 }
 
-/// Default audio engine based on hardware tier.
-///
-/// - Low tier (≤8GB): WhisperTiny (parakeet-mlx would OOM)
-/// - Mid/High tier: Parakeet (auto-upgrades to MLX GPU when compiled in)
+/// Use the same hardware, OS, and CPU defaults as the recording engine.
 fn default_audio_engine() -> CliAudioTranscriptionEngine {
-    let tier = screenpipe_config::detect_tier();
-    if matches!(tier, screenpipe_config::DeviceTier::Low) {
-        CliAudioTranscriptionEngine::WhisperTiny
-    } else {
-        CliAudioTranscriptionEngine::Parakeet
-    }
+    CliAudioTranscriptionEngine::from_str(
+        screenpipe_config::best_engine_for_platform(screenpipe_config::detect_tier()),
+        false,
+    )
+    .expect("the shared default audio engine must be supported by the CLI")
 }
 
 fn cli_engine_to_str(engine: &CliAudioTranscriptionEngine) -> &'static str {
@@ -204,7 +216,7 @@ pub enum Command {
     /// Start recording screen, audio, and serve the API
     Record(RecordArgs),
 
-    /// Show screenpipe status (running state, data stats)
+    /// Show recorder health, capture freshness, history, and storage
     Status {
         /// Output format
         #[arg(long, default_value_t = false)]
@@ -232,6 +244,13 @@ pub enum Command {
     /// (no daemon required — opens `~/.screenpipe/db.sqlite` read-side
     /// via WAL while sp may be writing).
     Search(SearchArgs),
+    /// Mark, list or edit important work intervals through the running engine.
+    Star {
+        #[command(subcommand)]
+        subcommand: starred::StarCommand,
+        #[arg(long, default_value_t = 3030)]
+        port: u16,
+    },
 
     /// Enterprise: query teammates' screen + audio history via
     /// `screenpi.pe/api/enterprise/v1/*`. Admin-only — needs a
@@ -365,6 +384,16 @@ pub enum Command {
         subcommand: DbCommand,
     },
 
+    /// Offline, opt-in frame storage lifecycle
+    Storage {
+        #[arg(value_parser = ["init", "migrate", "verify", "seal", "reclaim", "compact", "backup", "restore", "export-sqlite", "compare", "cancel", "status"])]
+        operation: String,
+        #[arg(value_hint = ValueHint::DirPath)]
+        root: std::path::PathBuf,
+        #[arg(value_hint = ValueHint::AnyPath)]
+        destination: Option<std::path::PathBuf>,
+    },
+
     /// Database backup & maintenance (checkpoint WAL, export snapshot)
     Backup {
         #[command(subcommand)]
@@ -452,9 +481,10 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub experimental_coreaudio_system_audio: bool,
 
-    /// Beta: meeting-driven per-process audio capture (piggyback; "Smart
-    /// recording" in the app). Engages during meetings in any capture mode.
-    #[arg(long, default_value_t = false)]
+    /// Meeting-driven per-process audio capture ("Smart recording" in the app).
+    /// Enabled by default; the backend checks platform support. Pass false to
+    /// use the configured capture devices throughout meetings.
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = screenpipe_config::default_experimental_meeting_piggyback(), default_missing_value = "true")]
     pub experimental_meeting_piggyback: bool,
 
     /// [experimental, Windows] Request WASAPI microphone AEC when supported.
@@ -489,7 +519,8 @@ pub struct RecordArgs {
     #[arg(short = 'm', long)]
     pub monitor_id: Vec<u32>,
 
-    /// Automatically record all monitors. Ignored when `--monitor-id` is passed.
+    /// Automatically record all monitors (enabled by default on every device tier).
+    /// Ignored when `--monitor-id` is passed.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
     pub use_all_monitors: bool,
 
@@ -592,20 +623,23 @@ pub struct RecordArgs {
 
     /// Select structured app context: off, memory, automation, or both.
     /// Memory builds compact context for retrieval and pipes; automation keeps
-    /// action controls, state, and bounds for computer-use agents. Off by default.
+    /// action controls, state, and bounds for computer-use agents. New CLI
+    /// configurations default to memory; saved choices are preserved.
     #[arg(long, value_enum)]
     pub app_context: Option<CliAppContext>,
 
-    /// Enable experimental normalized semantic context parsing. Parsing runs
-    /// after durable frame capture in a bounded background worker. Off by
-    /// default, preserving the historical capture and retrieval behavior.
-    /// Kept for compatibility; equivalent to `--app-context memory` on a
-    /// fresh CLI configuration. `--app-context` takes precedence when
-    /// both are supplied.
+    /// Enable normalized semantic context parsing. Parsing runs after durable
+    /// frame capture in a bounded background worker. On for new CLI configurations.
+    /// Kept for compatibility; prefer `--app-context memory` or `--app-context off`.
+    /// Explicit `--app-context` takes precedence over this flag and its environment
+    /// variable. Environment values override saved settings, but not CLI flags.
     #[arg(
         long,
         env = "SCREENPIPE_ENABLE_SEMANTIC_CONTEXT",
-        default_value_t = false
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true"
     )]
     pub enable_semantic_context: bool,
 
@@ -623,9 +657,21 @@ pub struct RecordArgs {
     #[arg(long)]
     pub included_windows: Vec<String>,
 
-    /// URLs to ignore for browser privacy filtering
+    /// Legacy browser URL block patterns. Prefer `--url-block` for explicit
+    /// exact-domain and subdomain behavior.
     #[arg(long)]
     pub ignored_urls: Vec<String>,
+
+    /// Block a browser domain. Repeat for multiple domains. A bare domain
+    /// matches exactly; append `:subdomains` to include all descendants.
+    #[arg(long, value_parser = parse_domain_rule)]
+    pub url_block: Vec<DomainRule>,
+
+    /// Allow only a browser domain. Repeat for multiple domains. A bare domain
+    /// matches exactly; append `:subdomains` to include all descendants. To
+    /// exclude one branch, combine it with a more specific `--url-block`.
+    #[arg(long, value_parser = parse_domain_rule)]
+    pub url_allow: Vec<DomainRule>,
 
     /// Automatically detect and skip incognito / private browsing windows.
     /// Pass `--ignore-incognito-windows=false` to record them.
@@ -664,6 +710,17 @@ pub struct RecordArgs {
     /// Video quality preset: low, balanced, high, max
     #[arg(long, default_value = "balanced")]
     pub video_quality: String,
+
+    /// Screen history detail: adaptive capture cost, or a fixed sampling preset.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "low_impact", "balanced", "more_detail"])]
+    pub recording_detail: String,
+    /// Max width in pixels of the macOS screen capture that OCR reads.
+    /// 0 = native; nonzero values below 1280 are raised to 1280. Stored
+    /// screenshots use the smaller of this width and the --video-quality
+    /// width. Lower it to trade OCR legibility for less GPU work on wide
+    /// displays. Other platforms always capture native.
+    #[arg(long, default_value_t = 0)]
+    pub capture_max_width: u32,
 
     /// Keep the computer awake while screenpipe is running.
     #[arg(long, default_value_t = false)]
@@ -708,12 +765,10 @@ pub struct RecordArgs {
     #[arg(long)]
     pub capture_on_clipboard: Option<bool>,
 
-    /// Override `UiRecorderConfig::capture_scroll` — record scroll wheel
-    /// events into `ui_events`. Off by default because wheel ticks fire
-    /// at ~60Hz and inflate the table fast. When on, the recorder's
-    /// `ScrollBurstTracker` retains every correlation ID while coalescing a
-    /// wheel flick into one `ScrollStop` trigger at burst-end, then links every
-    /// persisted scroll row in the settled burst to the resulting `frame_id`.
+    /// Record coalesced scroll events in `ui_events` (enabled by default on
+    /// macOS and Windows). Sustained scrolling produces periodic capture
+    /// checkpoints plus a settled tail. The recorder retains correlation IDs
+    /// so persisted scroll rows can link to their corresponding frames.
     #[arg(long)]
     pub capture_scroll: Option<bool>,
 
@@ -773,18 +828,16 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub pause_on_drm_content: bool,
 
-    /// Disable clipboard capture entirely. The UI recorder will not record
-    /// clipboard copy/paste events or contents — useful when piping
-    /// ~/.screenpipe data into a remote LLM (passwords, keys, secrets often
-    /// pass through the clipboard).
-    #[arg(long, default_value_t = false)]
+    /// Disable storing clipboard events and contents (default). Clipboard
+    /// operations can still trigger a screen capture. Pass false to store them.
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
     pub disable_clipboard_capture: bool,
 
-    /// Disable persisting keyboard / typed-text rows. Keyboard events still
+    /// Disable persisting keyboard / typed-text rows (default). Keyboard events still
     /// wake event-driven capture, and the accessibility tree + OCR still
     /// capture on-screen text. Useful when piping ~/.screenpipe data into a
-    /// remote LLM (secrets get typed).
-    #[arg(long, default_value_t = false)]
+    /// remote LLM (secrets get typed). Pass false to store keyboard / typed-text rows.
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
     pub disable_keyboard_capture: bool,
 
     /// Disable persisting mouse-click rows. Clicks still wake event-driven
@@ -888,6 +941,8 @@ pub struct RecordArgSources {
     pub ignored_windows: bool,
     pub included_windows: bool,
     pub ignored_urls: bool,
+    pub url_block: bool,
+    pub url_allow: bool,
     pub ignore_incognito_windows: bool,
     pub enhanced_incognito_detection: bool,
     pub ignored_meeting_apps: bool,
@@ -895,6 +950,8 @@ pub struct RecordArgSources {
     pub transcription_mode: bool,
     pub disable_telemetry: bool,
     pub video_quality: bool,
+    pub recording_detail: bool,
+    pub capture_max_width: bool,
     pub keep_computer_awake: bool,
     pub pause_on_drm_content: bool,
     pub disable_clipboard_capture: bool,
@@ -948,10 +1005,15 @@ impl RecordArgSources {
             disable_vision: from_command_line(record, "disable_vision"),
             disable_screenshots: from_command_line(record, "disable_screenshots"),
             app_context: from_command_line(record, "app_context"),
-            enable_semantic_context: from_command_line(record, "enable_semantic_context"),
+            enable_semantic_context: matches!(
+                record.value_source("enable_semantic_context"),
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            ),
             ignored_windows: from_command_line(record, "ignored_windows"),
             included_windows: from_command_line(record, "included_windows"),
             ignored_urls: from_command_line(record, "ignored_urls"),
+            url_block: from_command_line(record, "url_block"),
+            url_allow: from_command_line(record, "url_allow"),
             ignore_incognito_windows: from_command_line(record, "ignore_incognito_windows"),
             enhanced_incognito_detection: from_command_line(record, "enhanced_incognito_detection"),
             ignored_meeting_apps: from_command_line(record, "ignored_meeting_apps"),
@@ -959,6 +1021,8 @@ impl RecordArgSources {
             transcription_mode: from_command_line(record, "transcription_mode"),
             disable_telemetry: from_command_line(record, "disable_telemetry"),
             video_quality: from_command_line(record, "video_quality"),
+            recording_detail: from_command_line(record, "recording_detail"),
+            capture_max_width: from_command_line(record, "capture_max_width"),
             keep_computer_awake: from_command_line(record, "keep_computer_awake"),
             pause_on_drm_content: from_command_line(record, "pause_on_drm_content"),
             disable_clipboard_capture: from_command_line(record, "disable_clipboard_capture"),
@@ -1005,6 +1069,8 @@ impl RecordArgSources {
             || self.ignored_windows
             || self.included_windows
             || self.ignored_urls
+            || self.url_block
+            || self.url_allow
             || self.ignore_incognito_windows
             || self.enhanced_incognito_detection
             || self.ignored_meeting_apps
@@ -1012,6 +1078,8 @@ impl RecordArgSources {
             || self.transcription_mode
             || self.disable_telemetry
             || self.video_quality
+            || self.recording_detail
+            || self.capture_max_width
             || self.keep_computer_awake
             || self.pause_on_drm_content
             || self.disable_clipboard_capture
@@ -1078,6 +1146,15 @@ fn parse_schedule_rule(s: &str) -> Result<screenpipe_config::ScheduleRule, Strin
 }
 
 impl RecordArgs {
+    fn combined_ignored_urls(&self) -> Vec<UrlRule> {
+        self.ignored_urls
+            .iter()
+            .cloned()
+            .map(UrlRule::Legacy)
+            .chain(self.url_block.iter().cloned().map(UrlRule::Structured))
+            .collect()
+    }
+
     pub fn unique_languages(&self) -> Result<Vec<Language>, String> {
         let mut unique_langs = std::collections::HashSet::new();
         for lang in &self.language {
@@ -1185,7 +1262,8 @@ impl RecordArgs {
             use_all_monitors: self.use_all_monitors && self.monitor_id.is_empty(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
-            ignored_urls: self.ignored_urls.clone(),
+            ignored_urls: self.combined_ignored_urls(),
+            included_urls: self.url_allow.clone(),
             ignored_meeting_apps: self.ignored_meeting_apps.clone(),
             languages: self
                 .language
@@ -1194,6 +1272,13 @@ impl RecordArgs {
                 .collect(),
             deepgram_api_key: self.deepgram_api_key.clone().unwrap_or_default(),
             video_quality: self.video_quality.clone(),
+            recording_detail: match self.recording_detail.as_str() {
+                "low_impact" => screenpipe_config::RecordingDetail::LowImpact,
+                "balanced" => screenpipe_config::RecordingDetail::Balanced,
+                "more_detail" => screenpipe_config::RecordingDetail::MoreDetail,
+                _ => screenpipe_config::RecordingDetail::Auto,
+            },
+            capture_max_width: self.capture_max_width,
             disable_snapshot_compaction: self.disable_snapshot_compaction,
             disable_meeting_detector: self.disable_meeting_detector,
             idle_capture_interval_ms: self.idle_capture_interval_ms,
@@ -1248,16 +1333,10 @@ impl RecordArgs {
             false
         };
 
-        // Preserve explicit CLI monitor flags so tier defaults don't clobber them.
-        let cli_monitor_ids = self.monitor_id.clone();
-        let cli_use_all_monitors = self.use_all_monitors;
-
         let persisted_settings = load_recording_settings_from_store(&data_dir)?;
         let loaded_from_store = persisted_settings.is_some();
         let mut settings = persisted_settings.unwrap_or_else(|| self.to_recording_settings());
-        if loaded_from_store {
-            self.apply_explicit_overrides(&mut settings, sources);
-        }
+        let mut fresh_tier = None;
 
         // #3943: the desktop app migrates the cloud token out of plaintext
         // store.bin into the shared encrypted SecretStore. A standalone CLI
@@ -1291,29 +1370,12 @@ impl RecordArgs {
                 // Existing config without tier = upgrade — just set the tier for DB/channel tuning.
                 let is_fresh = !config_path.exists() && !loaded_from_store;
                 if is_fresh {
-                    screenpipe_config::apply_tier_defaults(&mut settings, tier);
-
-                    // Restore CLI audio engine — user's explicit -a/--audio-transcription-engine
-                    // must win over tier defaults
-                    settings.audio_transcription_engine =
-                        cli_engine_to_str(&self.audio_transcription_engine).to_string();
-
-                    // Restore CLI monitor flags — user's explicit --use-all-monitors or -m
-                    // must win over tier defaults (fixes #2897).
-                    // Explicit `--monitor-id` implies `use_all_monitors=false`
-                    // so privacy-motivated filtering actually takes effect.
-                    if !cli_monitor_ids.is_empty() {
-                        settings.use_all_monitors = false;
-                        settings.monitor_ids =
-                            cli_monitor_ids.iter().map(|id| id.to_string()).collect();
-                    } else if cli_use_all_monitors {
-                        settings.use_all_monitors = true;
-                        settings.monitor_ids = vec![];
-                    }
+                    fresh_tier = Some(tier);
                 }
                 settings.device_tier = Some(tier.as_str().to_string());
             }
         }
+        self.apply_defaults_and_overrides(&mut settings, fresh_tier, sources);
 
         // Safety guard: downgrade engine if unsafe for this platform
         // (Low tier = OOM, macOS < 26 = parakeet-mlx segfault)
@@ -1366,6 +1428,20 @@ impl RecordArgs {
         }
 
         Ok(config)
+    }
+
+    /// Apply hardware defaults only for fresh installs, then let explicit input
+    /// win. Clap defaults must not overwrite saved choices or hardware policy.
+    fn apply_defaults_and_overrides(
+        &self,
+        settings: &mut screenpipe_config::RecordingSettings,
+        fresh_tier: Option<screenpipe_config::DeviceTier>,
+        sources: &RecordArgSources,
+    ) {
+        if let Some(tier) = fresh_tier {
+            screenpipe_config::apply_tier_defaults(settings, tier);
+        }
+        self.apply_explicit_overrides(settings, sources);
     }
 
     fn apply_explicit_overrides(
@@ -1505,8 +1581,11 @@ impl RecordArgs {
         if sources.included_windows {
             settings.included_windows = self.included_windows.clone();
         }
-        if sources.ignored_urls {
-            settings.ignored_urls = self.ignored_urls.clone();
+        if sources.ignored_urls || sources.url_block {
+            settings.ignored_urls = self.combined_ignored_urls();
+        }
+        if sources.url_allow {
+            settings.included_urls = self.url_allow.clone();
         }
         if sources.ignore_incognito_windows {
             settings.ignore_incognito_windows = self.ignore_incognito_windows;
@@ -1529,8 +1608,14 @@ impl RecordArgs {
         if sources.disable_telemetry {
             settings.analytics_enabled = !self.disable_telemetry;
         }
+        if sources.recording_detail {
+            settings.recording_detail = self.to_recording_settings().recording_detail;
+        }
         if sources.video_quality {
             settings.video_quality = self.video_quality.clone();
+        }
+        if sources.capture_max_width {
+            settings.capture_max_width = self.capture_max_width;
         }
         if sources.keep_computer_awake {
             settings.keep_computer_awake = self.keep_computer_awake;
@@ -1946,6 +2031,10 @@ pub enum DbCommand {
     /// verifies integrity, foreign keys, and a durable write canary, then swaps.
     /// Refuses to run while screenpipe is open.
     Recover {
+        /// Revalidate and install the newest previously verified candidate.
+        /// Never starts another full recovery if the candidate cannot be reused.
+        #[arg(long)]
+        resume: bool,
         /// Deprecated compatibility flag. Recovery still refuses to race a
         /// reachable screenpipe server because that cannot preserve one exact
         /// DB/WAL/SHM generation.
@@ -2105,11 +2194,65 @@ pub enum TeamCommand {
     /// Chronological dump for one device — use after `devices` + `search`
     /// have narrowed down a person and a moment
     Records(TeamRecordsArgs),
+    /// Download one PII-redacted team frame after `search` or `records`
+    /// returns its device and frame ids
+    Frame(TeamFrameArgs),
     /// Manage the organization's hosted Pipes
     Pipes {
         #[command(subcommand)]
         subcommand: TeamPipeCommand,
     },
+    /// Discover approved skills or propose a local Agent Skills folder
+    Skills {
+        #[command(subcommand)]
+        subcommand: TeamSkillCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TeamSkillCommand {
+    /// List compact approved-skill metadata (no package bodies)
+    List(TeamSkillListArgs),
+    /// Fetch one approved skill, including its exact package manifest
+    Show(TeamSkillShowArgs),
+    /// Propose a local Agent Skills folder for private admin review
+    Propose(TeamSkillProposeArgs),
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct TeamSkillListArgs {
+    /// Emit the complete API response as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct TeamSkillShowArgs {
+    /// Approved skill id from `screenpipe team skills list`
+    pub id: String,
+
+    /// Emit the complete API response as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct TeamSkillProposeArgs {
+    /// Skill directory, or its root SKILL.md
+    #[arg(value_hint = ValueHint::DirPath)]
+    pub source: PathBuf,
+
+    /// Optional review title; defaults to the skill name
+    #[arg(long)]
+    pub title: Option<String>,
+
+    /// Submit after preview without an interactive confirmation
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Emit the complete API receipt as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2296,6 +2439,21 @@ pub struct TeamRecordsArgs {
     /// Emit compact JSON-lines (one record per line). Default is pretty JSON.
     #[arg(long)]
     pub raw: bool,
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct TeamFrameArgs {
+    /// Device id returned by `screenpipe team search` or `records`.
+    #[arg(long)]
+    pub device_id: String,
+
+    /// Frame id returned by `screenpipe team search` or `records`.
+    #[arg(long)]
+    pub frame_id: u64,
+
+    /// New JPEG file to create. Existing files are never overwritten.
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    pub output: PathBuf,
 }
 
 // =============================================================================
@@ -2510,20 +2668,276 @@ mod tests {
         match cli.command {
             Command::Record(args) => {
                 assert!(!args.pause_on_drm_content, "default should be false");
-                assert!(args.app_context.is_none());
-                assert!(
-                    !args.enable_semantic_context,
-                    "semantic parsing must remain opt-in"
-                );
-                let settings = args.to_recording_settings();
-                assert!(!settings.enable_semantic_context);
-                assert_eq!(
-                    settings.semantic_context_mode,
-                    screenpipe_config::SemanticContextMode::Memory
-                );
             }
             _ => panic!("expected Record command"),
         }
+    }
+
+    #[test]
+    fn test_fresh_cli_defaults_enable_memory_without_sensitive_input_storage() {
+        let args = record_args(["screenpipe", "record"]);
+        let settings = args.to_recording_settings();
+        assert!(settings.enable_semantic_context);
+        assert_eq!(
+            settings.semantic_context_mode,
+            screenpipe_config::SemanticContextMode::Memory
+        );
+        assert_eq!(
+            settings.experimental_meeting_piggyback,
+            screenpipe_config::default_experimental_meeting_piggyback()
+        );
+        assert!(settings.disable_clipboard_capture);
+        assert!(settings.disable_keyboard_capture);
+        assert_eq!(
+            settings.audio_transcription_engine,
+            screenpipe_config::best_engine_for_platform(screenpipe_config::detect_tier())
+        );
+
+        let ui = args.to_ui_recorder_config();
+        assert!(!ui.capture_clipboard_content);
+        assert!(!ui.capture_text);
+        assert!(!ui.record_clipboard_events);
+        assert!(!ui.record_keyboard_events);
+        assert!(ui.capture_on_keystroke);
+        assert!(ui.record_click_events);
+    }
+
+    #[test]
+    fn test_new_default_flags_accept_explicit_false_and_bare_true() {
+        for flag in [
+            "--enable-semantic-context",
+            "--experimental-meeting-piggyback",
+            "--disable-clipboard-capture",
+            "--disable-keyboard-capture",
+        ] {
+            let with_value = format!("{flag}=false");
+            for (argv, enabled) in [
+                (vec!["screenpipe", "record", with_value.as_str()], false),
+                (vec!["screenpipe", "record", flag, "false"], false),
+                (vec!["screenpipe", "record", flag], true),
+            ] {
+                let matches = Cli::command().try_get_matches_from(argv).unwrap();
+                let sources = RecordArgSources::from_cli_matches(&matches);
+                let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+                let Command::Record(args) = cli.command else {
+                    panic!("expected record");
+                };
+                // Start with opposite saved values to prove false is an explicit override.
+                let mut settings = screenpipe_config::RecordingSettings {
+                    enable_semantic_context: !enabled,
+                    experimental_meeting_piggyback: !enabled,
+                    disable_clipboard_capture: !enabled,
+                    disable_keyboard_capture: !enabled,
+                    ..Default::default()
+                };
+                args.apply_defaults_and_overrides(&mut settings, None, &sources);
+                let actual = match flag {
+                    "--enable-semantic-context" => settings.enable_semantic_context,
+                    "--experimental-meeting-piggyback" => settings.experimental_meeting_piggyback,
+                    "--disable-clipboard-capture" => settings.disable_clipboard_capture,
+                    _ => settings.disable_keyboard_capture,
+                };
+                assert_eq!(actual, enabled, "{flag}");
+                assert!(sources.has_recording_override());
+            }
+        }
+    }
+
+    #[test]
+    fn recording_detail_cli_preserves_saved_mode_unless_explicitly_overridden() {
+        let mut settings = screenpipe_config::RecordingSettings {
+            recording_detail: screenpipe_config::RecordingDetail::LowImpact,
+            ..Default::default()
+        };
+        let args = record_args(["screenpipe", "record"]);
+        args.apply_explicit_overrides(&mut settings, &record_sources(["screenpipe", "record"]));
+        assert_eq!(
+            settings.recording_detail,
+            screenpipe_config::RecordingDetail::LowImpact
+        );
+        let args = record_args(["screenpipe", "record", "--recording-detail", "more_detail"]);
+        let sources = record_sources(["screenpipe", "record", "--recording-detail", "more_detail"]);
+        args.apply_explicit_overrides(&mut settings, &sources);
+        assert!(sources.has_recording_override());
+        assert_eq!(
+            settings.recording_detail,
+            screenpipe_config::RecordingDetail::MoreDetail
+        );
+        assert!(
+            Cli::try_parse_from(["screenpipe", "record", "--recording-detail", "unbounded"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_new_defaults_preserve_saved_choices() {
+        let args = record_args(["screenpipe", "record"]);
+        let sources = record_sources(["screenpipe", "record"]);
+        let mut settings = screenpipe_config::RecordingSettings {
+            enable_semantic_context: false,
+            semantic_context_mode: screenpipe_config::SemanticContextMode::ComputerUse,
+            experimental_meeting_piggyback: false,
+            disable_clipboard_capture: false,
+            disable_keyboard_capture: false,
+            video_quality: "max".to_string(),
+            capture_max_width: 2560,
+            use_all_monitors: false,
+            monitor_ids: vec!["42".to_string()],
+            ..Default::default()
+        };
+        let before = serde_json::to_value(&settings).unwrap();
+        args.apply_defaults_and_overrides(&mut settings, None, &sources);
+        assert_eq!(serde_json::to_value(&settings).unwrap(), before);
+        assert!(!sources.has_recording_override());
+    }
+
+    #[test]
+    fn explicit_capture_max_width_overrides_saved_value() {
+        let argv = ["screenpipe", "record", "--capture-max-width", "1920"];
+        let args = record_args(argv);
+        let sources = record_sources(argv);
+        let mut settings = screenpipe_config::RecordingSettings {
+            capture_max_width: 2560,
+            ..Default::default()
+        };
+        args.apply_defaults_and_overrides(&mut settings, None, &sources);
+        assert_eq!(settings.capture_max_width, 1920);
+        assert!(sources.has_recording_override());
+    }
+
+    #[test]
+    fn test_fresh_hardware_defaults_survive_absent_cli_flags() {
+        use screenpipe_config::DeviceTier;
+        let args = record_args(["screenpipe", "record"]);
+        let sources = record_sources(["screenpipe", "record"]);
+        for tier in [DeviceTier::Low, DeviceTier::Mid, DeviceTier::High] {
+            let mut settings = args.to_recording_settings();
+            args.apply_defaults_and_overrides(&mut settings, Some(tier), &sources);
+            assert_eq!(
+                settings.audio_transcription_engine,
+                screenpipe_config::best_engine_for_platform(tier)
+            );
+            assert_eq!(
+                settings.video_quality,
+                if tier == DeviceTier::Low {
+                    "low"
+                } else {
+                    "balanced"
+                }
+            );
+            assert_eq!(settings.capture_max_width, 0);
+            assert!(settings.use_all_monitors);
+            assert!(settings.monitor_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_explicit_capture_choices_win_after_fresh_hardware_defaults() {
+        use screenpipe_config::DeviceTier;
+        let argv = [
+            "screenpipe",
+            "record",
+            "--video-quality",
+            "max",
+            "--monitor-id",
+            "42",
+            "--audio-transcription-engine",
+            "deepgram",
+            "--app-context",
+            "off",
+        ];
+        let args = record_args(argv);
+        let sources = record_sources(argv);
+        for tier in [DeviceTier::Low, DeviceTier::Mid, DeviceTier::High] {
+            let mut settings = args.to_recording_settings();
+            args.apply_defaults_and_overrides(&mut settings, Some(tier), &sources);
+            assert_eq!(settings.video_quality, "max");
+            assert_eq!(settings.audio_transcription_engine, "deepgram");
+            assert!(!settings.use_all_monitors);
+            assert_eq!(settings.monitor_ids, ["42"]);
+            assert!(!settings.enable_semantic_context);
+        }
+
+        for (flag, enabled) in [
+            ("--use-all-monitors", true),
+            ("--use-all-monitors=false", false),
+        ] {
+            let argv = ["screenpipe", "record", flag];
+            let args = record_args(argv);
+            let sources = record_sources(argv);
+            for tier in [DeviceTier::Low, DeviceTier::High] {
+                let mut settings = args.to_recording_settings();
+                args.apply_defaults_and_overrides(&mut settings, Some(tier), &sources);
+                assert_eq!(settings.use_all_monitors, enabled);
+                if enabled {
+                    assert!(settings.monitor_ids.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_semantic_context_environment_precedence() {
+        // Exercise real clap environment parsing in child processes, without
+        // mutating the process-wide environment of parallel tests.
+        const CHILD: &str = "SCREENPIPE_TEST_SEMANTIC_DEFAULTS_CHILD";
+        let Ok(value) = std::env::var(CHILD) else {
+            for value in ["true", "false"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cli::tests::test_semantic_context_environment_precedence",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, value)
+                    .env("SCREENPIPE_ENABLE_SEMANTIC_CONTEXT", value)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "environment={value}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let enabled: bool = value.parse().unwrap();
+        let argv = ["screenpipe", "record"];
+        let args = record_args(argv);
+        let sources = record_sources(argv);
+        assert!(sources.enable_semantic_context);
+        assert!(sources.has_recording_override());
+        assert_eq!(
+            args.to_recording_settings().enable_semantic_context,
+            enabled
+        );
+        let mut settings = screenpipe_config::RecordingSettings {
+            enable_semantic_context: !enabled,
+            ..Default::default()
+        };
+        args.apply_defaults_and_overrides(&mut settings, None, &sources);
+        assert_eq!(settings.enable_semantic_context, enabled);
+
+        let flag = format!("--enable-semantic-context={}", !enabled);
+        let argv = ["screenpipe", "record", flag.as_str()];
+        let args = record_args(argv);
+        assert_eq!(
+            args.to_recording_settings().enable_semantic_context,
+            !enabled
+        );
+        args.apply_defaults_and_overrides(&mut settings, None, &record_sources(argv));
+        assert_eq!(settings.enable_semantic_context, !enabled);
+
+        let mode = if enabled { "off" } else { "memory" };
+        let argv = ["screenpipe", "record", "--app-context", mode];
+        let args = record_args(argv);
+        assert_eq!(
+            args.to_recording_settings().enable_semantic_context,
+            !enabled
+        );
+        args.apply_defaults_and_overrides(&mut settings, None, &record_sources(argv));
+        assert_eq!(settings.enable_semantic_context, !enabled);
     }
 
     #[test]
@@ -3227,6 +3641,77 @@ mod tests {
         ]);
         assert!(args.use_pii_removal);
         assert!(args.api_auth);
+    }
+
+    #[test]
+    fn url_rule_flags_make_exact_and_subdomain_behavior_explicit() {
+        let args = record_args([
+            "screenpipe",
+            "record",
+            "--ignored-urls",
+            "legacy.example",
+            "--url-block",
+            "admin.worktrace.ai:subdomains",
+            "--url-allow",
+            "https://WorkTrace.AI/path",
+        ]);
+        let settings = args.to_recording_settings();
+
+        assert_eq!(
+            settings.ignored_urls,
+            vec![
+                UrlRule::Legacy("legacy.example".to_string()),
+                UrlRule::Structured(DomainRule {
+                    domain: "admin.worktrace.ai".to_string(),
+                    include_subdomains: true,
+                    excluded_subdomains: vec![],
+                }),
+            ]
+        );
+        assert_eq!(
+            settings.included_urls,
+            vec![DomainRule {
+                domain: "worktrace.ai".to_string(),
+                include_subdomains: false,
+                excluded_subdomains: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn url_rule_flags_reject_bare_labels() {
+        let result = Cli::try_parse_from([
+            "screenpipe",
+            "record",
+            "--url-allow",
+            "worktrace:subdomains",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn explicit_url_rule_flags_replace_persisted_policy() {
+        let cli_args = [
+            "screenpipe",
+            "record",
+            "--url-block",
+            "private.example.com",
+            "--url-allow",
+            "example.com:subdomains",
+        ];
+        let args = record_args(cli_args);
+        let sources = record_sources(cli_args);
+        let mut settings = screenpipe_config::RecordingSettings {
+            ignored_urls: vec![UrlRule::Legacy("old.example".to_string())],
+            included_urls: vec![],
+            ..Default::default()
+        };
+
+        args.apply_explicit_overrides(&mut settings, &sources);
+
+        assert_eq!(settings.ignored_urls.len(), 1);
+        assert!(matches!(settings.ignored_urls[0], UrlRule::Structured(_)));
+        assert!(settings.included_urls[0].include_subdomains);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 "use client";
 
 import React, { Suspense, useState, useEffect, useRef, useCallback } from "react";
+import { useGT } from "gt-react";
 import {
   Brain,
   Video,
@@ -21,6 +22,7 @@ import {
   ChevronLeft,
   SlidersHorizontal,
   KeyRound,
+  ListChecks,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import * as PopoverPrimitive from "@radix-ui/react-popover";
@@ -51,16 +53,18 @@ import { StorageSection, searchIndex as storageSearchIndex } from "@/components/
 import { NotificationsSettings, searchIndex as notificationsSearchIndex } from "@/components/settings/notifications-settings";
 import { UsageSection, searchIndex as usageSearchIndex } from "@/components/settings/usage-section";
 import { SpeakersSection, searchIndex as speakersSearchIndex } from "@/components/settings/speakers-section";
+import { ActivitiesSettings, searchIndex as activitiesSearchIndex } from "@/components/settings/activities-settings";
 import { searchIndex as powerSearchIndex } from "@/components/settings/battery-saver-section";
 import { ReferralCard } from "@/components/settings/referral-card";
 import { SettingsSearchInput, SettingsSearchPopover, searchSettingsNav, scrollToSettingsField, type IndexedSettingsField, type SettingsField } from "@/components/settings/settings-search";
+import { ExperimentalShortcutGuide } from "@/components/shortcut-guide";
 
 // Settings search index for the inline ReferralSection defined further down in
 // this file. Lives here because the section itself lives here; same co-location
 // principle as the standalone sections.
 const referralSearchIndex: SettingsField[] = [
-  { label: "Invite link", keywords: ["invite", "refer", "promo"] },
-  { label: "Free month", keywords: ["discount", "earn"] },
+  { label: msg("Invite link", {}), keywords: ["invite", "refer", "promo"] },
+  { label: msg("Free month", {}), keywords: ["discount", "earn"] },
 ];
 
 /**
@@ -79,6 +83,7 @@ const ALL_SETTINGS_FIELDS: IndexedSettingsField[] = [
   ...generalSearchIndex.map((f) => ({ ...f, section: "general" })),
   ...aiSearchIndex.map((f) => ({ ...f, section: "ai" })),
   ...aiSettingsSearchIndex.map((f) => ({ ...f, section: "ai-settings" })),
+  ...activitiesSearchIndex.map((f) => ({ ...f, section: "activities" })),
   ...audioSearchIndex.map((f) => ({ ...f, section: "audio" })),
   ...screenSearchIndex.map((f) => ({ ...f, section: "recording" })),
   ...powerSearchIndex.map((f) => ({ ...f, section: "recording" })),
@@ -96,6 +101,9 @@ const ALL_SETTINGS_FIELDS: IndexedSettingsField[] = [
 import { useManagedPolicy } from "@/lib/hooks/use-managed-policy";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import posthog from "posthog-js";
+import { msg, useMessages } from "gt-react";
+import { localizeDefinitions } from "@/lib/i18n/definitions";
+
 
 /**
  * Nav layout revision, stamped onto `settings_viewed`.
@@ -112,10 +120,13 @@ function ReferralSection() {
 }
 
 function SettingsContent() {
+
+  const uiMessages = useMessages();
+  const gt = useGT();
   const router = useRouter();
   const searchParams = useSearchParams();
   const fromSection = searchParams.get("from");
-  const { isSectionHidden, isManagedDeployment } = useManagedPolicy();
+  const { isSectionHidden } = useManagedPolicy();
   const { isTranslucent } = useSidebarContext();
   const { isMac, isLoading: isPlatformLoading } = usePlatform();
   // macOS TCC recovery only. Non-mac must not see the nav item, search hits,
@@ -183,59 +194,54 @@ function SettingsContent() {
   // off the id, not the label.
   const navGroups = [
     {
-      label: "Capture & data",
+      label: gt("Capture & data"),
       items: [
-        { id: "recording" as const, label: "Screen", icon: <Video className="h-4 w-4" /> },
-        { id: "audio" as const, label: "Audio & meetings", icon: <Mic className="h-4 w-4" /> },
+        { id: "recording" as const, label: gt("Screen"), icon: <Video className="h-4 w-4" /> },
+        { id: "audio" as const, label: gt("Audio & meetings"), icon: <Mic className="h-4 w-4" /> },
         // Speaker identification is meeting work; it does not deserve a group
         // of its own directly below the one it belongs to.
-        { id: "speakers" as const, label: "Speakers", icon: <Users className="h-4 w-4" /> },
-        { id: "storage" as const, label: "Disk & retention", icon: <HardDrive className="h-4 w-4" /> },
-        { id: "privacy" as const, label: "Privacy", icon: <Shield className="h-4 w-4" /> },
+        { id: "speakers" as const, label: gt("Speakers"), icon: <Users className="h-4 w-4" /> },
+        { id: "storage" as const, label: gt("Disk & retention"), icon: <HardDrive className="h-4 w-4" /> },
+        { id: "privacy" as const, label: gt("Privacy"), icon: <Shield className="h-4 w-4" /> },
         ...(showPermissions
-          ? [{ id: "permissions" as const, label: "Permissions", icon: <KeyRound className="h-4 w-4" /> }]
+          ? [{ id: "permissions" as const, label: gt("Permissions"), icon: <KeyRound className="h-4 w-4" /> }]
           : []),
       ].filter((s) => !isSettingsSectionHidden(s.id)),
     },
     {
-      label: "AI",
+      label: gt("AI"),
       items: [
-        { id: "ai-settings" as const, label: "AI features", icon: <SlidersHorizontal className="h-4 w-4" /> },
-        { id: "ai" as const, label: "Models & keys", icon: <Brain className="h-4 w-4" /> },
-        { id: "usage" as const, label: "AI credits", icon: <BarChart3 className="h-4 w-4" /> },
+        { id: "activities" as const, label: gt("Activities"), icon: <ListChecks className="h-4 w-4" /> },
+        { id: "ai-settings" as const, label: gt("AI features"), icon: <SlidersHorizontal className="h-4 w-4" /> },
+        { id: "ai" as const, label: gt("Models & keys"), icon: <Brain className="h-4 w-4" /> },
+        { id: "usage" as const, label: gt("AI credits"), icon: <BarChart3 className="h-4 w-4" /> },
       ].filter((s) => !isSettingsSectionHidden(s.id)),
     },
     {
-      label: "Account",
+      label: gt("Account"),
       items: [
-        { id: "account" as const, label: "Account", icon: <User className="h-4 w-4" /> },
-        // Hide "Team" on enterprise builds — those installs are already
-        // org-managed; the desktop has nothing to manage. Admins use the
-        // /enterprise dashboard on the web. On consumer builds we still
-        // surface Team as a marketing entry point to /team.
-        ...(isManagedDeployment
-          ? []
-          : [{ id: "team" as const, label: "Team", icon: <Users className="h-4 w-4" /> }]),
-        { id: "referral" as const, label: "Get free month", icon: <Gift className="h-4 w-4" /> },
+        { id: "account" as const, label: gt("Account"), icon: <User className="h-4 w-4" /> },
+        { id: "team" as const, label: gt("Team"), icon: <Users className="h-4 w-4" /> },
+        { id: "referral" as const, label: gt("Refer a friend"), icon: <Gift className="h-4 w-4" /> },
       ].filter((s) => !isSectionHidden(s.id)),
     },
     {
-      label: "App",
+      label: gt("App"),
       items: [
         // Keep the legacy `general` section id so existing deep links and
         // automated tests continue to work. The user-facing label is the
         // familiar Apple-style category name.
-        { id: "general" as const, label: "General", icon: <SettingsIcon className="h-4 w-4" /> },
-        { id: "display" as const, label: "Appearance", icon: <Layout className="h-4 w-4" /> },
-        { id: "notifications" as const, label: "Notifications", icon: <Bell className="h-4 w-4" /> },
-        { id: "shortcuts" as const, label: "Shortcuts", icon: <Keyboard className="h-4 w-4" /> },
+        { id: "general" as const, label: gt("General"), icon: <SettingsIcon className="h-4 w-4" /> },
+        { id: "display" as const, label: gt("Appearance"), icon: <Layout className="h-4 w-4" /> },
+        { id: "notifications" as const, label: gt("Notifications"), icon: <Bell className="h-4 w-4" /> },
+        { id: "shortcuts" as const, label: gt("Shortcuts"), icon: <Keyboard className="h-4 w-4" /> },
       ].filter((s) => !isSectionHidden(s.id)),
     },
   ];
 
   type NavItem = { id: string; label: string; icon: React.ReactNode };
   const allItems: NavItem[] = navGroups.flatMap((g) => g.items as NavItem[]);
-  const currentLabel = allItems.find((s) => s.id === section)?.label ?? "Settings";
+  const currentLabel = allItems.find((s) => s.id === section)?.label ?? gt("Settings");
 
   // Search state. Overlay pattern (Claude-style): full nav stays rendered;
   // results float in a popover under the input. activeIndex tracks the
@@ -249,8 +255,8 @@ function SettingsContent() {
     g.items.map((it) => ({ ...it, group: g.label })),
   );
   const searchableFields = showPermissions
-    ? ALL_SETTINGS_FIELDS
-    : ALL_SETTINGS_FIELDS.filter((f) => f.section !== "permissions");
+    ? localizeDefinitions(ALL_SETTINGS_FIELDS, uiMessages)
+    : localizeDefinitions(ALL_SETTINGS_FIELDS, uiMessages).filter((f) => f.section !== "permissions");
   const results = searchSettingsNav(searchQuery, flatItems, searchableFields);
 
   useEffect(() => {
@@ -344,6 +350,7 @@ function SettingsContent() {
       case "display":       return <DisplaySection />;
       case "ai":            return <AIPresets />;
       case "ai-settings":   return <AISettings />;
+      case "activities":    return <ActivitiesSettings />;
       case "account":       return <AccountSection />;
       case "recording":     return <RecordingSettings section="screen" />;
       case "audio":         return <RecordingSettings section="audio" />;
@@ -363,15 +370,6 @@ function SettingsContent() {
   // (main)/layout.tsx so the sidebar width survives navigation to /home.
   return (
     <>
-      <style>{`
-        body * {
-          text-transform: none !important;
-        }
-      `}</style>
-
-      {/* Drag region */}
-      <div className="absolute top-0 left-0 right-0 h-8 z-10" data-tauri-drag-region />
-
       {/* Left sidebar */}
       <AppSidebar className="pl-4">
         {/* Back to app */}
@@ -389,7 +387,15 @@ function SettingsContent() {
               if (chatId) {
                 localStorage.setItem("pending-chat-conversation", chatId);
               }
-              router.push(section ? `/home?section=${section}` : "/home");
+              // Settings is pushed from the Home shell. Consume that entry so
+              // the next native back gesture continues through the user's UI
+              // history instead of bouncing straight back into Settings.
+              if (fromSection) {
+                router.back();
+              } else {
+                // Direct settings deep links have no known in-app predecessor.
+                router.replace(section ? `/home?section=${section}` : "/home");
+              }
             }}
             className={cn(
               "flex items-center space-x-1.5 text-sm transition-colors w-full",
@@ -446,7 +452,7 @@ function SettingsContent() {
                 <div key={group.label}>
                   <div className="px-2 pb-1">
                     <span className={cn(
-                      "text-[10px] font-medium uppercase tracking-wider",
+                      "text-[10px] font-medium normal-case tracking-wider",
                       isTranslucent ? "vibrant-sidebar-fg-muted" : "text-muted-foreground/60",
                     )}>
                       {group.label}
@@ -507,12 +513,15 @@ function SettingsContent() {
 
 export default function SettingsPage() {
   return (
-    <Suspense fallback={
-      <div className="flex-1 min-w-0 h-full bg-background flex items-center justify-center">
-        <div className="text-muted-foreground text-sm">Loading...</div>
-      </div>
-    }>
-      <SettingsContent />
-    </Suspense>
+    <>
+      <ExperimentalShortcutGuide />
+      <Suspense fallback={
+        <div className="flex-1 min-w-0 h-full bg-background flex items-center justify-center">
+          <div className="text-muted-foreground text-sm">Loading...</div>
+        </div>
+      }>
+        <SettingsContent />
+      </Suspense>
+    </>
   );
 }

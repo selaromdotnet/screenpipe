@@ -4,6 +4,7 @@
 "use client";
 
 import { X } from "lucide-react";
+import { ComposerTextArea } from "@screenpipe/workflows-ui/chat";
 import { IntegrationIcon } from "@/components/settings/connections-section";
 import { MentionDropdown } from "@/components/chat/standalone/mention-dropdown";
 import type {
@@ -11,6 +12,11 @@ import type {
   ComposerMentionsProps,
 } from "./composer-types";
 import { cn } from "@/lib/utils";
+import { useGT } from "gt-react";
+
+// Text scrolling into the padding fades out and never reaches the border.
+const SCROLL_FADE =
+  "[mask-image:linear-gradient(to_bottom,transparent_0.25rem,#000_0.5rem,#000_calc(100%_-_0.5rem),transparent_calc(100%_-_0.25rem))]";
 
 export function ComposerInputBox({
   input,
@@ -19,21 +25,23 @@ export function ComposerInputBox({
   input: ComposerInputProps;
   mentions: ComposerMentionsProps;
 }) {
+  const ui = useGT();
   return (
     <div
       className={cn(
-        "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors duration-150 focus-within:border-phosphor-strong focus-within:ring-phosphor-strong/20 focus-within:ring-1",
-        "bg-background/80 border-border/50 shadow-lg shadow-black/5",
+        "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors duration-150 focus-within:border-signal focus-within:ring-signal/15 focus-within:ring-1 motion-reduce:transition-none",
+        "border-border bg-surface shadow-[0_4px_18px_rgba(0,0,0,0.08)] dark:shadow-[0_4px_18px_rgba(0,0,0,0.28)]",
         input.disabledReason && "border-muted-foreground/30",
       )}
     >
       <div className="relative flex-1 min-w-0">
         {input.connectionChip && (
           <>
-            <div className="pointer-events-none absolute left-3 right-7 top-2.5 bottom-2.5 z-10 overflow-hidden">
+            <div className={cn("pointer-events-none absolute inset-y-0 left-3 right-7 z-10 overflow-hidden", SCROLL_FADE)}>
+              {/* Sits on the textarea's first line: py-2 top, 22px line height. */}
               <div
                 ref={input.chipPrefixRef}
-                className="absolute left-0 top-0 flex h-5 items-center gap-1.5"
+                className="absolute left-0 top-2 flex h-[22px] items-center gap-1.5"
                 style={{ transform: `translateY(${-input.chipScrollTop}px)` }}
               >
                 <IntegrationIcon
@@ -48,15 +56,16 @@ export function ComposerInputBox({
             </div>
             <button
               type="button"
-              aria-label="Remove connection context"
+              aria-label={ui("Remove connection context")}
               onClick={input.onClearConnectionChip}
-              className="absolute right-2.5 top-2 z-10 text-muted-foreground/60 hover:text-foreground transition-colors shrink-0"
+              className="absolute right-2.5 top-3 z-10 text-muted-foreground/60 hover:text-foreground transition-colors shrink-0"
             >
               <X className="w-3.5 h-3.5" />
             </button>
           </>
         )}
-        <textarea
+        <ComposerTextArea
+          aria-label={input.ariaLabel}
           ref={input.inputRef}
           value={input.value}
           onChange={input.onChange}
@@ -67,23 +76,18 @@ export function ComposerInputBox({
           placeholder={
             input.disabledReason
               ? input.disabledReason
-              : input.isLoading || input.isStreaming
-                ? "Message will be queued..."
-                : // Kept to the same rendered width as the previous legend so it
-                  // still fits the 600px minimum chat window on one line. `~`
-                  // and `#` stay live and are taught by the palette itself.
-                  "Ask about your screen... (/ for commands, @ chats, $ skills)"
+              : input.placeholder ?? ui("Ask a question or describe a task")
           }
           disabled={!input.canChat}
           spellCheck={false}
           autoCorrect="off"
           rows={1}
           className={cn(
-            "w-full min-h-[38px] border-0 bg-transparent px-3 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 caret-phosphor-strong resize-none overflow-y-auto scrollbar-minimal py-2",
+            "block w-full max-h-52 border-0 bg-transparent px-3 text-sm leading-[22px] font-mono placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 caret-signal resize-none overscroll-contain scrollbar-minimal py-2",
+            SCROLL_FADE,
             input.connectionChip ? "pr-7" : "pr-3",
           )}
           style={{
-            maxHeight: "150px",
             textIndent:
               input.connectionChip && input.chipPrefixWidth
                 ? `${input.chipPrefixWidth + 8}px`

@@ -48,9 +48,12 @@ export type AppEntitlement = {
 };
 
 export type AppEnterpriseAccount = {
+  team_id?: string | null;
   org_name?: string | null;
   role?: string | null;
   requires_enterprise_app?: boolean | null;
+  restrict_consumer_build_access?: boolean | null;
+  is_screenpipe_user?: boolean | null;
 };
 
 export type AppUser = User & {
@@ -84,7 +87,11 @@ export const PRICING_URL = screenpipeWebUrl("/onboarding", "https://screenpipe.c
 export const ENTERPRISE_BUILDS_URL = screenpipeWebUrl("/enterprise?tab=builds", "https://screenpipe.com");
 export const ENTERPRISE_DOWNLOAD_URL = screenpipeWebUrl("/api/download", "https://screenpipe.com");
 const VERIFIED_PAID_PLAN_IDS = new Set([
+  "basic",
   "standard",
+  "business",
+  "business_max",
+  "business_ultra",
   "pro",
   "pro_max",
   "pro_ultra",
@@ -121,6 +128,13 @@ export function isDevBillingBypassEnabled() {
     // features; the dedicated gate spec re-enables it via the key above.
     process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true"
   );
+}
+
+// Deliberately separate from the broader dev billing bypass. Most local and
+// preview builds should still exercise login unless this test-only affordance
+// was explicitly compiled into the frontend.
+export function isDevLoginSkipEnabled() {
+  return process.env.NEXT_PUBLIC_SCREENPIPE_DEV_LOGIN_SKIP === "true";
 }
 
 // Show the dev-only login helper (paste a token / screenpipe:// URL) when we are
@@ -258,6 +272,13 @@ export function getLocalPlanPolicy(
   return "unknown";
 }
 
+/** Free or missing/conflicting/unverified plan truth. */
+export function isFreeOrUnattributedUser(
+  user: AppUser | null | undefined,
+): boolean {
+  return getLocalPlanPolicy(user) !== "verified-paid";
+}
+
 export function hasFreePlanPolicy(user: AppUser | null | undefined): boolean {
   return getLocalPlanPolicy(user) === "verified-free";
 }
@@ -323,6 +344,31 @@ function hasVerifiedPaidPlanAt(
 /** Explicit server-verified paid truth, without the debug billing bypass. */
 export function hasVerifiedPaidPlan(user: AppUser | null | undefined): boolean {
   return hasVerifiedPaidPlanAt(user, Date.now());
+}
+
+/** Data sync is available only to eligible individual paid accounts. */
+export function canUseDataSync(user: AppUser | null | undefined): boolean {
+  if (!hasVerifiedPaidPlan(user)) return false;
+
+  const plan = user?.subscription_plan?.trim().toLowerCase();
+  const entitlement = asEntitlement(user?.entitlement);
+  const enterpriseAccount = getEnterpriseAccount(user);
+  const isScreenpipeAccount =
+    enterpriseAccount?.is_screenpipe_user === true ||
+    enterpriseAccount?.team_id?.trim().toLowerCase() === "screenpipe" ||
+    enterpriseAccount?.org_name?.trim().toLowerCase() === "screenpipe";
+  const isEnterpriseAccount =
+    Boolean(enterpriseAccount) ||
+    user?.entitlement_source?.trim().toLowerCase() === "enterprise" ||
+    entitlement?.source?.trim().toLowerCase() === "enterprise";
+
+  return (
+    (!isEnterpriseAccount || isScreenpipeAccount) &&
+    plan !== "none" &&
+    plan !== "standard" &&
+    plan !== "basic" &&
+    (isScreenpipeAccount || (plan !== "team" && plan !== "enterprise"))
+  );
 }
 
 function hasFutureGraceAt(
@@ -493,6 +539,27 @@ export function needsAppEntitlementRefresh(user: AppUser | null | undefined) {
   if (isLifetimeEntitlement(entitlement) || hasFutureGrace(entitlement)) return false;
   const appearsEntitled = user.app_entitled === true || entitlement?.features?.app === true;
   return appearsEntitled && !isEntitlementFresh(entitlement);
+}
+
+export function isBusinessSubscriptionPlan(plan: string | null | undefined): boolean {
+  // `cloud_subscribed` can remain true in persisted settings after the server
+  // resolves an old one-time license as Lifetime. Explicit plan truth must win
+  // or Lifetime/Basic users land in the Business-active branch with no upgrade
+  // action. Keep the no-plan fallback for older Business responses that only
+  // carried the cloud flag.
+  if (!plan) return true;
+  return [
+    "pro",
+    "business",
+    "pro_max",
+    "business_max",
+    "pro_ultra",
+    "business_ultra",
+    "team",
+    "enterprise",
+    "monthly",
+    "annual",
+  ].includes(plan.toLowerCase());
 }
 
 export function normalizePlanLabel(plan: string | null | undefined) {

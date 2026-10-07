@@ -54,22 +54,7 @@ fn is_excluded_app(app_lower: &str) -> bool {
 }
 
 /// Known browser app names (lowercase). Matches vision crate's list.
-const BROWSER_NAMES: &[&str] = &[
-    "chrome",
-    "firefox",
-    "safari",
-    "edge",
-    "brave",
-    "arc",
-    "chromium",
-    "vivaldi",
-    "opera",
-    "zen",
-    "comet",
-    "brave browser",
-    "google chrome",
-    "microsoft edge",
-];
+use crate::url_filter::BROWSER_NAMES;
 
 /// Check if the app (lowercase name) is a known browser.
 fn is_browser(app_lower: &str) -> bool {
@@ -282,6 +267,7 @@ fn extract_browser_url(
     pid: i32,
     app_name: &str,
     window_name: &str,
+    require_fresh: bool,
 ) -> Option<String> {
     // Tier 1: AXDocument attribute on the window.
     if let Some(url) = get_string_attr(window, ax::attr::document()) {
@@ -308,7 +294,12 @@ fn extract_browser_url(
     // Tier 3: Arc-only in-process AppleScript fallback (no web area found yet).
     let app_lower = app_name.to_lowercase();
     if app_lower.contains("arc") {
-        if let Some(url) = get_arc_url_cached(pid, window_name) {
+        let arc_url = if require_fresh {
+            run_arc_url_applescript()
+        } else {
+            get_arc_url_cached(pid, window_name)
+        };
+        if let Some(url) = arc_url {
             debug!("browser_url: tier3 Arc AppleScript hit: {}", url);
             return Some(url);
         }
@@ -1026,7 +1017,13 @@ impl MacosTreeWalker {
 
         // Extract browser URL (runs after tree walk to avoid affecting walk timeout)
         let browser_url = if is_browser(&app_lower) {
-            extract_browser_url(window, pid, &app_name, &window_name)
+            extract_browser_url(
+                window,
+                pid,
+                &app_name,
+                &window_name,
+                !self.config.included_urls.is_empty(),
+            )
         } else {
             None
         };
@@ -1083,6 +1080,7 @@ impl MacosTreeWalker {
             simhash,
             truncated: state.truncated,
             truncation_reason: state.truncation_reason,
+            retained_work_pending: false,
             max_depth_reached: state.max_depth_reached,
             window_bounds,
         }))
@@ -1883,6 +1881,7 @@ fn capture_structural_node(
             | "AXScrollArea"
             | "AXList"
             | "AXRow"
+            | "AXColumn"
             | "AXTable"
             | "AXWebArea"
             | "AXDocumentArticle"
@@ -1897,6 +1896,7 @@ fn capture_structural_node(
         role_str,
         "AXWindow"
             | "AXRow"
+            | "AXColumn"
             | "AXCell"
             | "AXWebArea"
             | "AXDocumentArticle"
@@ -1931,6 +1931,8 @@ fn capture_structural_node(
     let mut node =
         AccessibilityTreeNode::new(role_str.to_owned(), text, depth.min(255) as u8, bounds);
     node.on_screen = on_screen;
+    node.semantic_offscreen =
+        state.capture_parser_structure && semantic_offscreen(frame, on_screen);
     node.walk_index = state.node_count.min(u32::MAX as usize) as u32;
     node.semantic_only = true;
     node.automation_relevant = automation_relevant;
@@ -2206,6 +2208,8 @@ fn extract_text(
                     bounds.clone(),
                 );
                 node.on_screen = on_screen;
+                node.semantic_offscreen =
+                    state.capture_parser_structure && semantic_offscreen(frame, on_screen);
                 node.walk_index = state.node_count.min(u32::MAX as usize) as u32;
                 node.value = Some(trimmed.clone());
                 fill_ax_props(&mut node, elem, role_str, state.capture_semantic_structure);
@@ -2234,6 +2238,8 @@ fn extract_text(
                     bounds.clone(),
                 );
                 node.on_screen = on_screen;
+                node.semantic_offscreen =
+                    state.capture_parser_structure && semantic_offscreen(frame, on_screen);
                 node.walk_index = state.node_count.min(u32::MAX as usize) as u32;
                 fill_ax_props(&mut node, elem, role_str, state.capture_semantic_structure);
                 apply_primary_semantic_attrs(&mut node, attrs);
@@ -2255,6 +2261,8 @@ fn extract_text(
                 bounds,
             );
             node.on_screen = on_screen;
+            node.semantic_offscreen =
+                state.capture_parser_structure && semantic_offscreen(frame, on_screen);
             node.walk_index = state.node_count.min(u32::MAX as usize) as u32;
             fill_ax_props(&mut node, elem, role_str, state.capture_semantic_structure);
             apply_primary_semantic_attrs(&mut node, attrs);
@@ -2274,6 +2282,8 @@ fn extract_text(
                 bounds,
             );
             node.on_screen = on_screen;
+            node.semantic_offscreen =
+                state.capture_parser_structure && semantic_offscreen(frame, on_screen);
             node.walk_index = state.node_count.min(u32::MAX as usize) as u32;
             fill_ax_props(&mut node, elem, role_str, state.capture_semantic_structure);
             apply_primary_semantic_attrs(&mut node, attrs);
@@ -2356,6 +2366,15 @@ fn is_on_screen(
     ))
 }
 
+/// Keep proof of off-window geometry before screenshot normalization drops it.
+/// Zero-sized accessibility labels remain unknown, preserving screen-reader text.
+fn semantic_offscreen(frame: Option<(f64, f64, f64, f64)>, on_screen: Option<bool>) -> bool {
+    on_screen == Some(false)
+        && frame.is_some_and(|(x, y, w, h)| {
+            x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
+        })
+}
+
 /// Normalize an element's screen-absolute frame to 0-1 coordinates.
 ///
 /// Prefers **monitor-relative** normalization (matching the full-screen capture image).
@@ -2427,58 +2446,6 @@ fn get_bool_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<bool> {
     })
 }
 
-/// Frontmost app pid straight from the window server: owner of the first
-/// layer-0 window in CGWindowList's front-to-back z-order. Unlike
-/// NSWorkspace's `isActive`/`frontmostApplication` (KVO/notification-driven
-/// — silently stale in processes without a pumping AppKit run loop: CLI
-/// tools, plain worker threads), the window server answers fresh on every
-/// query, and pids/layers need no extra TCC permission.
-fn frontmost_pid_via_window_server() -> Option<i32> {
-    use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex};
-    use core_foundation::base::TCFType;
-    use core_foundation::dictionary::{CFDictionaryGetValueIfPresent, CFDictionaryRef};
-    use core_foundation::number::{CFNumber, CFNumberRef};
-    use core_foundation::string::CFString;
-    use core_graphics::window::{
-        copy_window_info, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
-        kCGWindowListOptionOnScreenOnly,
-    };
-
-    let options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
-    let list = copy_window_info(options, kCGNullWindowID)?;
-    let count = unsafe { CFArrayGetCount(list.as_concrete_TypeRef()) };
-    for i in 0..count {
-        unsafe {
-            let dict_ref = CFArrayGetValueAtIndex(list.as_concrete_TypeRef(), i);
-            if dict_ref.is_null() {
-                continue;
-            }
-            let dict = dict_ref as CFDictionaryRef;
-            let get_i64 = |key: &str| -> Option<i64> {
-                let k = CFString::new(key);
-                let mut v = std::ptr::null();
-                if CFDictionaryGetValueIfPresent(dict, k.as_concrete_TypeRef() as *const _, &mut v)
-                    != 0
-                    && !v.is_null()
-                {
-                    CFNumber::wrap_under_get_rule(v as CFNumberRef).to_i64()
-                } else {
-                    None
-                }
-            };
-            // Layer 0 = normal app windows; menus/overlays/status items sit
-            // on higher layers and must not win "frontmost".
-            if get_i64("kCGWindowLayer") != Some(0) {
-                continue;
-            }
-            if let Some(pid) = get_i64("kCGWindowOwnerPID") {
-                return Some(pid as i32);
-            }
-        }
-    }
-    None
-}
-
 fn resolve_focused_ax_app(
     capture_app_identity: bool,
 ) -> Option<(Retained<ax::UiElement>, i32, String, Option<String>)> {
@@ -2515,8 +2482,8 @@ fn resolve_focused_ax_app(
         }
         None
     });
-    let front_pid =
-        frontmost_pid_via_window_server().or_else(|| ws_active.as_ref().map(|(pid, _, _)| *pid));
+    let front_pid = crate::platform::macos::get_focused_pid_fresh()
+        .or_else(|| ws_active.as_ref().map(|(pid, _, _)| *pid));
 
     let sys = ax::UiElement::sys_wide();
     if let Ok(focused_app) = sys.focused_app() {
@@ -2835,6 +2802,24 @@ fn fill_ax_props(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retains_offwindow_geometry_without_suppressing_zero_sized_labels() {
+        assert!(semantic_offscreen(
+            Some((10.0, 2000.0, 80.0, 20.0)),
+            Some(false)
+        ));
+        assert!(!semantic_offscreen(
+            Some((10.0, 20.0, 80.0, 20.0)),
+            Some(true)
+        ));
+        assert!(!semantic_offscreen(Some((0.0, 0.0, 0.0, 0.0)), Some(false)));
+        assert!(!semantic_offscreen(
+            Some((f64::NAN, 0.0, 80.0, 20.0)),
+            Some(false)
+        ));
+        assert!(!semantic_offscreen(None, Some(false)));
+    }
 
     #[test]
     fn apple_screenshot_ui_is_excluded_from_walks() {

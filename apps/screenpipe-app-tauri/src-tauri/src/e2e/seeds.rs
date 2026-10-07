@@ -59,6 +59,12 @@ pub(crate) fn apply_settings(app: &AppHandle, store: &mut SettingsStore) {
     // "no-audio" keeps vision enabled while disabling only audio, which
     // lets Windows hosted runners exercise OCR without booting Whisper.
     let e2e_flags = flags();
+    if e2e_flags.iter().any(|f| f == "cloud-authenticated") {
+        let token = "e2e-fake-token-onboarding-background-ai-tools".to_string();
+        store.user.token = Some(token.clone());
+        crate::auth_token::seed_cloud_token(Some(token));
+        info!("E2E seed: synthetic cloud authentication enabled");
+    }
     if e2e_flags.iter().any(|f| f == "no-recording") {
         store.recording.disable_audio = true;
         store.recording.disable_vision = true;
@@ -67,6 +73,13 @@ pub(crate) fn apply_settings(app: &AppHandle, store: &mut SettingsStore) {
     if e2e_flags.iter().any(|f| f == "no-audio") {
         store.recording.disable_audio = true;
         info!("E2E seed: audio disabled");
+    }
+    if e2e_flags.iter().any(|f| f == "pii-text-redaction") {
+        store.recording.async_pii_redaction = true;
+        store.recording.async_image_pii_redaction = false;
+        store.recording.pii_backend = "local".to_string();
+        store.recording.pii_redaction_labels = vec!["secret".to_string()];
+        info!("E2E seed: local async text-PII reconciliation enabled");
     }
     if e2e_flags.iter().any(|f| f == "sck-capture-hang-once") {
         // The CoreGraphics recovery path cannot enforce SCK window-id
@@ -173,6 +186,9 @@ const DB_HARD_FAULT_CHECKPOINT_ATTEMPTS: usize = 10;
 /// - 1 accessibility frame whose snapshot carries REAL rendered text and no
 ///   stored boxes, so platform OCR must read the word off the pixels and the
 ///   highlight is placed from OCR-derived bounds.
+/// - 4 tightly spaced, visually distinct frames for the historical meeting
+///   replay journey. Each is indexed through OCR and accessibility so the UI
+///   must dedupe merged search results before playback.
 ///
 /// `insert_snapshot_frame_with_ocr` writes `full_text` (FTS-indexed by the
 /// `frames_ai` trigger → searchable) and `text_json` (per-word boxes →
@@ -433,10 +449,67 @@ async fn seed_search_fixture(db: &DatabaseManager) {
         warn!("e2e search-fixture: failed to insert missing-thumbnail frame: {error}");
     }
 
+    let replay_json = r#"[
+        {"text":"meeting","conf":"99","left":"0.10","top":"0.10","width":"0.12","height":"0.04"},
+        {"text":"replay","conf":"99","left":"0.24","top":"0.10","width":"0.10","height":"0.04"},
+        {"text":"fixture","conf":"99","left":"0.36","top":"0.10","width":"0.11","height":"0.04"}
+    ]"#;
+    let replay_colors = [
+        [28_u8, 34_u8, 46_u8],
+        [50_u8, 45_u8, 38_u8],
+        [34_u8, 50_u8, 44_u8],
+        [48_u8, 38_u8, 52_u8],
+    ];
+    for (index, color) in replay_colors.into_iter().enumerate() {
+        let replay_path = fixture_dir.join(format!("screenpipe-e2e-meeting-replay-{index}.jpg"));
+        let replay_image = ImageBuffer::from_fn(1600, 1000, |x, y| {
+            if (160..1440).contains(&x) && (180..820).contains(&y) {
+                Rgb([
+                    color[0].saturating_add(28),
+                    color[1].saturating_add(28),
+                    color[2].saturating_add(28),
+                ])
+            } else {
+                Rgb(color)
+            }
+        });
+        if let Err(error) = replay_image.save(&replay_path) {
+            warn!("e2e search-fixture: failed to create replay frame {index}: {error}");
+            continue;
+        }
+
+        let text = format!("meeting replay fixture frame {index}");
+        let window_name = format!("historical meeting replay frame {index}");
+        let timestamp = now - Duration::seconds(8 - index as i64 * 2);
+        if let Err(error) = db
+            .insert_snapshot_frame_with_ocr(
+                "e2e-meeting-replay",
+                timestamp,
+                &replay_path.to_string_lossy(),
+                Some("e2e replay"),
+                Some(&window_name),
+                None,
+                None,
+                true,
+                None,
+                Some(&text),
+                Some("accessibility"),
+                None,
+                None,
+                None,
+                Some((text.as_str(), replay_json, "e2e")),
+                None,
+            )
+            .await
+        {
+            warn!("e2e search-fixture: failed to insert replay frame {index}: {error}");
+        }
+    }
+
     info!(
         "e2e search-fixture: seeded searchable frames \
          (vector x12 + highlight + visibility x5 + real ocr + unstored ocr \
-          + missing thumbnail)"
+          + missing thumbnail + meeting replay x4)"
     );
 }
 
@@ -501,10 +574,10 @@ async fn checkpoint_hard_fault_fixture(database: &DatabaseManager) -> Result<(),
             .await
             .map_err(|error| format!("failed to checkpoint corruption fixture: {error}"))?;
         last_checkpoint = Some((busy, log_pages, checkpointed_pages));
-        // Production checkpoints deliberately use RESTART instead of TRUNCATE:
-        // the WAL can remain physically allocated even after every logical
-        // frame is durable in the main database. Requiring zero frames here
-        // confuses that safe allocation reuse with an incomplete checkpoint.
+        // Production checkpoints deliberately use PASSIVE: the WAL can remain
+        // physically allocated even after every logical frame is durable in
+        // the main database. Requiring zero frames here confuses safe
+        // allocation reuse with an incomplete checkpoint.
         if busy == 0 && checkpointed_pages == log_pages {
             return Ok(());
         }
@@ -515,6 +588,25 @@ async fn checkpoint_hard_fault_fixture(database: &DatabaseManager) -> Result<(),
     Err(format!(
         "corruption fixture did not fully checkpoint: last result {last_checkpoint:?}"
     ))
+}
+
+/// Match the live capture connection's platform locking regime while allowing
+/// queries only. A default read-only Unix VFS must not coexist with unix-excl.
+fn db_fault_observer_options(path: &std::path::Path) -> sqlx::sqlite::SqliteConnectOptions {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .pragma("wal_autocheckpoint", "0")
+        .pragma("query_only", "ON");
+    #[cfg(target_os = "macos")]
+    {
+        options.vfs("unix-excl").read_only(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        options.read_only(true)
+    }
 }
 
 /// Damage only an E2E-owned table in the disposable database, then route the
@@ -600,13 +692,7 @@ pub(super) async fn inject_db_hard_fault(
     file.sync_all()
         .map_err(|error| format!("failed to persist isolated database fixture: {error}"))?;
 
-    let options = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(&database_path)
-        .read_only(true)
-        .create_if_missing(false)
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .pragma("wal_autocheckpoint", "0")
-        .pragma("query_only", "ON");
+    let options = db_fault_observer_options(&database_path);
     let mut observer = options
         .connect()
         .await
@@ -644,6 +730,103 @@ pub(super) async fn inject_db_hard_fault(
         "databasePath": database_path.display().to_string(),
         "hardFaulted": database.write_queue_health().is_hard_faulted(),
     }))
+}
+
+/// Exercise the actual desktop retry dispatch with a synthetic IOERR status.
+/// Real SQLite xRead/xWrite injection is covered by screenpipe-db VFS tests;
+/// this feature-gated hook proves the packaged app resumes its recording owner.
+pub(super) async fn inject_db_transient_fault(
+    state: State<'_, RecordingState>,
+) -> Result<serde_json::Value, String> {
+    let database_path = require_isolated_db_hard_fault_seed()?;
+    let database = state
+        .server
+        .lock()
+        .await
+        .as_ref()
+        .map(|server| server.db.clone())
+        .ok_or_else(|| "embedded server is not running".to_string())?;
+    let preserved_id = database
+        .insert_audio_chunk("e2e-transient-before", None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let error = sqlx::Error::Protocol(
+        "error returned from database: (code: 10) disk I/O error [synthetic E2E status]".into(),
+    );
+    if !database.report_sqlite_error(&error) {
+        return Err("synthetic IOERR did not enter the production fault dispatch".into());
+    }
+    Ok(serde_json::json!({
+        "databasePath": database_path.display().to_string(),
+        "preservedChunkId": preserved_id,
+        "hardFaulted": database.write_queue_health().is_hard_faulted(),
+        "syntheticStatus": true,
+    }))
+}
+
+/// Trigger the real write-wedge lifecycle, observing the same reattach event
+/// the live transcription coordinator consumes. Never available outside E2E.
+pub(super) async fn recover_meeting_from_db_wedge(
+    app: AppHandle,
+    state: State<'_, RecordingState>,
+) -> Result<serde_json::Value, String> {
+    use futures::StreamExt;
+    require_isolated_db_hard_fault_seed()?;
+    let health = state
+        .server
+        .lock()
+        .await
+        .as_ref()
+        .ok_or("embedded server is not running")?
+        .db
+        .write_queue_health();
+    let mut reattach = screenpipe_events::subscribe_to_event::<serde_json::Value>(
+        screenpipe_audio::meeting_streaming::MEETING_STREAMING_REATTACH_EVENT,
+    );
+    let hook =
+        crate::recording::make_database_restart_hook(app, state.db_wedge_breaker.clone(), health);
+    hook(screenpipe_db::DatabaseRestartReason::PersistentWriteFailure);
+    timeout(TokioDuration::from_secs(90), reattach.next())
+        .await
+        .map_err(|_| "database recovery never reattached the live meeting".to_string())?
+        .map(|event| event.data)
+        .ok_or_else(|| "meeting reattach subscription ended".to_string())
+}
+
+/// A new production queue write after retry must be visible from a freshly
+/// opened query-only SQLite connection, alongside the pre-fault sentinel.
+pub(super) async fn db_retry_write_probe(
+    state: State<'_, RecordingState>,
+) -> Result<serde_json::Value, String> {
+    let database_path = require_isolated_db_hard_fault_seed()?;
+    let database = state
+        .server
+        .lock()
+        .await
+        .as_ref()
+        .map(|server| server.db.clone())
+        .ok_or_else(|| "embedded server is not running".to_string())?;
+    let new_id = database
+        .insert_audio_chunk("e2e-transient-after", None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let options = db_fault_observer_options(&database_path);
+    let mut observer = options.connect().await.map_err(|error| error.to_string())?;
+    let preserved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audio_chunks WHERE file_path = 'e2e-transient-before'",
+    )
+    .fetch_one(&mut observer)
+    .await
+    .map_err(|error| error.to_string())?;
+    let persisted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audio_chunks WHERE id = ? AND file_path = 'e2e-transient-after'",
+    )
+    .bind(new_id)
+    .fetch_one(&mut observer)
+    .await
+    .map_err(|error| error.to_string())?;
+    observer.close().await.map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({ "preservedRows": preserved, "persistedRows": persisted }))
 }
 
 /// Read-only lifecycle snapshot for the packaged desktop regression.

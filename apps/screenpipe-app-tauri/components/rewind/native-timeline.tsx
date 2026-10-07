@@ -36,7 +36,11 @@ import {
 import { TimelineDailySummary } from "@/components/rewind/timeline/daily-summary";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
+import { clearTimelineCache } from "@/lib/hooks/use-timeline-cache";
+import { clearTextCache } from "@/lib/hooks/use-frame-text-data";
 import { toast } from "@/components/ui/use-toast";
+import { useGT } from "gt-react";
+
 
 export interface NativeTimelineSelectionContext {
   start: string;
@@ -50,6 +54,15 @@ export interface NativeTimelineSelectionContext {
 export interface NativeTimelineExportSelection {
   start: string;
   end: string;
+}
+
+/** Outcome of a range deletion the Swift timeline performed itself. */
+export interface NativeTimelineDeleteRangeResult {
+  start: string;
+  end: string;
+  framesDeleted: number;
+  audioTranscriptionsDeleted: number;
+  error?: string;
 }
 
 export interface NativeTimelineDailySummaryRequest {
@@ -134,6 +147,16 @@ export function parseTimelineDailySummaryRequest(
   return parseTimelineDay(payload.date);
 }
 
+export function shouldClearActivityReturn(
+  previousSection: string,
+  activeSection: string,
+): boolean {
+  return (
+    (previousSection === "meetings" || previousSection === "timeline") &&
+    activeSection !== previousSection
+  );
+}
+
 /**
  * Routes the actions the Swift window cannot perform on its own. Mount once,
  * high enough that it outlives navigation.
@@ -144,11 +167,13 @@ export function parseTimelineDailySummaryRequest(
  */
 export function NativeTimelineBridge({
   onReturnToActivity,
-  onDismissActivityReturn,
+  onToggleSidebar,
 }: {
   onReturnToActivity?: () => void;
-  onDismissActivityReturn?: () => void;
+  onToggleSidebar?: () => void;
 } = {}) {
+
+  const ui = useGT();
   const [dailySummaryRequest, setDailySummaryRequest] = useState<{
     date: Date;
     id: number;
@@ -163,11 +188,11 @@ export function NativeTimelineBridge({
       listen("timeline-open-chat", () => {
         void commands.showWindow("Chat");
       }),
+      listen("timeline-toggle-sidebar", () => {
+        onToggleSidebar?.();
+      }),
       listen("timeline-return-to-activity", () => {
         onReturnToActivity?.();
-      }),
-      listen("timeline-dismiss-activity-return", () => {
-        onDismissActivityReturn?.();
       }),
       listen<string | NativeTimelineDailySummaryRequest>(
         "timeline-open-daily-summary",
@@ -209,11 +234,39 @@ export function NativeTimelineBridge({
             });
         },
       ),
+      listen<NativeTimelineDeleteRangeResult>(
+        "timeline-delete-range",
+        (event) => {
+          const result = event.payload;
+          if (result.error) {
+            toast({
+              variant: "destructive",
+              title: ui("deletion failed"),
+              description: result.error,
+            });
+            return;
+          }
+          toast({
+            title: ui("deleted"),
+            description: ui("removed {value1} frames, {value2} audio segments", { value1: result.framesDeleted, value2: result.audioTranscriptionsDeleted }),
+          });
+          // The React timeline shares these caches; a stale entry would
+          // resurrect deleted frames the next time it mounts.
+          clearTextCache();
+          void clearTimelineCache();
+          posthog.capture("timeline_range_deleted", {
+            duration_ms:
+              new Date(result.end).getTime() - new Date(result.start).getTime(),
+            frames_deleted: result.framesDeleted,
+            native_timeline: true,
+          });
+        },
+      ),
       listen<NativeTimelineExportSelection>(
         "timeline-export-video-selection",
         (event) => {
           const selection = event.payload;
-          toast({ title: "exporting selected timeline…" });
+          toast({ title: ui("Exporting selected timeline…") });
           void localFetch("/export", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -234,8 +287,8 @@ export function NativeTimelineBridge({
               const outputPath = String(result.output_path || "");
               if (outputPath) await revealItemInDir(outputPath);
               toast({
-                title: "timeline video exported",
-                description: outputPath || "Saved in screenpipe exports.",
+                title: ui("Timeline video exported"),
+                description: outputPath || ui("Saved in screenpipe exports."),
               });
               posthog.capture("timeline_selection_exported", {
                 selection_duration_ms:
@@ -251,9 +304,9 @@ export function NativeTimelineBridge({
               );
               toast({
                 variant: "destructive",
-                title: "timeline export failed",
+                title: ui("Timeline export failed"),
                 description:
-                  error instanceof Error ? error.message : "Try again.",
+                  error instanceof Error ? error.message : ui("Try again."),
               });
             });
         },
@@ -264,7 +317,7 @@ export function NativeTimelineBridge({
         void subscription.then((unlisten) => unlisten());
       }
     };
-  }, [onDismissActivityReturn, onReturnToActivity]);
+  }, [onReturnToActivity, onToggleSidebar]);
 
   if (!dailySummaryRequest) return null;
 
@@ -297,6 +350,7 @@ export function NativeTimeline({
   closeOnEscape?: boolean;
   showActivityReturn?: boolean;
 }) {
+
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [available, setAvailable] = useState<boolean | null>(null);
   // `getApiPort()` is intentionally synchronous, but its value starts at the
@@ -389,45 +443,48 @@ export function NativeTimeline({
 
     const timestamp = navigation.timestamp || null;
     const frameId = navigation.frameId || null;
+    let cancelled = false;
+    let complete = false;
+    let inFlight = false;
+    const finish = () => {
+      if (cancelled) return;
+      complete = true;
+      setNativePendingNavigation((pending) =>
+        pending === navigation ? null : pending,
+      );
+      const current = useTimelineStore.getState().pendingNavigation;
+      if (
+        current?.timestamp === navigation.timestamp &&
+        current?.frameId === navigation.frameId
+      ) {
+        setPendingNavigation(null);
+      }
+    };
     const timers = NATIVE_TIMELINE_NAVIGATION_RETRY_MS.map((delay) =>
-      window.setTimeout(() => {
-        // Timestamp first ensures a past-day artifact loads the right day.
-        // Frame id then refines a screen artifact to the exact captured frame.
-        if (timestamp) {
-          void commands.nativeTimelineNavigate(timestamp, null).catch(() => {
-            // A later retry runs after the native day finishes loading.
-          });
-        }
-        if (frameId) {
-          void commands.nativeTimelineNavigate(null, frameId).catch(() => {
-            // The target frame may not exist until the timestamp request lands.
-          });
+      window.setTimeout(async () => {
+        if (cancelled || complete || inFlight) return;
+        inFlight = true;
+        try {
+          // Native returns false until the requested day/frame is available.
+          // Once it selects the target, retries must stop: they would undo
+          // any subsequent scrubbing or date change by the user.
+          if (timestamp && !(await commands.nativeTimelineNavigate(timestamp, null))) return;
+          if (cancelled || complete) return;
+          if (frameId && !(await commands.nativeTimelineNavigate(null, frameId))) return;
+          finish();
+        } catch {
+          // Retry only a failed or unresolved hand-off.
+        } finally {
+          inFlight = false;
         }
       }, delay),
     );
     timers.push(
-      window.setTimeout(
-        () => {
-          const current = useTimelineStore.getState().pendingNavigation;
-          if (
-            !current ||
-            (current.timestamp === navigation.timestamp &&
-              current.frameId === navigation.frameId)
-          ) {
-            setNativePendingNavigation((pending) =>
-              pending?.timestamp === navigation.timestamp &&
-              pending?.frameId === navigation.frameId
-                ? null
-                : pending,
-            );
-            setPendingNavigation(null);
-          }
-        },
-        NATIVE_TIMELINE_NAVIGATION_RETRY_MS.at(-1)! + 500,
-      ),
+      window.setTimeout(finish, NATIVE_TIMELINE_NAVIGATION_RETRY_MS.at(-1)! + 500),
     );
 
     return () => {
+      cancelled = true;
       for (const timer of timers) window.clearTimeout(timer);
     };
   }, [attached, available, nativePendingNavigation, setPendingNavigation]);

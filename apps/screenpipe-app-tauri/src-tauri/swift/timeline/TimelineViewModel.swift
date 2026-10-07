@@ -43,6 +43,12 @@ enum FrameImageSource: Equatable {
 /// Failed video chunks are remembered so a broken file is not retried on every
 /// scrub tick.
 actor FrameImageLoader {
+    private enum VideoFrameResult {
+        case image(NSImage)
+        case mismatchedSample
+        case unavailable
+    }
+
     private let rest: TimelineRESTClient
     private var failedChunks: [String: Date] = [:]
     private var calibratedFPS: [String: Double] = [:]
@@ -72,8 +78,17 @@ actor FrameImageLoader {
             }
         case .videoChunk(let url, let offset, let fps):
             if !Task.isCancelled, !isChunkFailed(url.path) {
-                image = await videoFrame(url: url, offsetIndex: offset, fps: fps)
-                if image == nil, !Task.isCancelled { markChunkFailed(url.path) }
+                switch await videoFrame(url: url, offsetIndex: offset, fps: fps) {
+                case .image(let decoded):
+                    image = decoded
+                case .mismatchedSample:
+                    // The chunk is readable, but AVFoundation did not return
+                    // the requested sample. Fall back to the exact frame API
+                    // without quarantining all later seeks in this chunk.
+                    break
+                case .unavailable:
+                    if !Task.isCancelled { markChunkFailed(url.path) }
+                }
             }
             if image == nil, !Task.isCancelled, !device.frameId.isEmpty {
                 image = await httpImage(frameId: device.frameId)
@@ -102,11 +117,16 @@ actor FrameImageLoader {
     /// Native equivalent of the webview's `<video>` seek: decode one frame at
     /// `offset_index / fps`, calibrating fps against the real duration when the
     /// server's value would overshoot.
-    private func videoFrame(url: URL, offsetIndex: Int, fps: Double) async -> NSImage? {
+    private func videoFrame(url: URL, offsetIndex: Int, fps: Double) async -> VideoFrameResult {
         let asset = AVURLAsset(url: url)
-        guard let duration = try? await asset.load(.duration) else { return nil }
+        guard let duration = try? await asset.load(.duration) else { return .unavailable }
         let seconds = CMTimeGetSeconds(duration)
-        guard seconds.isFinite, seconds > 0 else { return nil }
+        guard seconds.isFinite, seconds > 0 else { return .unavailable }
+
+        guard let tracks = try? await asset.loadTracks(withMediaType: .video),
+              let track = tracks.first else { return .unavailable }
+        let naturalTimeScale = (try? await track.load(.naturalTimeScale)) ?? duration.timescale
+        guard naturalTimeScale > 0 else { return .unavailable }
 
         let effective = effectiveFPS(path: url.path, offsetIndex: offsetIndex, serverFPS: fps, duration: seconds)
         let target = min(Double(offsetIndex) / max(effective, 0.0001), seconds - 0.01)
@@ -115,12 +135,25 @@ actor FrameImageLoader {
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
-        let time = CMTime(seconds: max(0, target), preferredTimescale: 600)
+        // Compact captures use a source-specific timebase. Quantizing every
+        // seek to 1/600 s can put the request one tick before the target sample,
+        // making AVFoundation return the previous frame even at zero tolerance.
+        let targetTicks = (max(0, target) * Double(naturalTimeScale)).rounded()
+        let time = CMTime(value: Int64(targetTicks), timescale: naturalTimeScale)
         return await withTaskCancellationHandler {
             guard !Task.isCancelled,
-                  let cgImage = try? await generator.image(at: time).image,
-                  !Task.isCancelled else { return nil }
-            return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                  let result = try? await generator.image(at: time),
+                  !Task.isCancelled else { return .unavailable }
+            let actual = CMTimeGetSeconds(result.actualTime)
+            let requested = CMTimeGetSeconds(time)
+            let maximumDrift = 0.5 / max(effective, 0.0001)
+            guard actual.isFinite,
+                  requested.isFinite,
+                  abs(actual - requested) < maximumDrift else {
+                return .mismatchedSample
+            }
+            let image = result.image
+            return .image(NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)))
         } onCancel: {
             generator.cancelAllCGImageGeneration()
         }
@@ -209,8 +242,11 @@ final class TimelineViewModel: ObservableObject {
     }
     @Published var filters = TimelineFilters()
     @Published var selection: TimelineSelection?
+    /// True while `POST /data/delete-range` is in flight for the selection.
+    @Published private(set) var isDeletingSelection = false
     @Published var searchReview: TimelineSearchReview?
     @Published var currentDate = Date()
+    @Published private(set) var historyAccessRestricted: Bool
     @Published private(set) var connectionError: String?
     @Published private(set) var isLoading = true
     @Published private(set) var isNavigating = false
@@ -311,6 +347,7 @@ final class TimelineViewModel: ObservableObject {
 
     init(config: TimelineAPIConfig = .fromEnvironment()) {
         self.config = config
+        self.historyAccessRestricted = config.historyAccessRestricted
         self.rest = TimelineRESTClient(config: config)
         self.stream = FrameStreamClient(config: config)
         self.images = FrameImageLoader(rest: rest)
@@ -369,8 +406,10 @@ final class TimelineViewModel: ObservableObject {
     /// transport made that correction a no-op and left a permanent connection
     /// error over an otherwise healthy app.
     @discardableResult
-    func updateAPIConfig(_ updated: TimelineAPIConfig) -> Bool {
-        guard updated != config else { return false }
+    func updateAPIConfig(_ updated: TimelineAPIConfig, forceReload: Bool = false) -> Bool {
+        // A successful deletion also needs a fresh stream and uncached data,
+        // even though it uses the same local API instance.
+        guard forceReload || updated != config else { return false }
 
         let searchToResume = pendingSearchNavigation ?? searchReview?.activeResult.map {
             (frameId: Optional($0.frameId), timestamp: $0.timestamp)
@@ -379,6 +418,13 @@ final class TimelineViewModel: ObservableObject {
         stop()
         apiGeneration &+= 1
         config = updated
+        historyAccessRestricted = updated.historyAccessRestricted
+        if !TimelineDateNavigation.isCalendarDateAllowed(
+            currentDate,
+            historyAccessRestricted: historyAccessRestricted
+        ) {
+            currentDate = Date()
+        }
         rest = TimelineRESTClient(config: updated)
         stream = FrameStreamClient(config: updated)
         stream.delegate = self
@@ -481,6 +527,10 @@ final class TimelineViewModel: ObservableObject {
     // MARK: Requests
 
     func requestDay(_ date: Date, order: String = "descending") {
+        guard TimelineDateNavigation.isCalendarDateAllowed(
+            date,
+            historyAccessRestricted: historyAccessRestricted
+        ) else { return }
         let key = TimelineDateNavigation.dayKey(date)
         let range = TimelineDateNavigation.dayRange(for: date)
         requestedDays.insert(key)
@@ -1096,7 +1146,11 @@ final class TimelineViewModel: ObservableObject {
     // MARK: Dates
 
     func jumpDay(_ delta: Int) {
-        let target = TimelineDateNavigation.jumpDay(from: currentDate, delta: delta)
+        let target = TimelineDateNavigation.jumpDay(
+            from: currentDate,
+            delta: delta,
+            historyAccessRestricted: historyAccessRestricted
+        )
         // An older/empty day may never yield a frame batch, so its navigation
         // guard must not trap the user there. Moving forward supersedes that
         // pending request; moving further backward stays guarded to avoid a
@@ -1126,6 +1180,10 @@ final class TimelineViewModel: ObservableObject {
         preservePendingSearchNavigation: Bool = false
     ) {
         guard !isNavigating || supersedePendingNavigation else { return }
+        guard TimelineDateNavigation.isCalendarDateAllowed(
+            date,
+            historyAccessRestricted: historyAccessRestricted
+        ) else { return }
         navigationGeneration += 1
         if !preservePendingSearchNavigation { pendingSearchNavigation = nil }
         let generation = navigationGeneration
@@ -1153,7 +1211,13 @@ final class TimelineViewModel: ObservableObject {
     }
 
     var isAtToday: Bool { TimelineDateNavigation.isAtToday(currentDate) }
-    var isAtEarliest: Bool { TimelineDateNavigation.isAtEarliest(currentDate, earliest: earliestRecording) }
+    var isAtEarliest: Bool {
+        TimelineDateNavigation.isAtEarliest(
+            currentDate,
+            earliest: earliestRecording,
+            historyAccessRestricted: historyAccessRestricted
+        )
+    }
 
     // MARK: Selection
 
@@ -1177,6 +1241,76 @@ final class TimelineViewModel: ObservableObject {
 
     func clearSelection() {
         selection = nil
+    }
+
+    /// Deletes the selected range on the server, then reloads the day so cached
+    /// frames and audio on neighbouring frames reflect the deletion. The
+    /// outcome goes over the action bridge so the webview can toast and clear
+    /// its own caches; the webview does not perform the delete.
+    func deleteSelectionRange() {
+        guard let selection, !isDeletingSelection else { return }
+        let start = selection.start
+        let end = selection.end
+        let generation = apiGeneration
+        isDeletingSelection = true
+        Task { [rest] in
+            var payload = TimelineDeleteRangeResultPayload(
+                start: selection.startTimestamp,
+                end: selection.endTimestamp,
+                framesDeleted: 0,
+                audioTranscriptionsDeleted: 0,
+                error: nil
+            )
+            do {
+                let response = try await rest.deleteRange(
+                    start: selection.startTimestamp, end: selection.endTimestamp
+                )
+                payload.framesDeleted = response.framesDeleted
+                payload.audioTranscriptionsDeleted = response.audioTranscriptionsDeleted
+            } catch {
+                payload.error = String(describing: error)
+            }
+            await MainActor.run {
+                self.isDeletingSelection = false
+                guard generation == self.apiGeneration else { return }
+                if payload.error == nil {
+                    self.reloadAfterDeletion(from: start, to: end)
+                    self.selection = nil
+                }
+                if let action = payload.actionString {
+                    self.emitAction(action)
+                }
+            }
+        }
+    }
+
+    private func reloadAfterDeletion(from start: Date, to end: Date) {
+        let result = TimelineRangeRemoval.remove(
+            from: start,
+            to: end,
+            frames: frames,
+            currentIndex: currentIndex
+        )
+        let preferredSurvives = preferredFrameId.map {
+            !result.removedFrameIds.contains($0)
+        } ?? false
+        pendingSearchNavigation = nil
+        if (result.nextIndex > 0 || preferredSurvives),
+           result.frames.indices.contains(result.nextIndex),
+           let timestamp = TimelineFrames.date(of: result.frames[result.nextIndex]) {
+            pendingSearchNavigation = (
+                frameId: preferredSurvives ? preferredFrameId
+                    : result.frames[result.nextIndex].devices.first?.frameId,
+                timestamp: timestamp
+            )
+        }
+        // Search results can also contain the deleted text. The normal API
+        // reset clears buffered frames, audio, tags, pixels and derived state;
+        // its pending navigation preserves the surviving playhead, while an
+        // unanchored index zero continues following live captures.
+        searchReview = nil
+        updateAPIConfig(config, forceReload: true)
+        if result.frames.isEmpty { isLoading = false }
     }
 
     func askAISelectionAction() -> String? {
@@ -1450,6 +1584,7 @@ final class TimelineViewModel: ObservableObject {
     }
 
     var isRunningForTesting: Bool { isStarted }
+    var frameStreamForTesting: FrameStreamClient { stream }
     var hasActiveZoomTimerForTesting: Bool { zoomTimer != nil }
     func hasRequestedDayForTesting(_ date: Date) -> Bool {
         requestedDays.contains(TimelineDateNavigation.dayKey(date))
@@ -1459,22 +1594,44 @@ final class TimelineViewModel: ObservableObject {
 // MARK: - Stream delegate
 
 extension TimelineViewModel: FrameStreamClientDelegate {
-    nonisolated func frameStream(didReceive batch: [StreamTimeSeriesResponse]) {
+    nonisolated func frameStream(_ stream: FrameStreamClient, didReceive batch: [StreamTimeSeriesResponse]) {
         Task { @MainActor in
+            guard self.stream === stream else { return }
             if !batch.isEmpty { self.connectionError = nil }
             self.pendingBatch.append(contentsOf: batch)
         }
     }
 
-    nonisolated func frameStream(didReceive audioUpdate: AudioUpdate) {
+    nonisolated func frameStream(_ stream: FrameStreamClient, didComplete completion: FrameStreamCompletion) {
         Task { @MainActor in
+            guard self.stream === stream else { return }
+            self.completeFrameRequest(completion)
+        }
+    }
+
+    func completeFrameRequest(_ completion: FrameStreamCompletion) {
+        let range = TimelineDateNavigation.dayRange(for: currentDate)
+        // A completed background day or a narrow search window cannot end the
+        // current day's loader. The server echoes the original request bounds.
+        guard abs(completion.start.timeIntervalSince(range.start)) < 0.001,
+              abs(completion.end.timeIntervalSince(range.end)) < 0.001 else { return }
+        flushPending()
+        isLoading = false
+        isNavigating = false
+        connectionError = completion.error
+    }
+
+    nonisolated func frameStream(_ stream: FrameStreamClient, didReceive audioUpdate: AudioUpdate) {
+        Task { @MainActor in
+            guard self.stream === stream else { return }
             self.frames = TimelineMerge.applyAudioUpdate(audioUpdate, to: self.frames)
             self.scheduleMeetingDetection()
         }
     }
 
-    nonisolated func frameStream(didChangeState state: FrameStreamClient.State) {
+    nonisolated func frameStream(_ stream: FrameStreamClient, didChangeState state: FrameStreamClient.State) {
         Task { @MainActor in
+            guard self.stream === stream else { return }
             switch state {
             case .failed(let message):
                 self.connectionError = message
@@ -1484,8 +1641,9 @@ extension TimelineViewModel: FrameStreamClientDelegate {
         }
     }
 
-    nonisolated func frameStream(didFail message: String) {
+    nonisolated func frameStream(_ stream: FrameStreamClient, didFail message: String) {
         Task { @MainActor in
+            guard self.stream === stream else { return }
             // A transport hiccup with frames already on screen is not worth a
             // full-screen error; the client reconnects on its own. The first
             // failed handshake is also expected while the local server wakes,

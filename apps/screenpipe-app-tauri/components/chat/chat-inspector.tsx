@@ -29,6 +29,8 @@ import {
   openSearchForQuery,
 } from "@/lib/timeline-navigation";
 import { cn } from "@/lib/utils";
+import { useGT } from "gt-react";
+
 
 interface ChatInspectorProps {
   outputs: SourceCitation[];
@@ -48,6 +50,13 @@ export function ChatInspectorPopover({
   sources,
   onOpenFile,
 }: ChatInspectorPopoverProps) {
+
+  const ui = useGT();
+  // Keep the control out of the toolbar until there is something to inspect,
+  // while still mounting it when an explicit action such as `/inspector`
+  // opens the empty state.
+  if (!open && outputs.length === 0 && sources.length === 0) return null;
+
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>
@@ -59,8 +68,8 @@ export function ChatInspectorPopover({
             "h-7 w-7",
             open && "bg-muted ring-2 ring-primary ring-offset-1 ring-offset-background",
           )}
-          title="Toggle pinned summary"
-          aria-label="Toggle pinned summary"
+          title={ui("Toggle pinned summary")}
+          aria-label={ui("Toggle pinned summary")}
           aria-pressed={open}
           onMouseDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
@@ -71,7 +80,7 @@ export function ChatInspectorPopover({
       <PopoverContent
         align="end"
         sideOffset={8}
-        className="w-[22rem] max-w-[calc(100vw-2rem)] rounded-2xl p-0 shadow-xl"
+        className="w-[22rem] max-w-[calc(100vw-2rem)] rounded-lg p-0 shadow-xl"
         onInteractOutside={(event) => event.preventDefault()}
       >
         <ChatInspector
@@ -89,10 +98,12 @@ export function ChatInspector({
   sources,
   onOpenFile,
 }: ChatInspectorProps) {
+
+  const ui = useGT();
   return (
     <div
       role="region"
-      aria-label="Pinned summary"
+      aria-label={ui("Pinned summary")}
       className="max-h-[min(34rem,calc(100vh-5rem))] overflow-y-auto"
     >
       <div className="px-4 pb-2 pt-3">
@@ -125,7 +136,7 @@ export function ChatInspector({
       <Separator />
 
       <div className="px-4 pb-1 pt-3">
-        <h3 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        <h3 className="text-[11px] font-medium normal-case tracking-wider text-muted-foreground">
           Sources
         </h3>
       </div>
@@ -157,6 +168,7 @@ function SourceIcon({
   source: SourceCitation;
   onOpenFile: (path: string) => void;
 }) {
+
   const Icon = KIND_ICON[source.kind] ?? FileText;
 
   const handleClick = React.useCallback(() => {

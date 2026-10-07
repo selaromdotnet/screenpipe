@@ -19,6 +19,10 @@ on:
         description: "Windows launch-smoke run only: build the Windows CLI package and run the native + Intel SDE (non-AVX2) probes; skip macOS/Linux builds, EV signing, Sentry symbols, npm publish, and the GitHub release (publish-npm/release skip via their skipped needs)"
         type: boolean
         default: false
+      npm_only:
+        description: "Build and publish the npm packages without creating or updating the rolling GitHub CLI release"
+        type: boolean
+        default: false
 
 concurrency:
   # Serialize releases — aborting a release mid-flight is worse than waiting.
@@ -26,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1
@@ -343,6 +347,10 @@ jobs:
           Write-Host "x64: ORT_LIB_LOCATION=$libDir (dynamic import link)"
           Get-ChildItem "$extractDir/lib"
 
+      - name: Install Vulkan SDK for Whisper
+        shell: pwsh
+        run: ./.github/scripts/setup-vulkan-windows.ps1 -Architecture x64 -InstallSdk -StageRuntimeDirectory apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2/lib
+
       - name: Install wget (Windows)
         shell: pwsh
         run: |
@@ -364,6 +372,10 @@ jobs:
           bun scripts/setup_openblas.js
           "OPENBLAS_PATH=${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Configure Ninja for Windows native dependencies
+        shell: pwsh
+        run: ./.github/scripts/setup-ninja-windows.ps1
+
       - name: Shorten target dir to avoid MAX_PATH
         shell: pwsh
         run: |
@@ -377,6 +389,13 @@ jobs:
 
       - name: Build CLI
         env:
+          # Cargo must pass the short path to CMake; the target junction alone
+          # leaves nested Vulkan compiler probes using the long checkout path.
+          CARGO_TARGET_DIR: "C:/t"
+          # libsamplerate-sys searches build/<profile> on MSVC. Multi-config
+          # Ninja preserves that layout; opt-level="s" requires MinSizeRel.
+          CMAKE_GENERATOR: "Ninja Multi-Config"
+          CMAKE_CONFIGURATION_TYPES: "Debug;Release;RelWithDebInfo;MinSizeRel"
           CARGO_PROFILE_RELEASE_STRIP: "none"
           CARGO_PROFILE_RELEASE_PANIC: "abort"
           CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
@@ -415,7 +434,7 @@ jobs:
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: |
-          cargo build --release -p screenpipe-engine --bin screenpipe --features directml,redact-onnx-directml --target x86_64-pc-windows-msvc
+          cargo build --release -p screenpipe-engine --bin screenpipe --features directml,vulkan,redact-onnx-directml --target x86_64-pc-windows-msvc
 
       - name: Upload debug symbols to Sentry
         # Skipped on smoke_only dispatches: nothing from those builds ships.
@@ -505,6 +524,8 @@ jobs:
           # DirectML.dll: the DirectML-flavored onnxruntime.dll needs it for the
           # DML EP (staged by the "Download ONNX Runtime" step).
           Copy-Item "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2/lib/DirectML.dll" "$packageDir/bin/"
+          Copy-Item "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2/lib/vulkan-1.dll" "$packageDir/bin/"
+          Copy-Item "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2/lib/VulkanRT-License.txt" "$packageDir/bin/"
           # Copy OpenBLAS DLL(s) for qwen3-asr (libopenblas.dll or openblas.dll)
           $openblasBin = "apps/screenpipe-app-tauri/src-tauri/openblas/bin"
           if (Test-Path $openblasBin) {
@@ -885,6 +906,9 @@ jobs:
 
   publish-npm:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     # smoke-windows: nothing ships unless the package launches + inits ONNX
     # on non-AVX2 CPUs (#3125 regression guard).
     needs: [build-macos, build-windows, build-linux, smoke-windows]
@@ -895,7 +919,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # npm trusted publishing requires Node >=22.14 and npm >=11.5.1.
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
       - name: Setup Bun
@@ -982,13 +1007,17 @@ jobs:
       # every error — versions 0.3.290..0.3.295 all "succeeded" without ever
       # publishing because the npm token had expired and nobody noticed.
       - name: Publish platform packages
+        # npm prefers the job's OIDC identity when a package has trusted
+        # publishing configured, then falls back to this shared release token.
+        # Keep the fallback until every platform package has its own trusted
+        # publisher configuration on npm.
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in screenpipe-darwin-arm64 screenpipe-darwin-x64 screenpipe-linux-x64 screenpipe-win32-x64; do
             cd packages/cli/$pkg
             err=$(mktemp)
-            if npm publish --access public 2>"$err"; then
+            if npm publish --access public --tag latest 2>"$err"; then
               echo "::notice::published $pkg"
             else
               if grep -q "You cannot publish over the previously published versions" "$err"; then
@@ -1048,7 +1077,7 @@ jobs:
         run: |
           cd packages/cli/screenpipe
           err=$(mktemp)
-          if npm publish --access public 2>"$err"; then
+          if npm publish --access public --tag latest 2>"$err"; then
             echo "::notice::published main package"
           else
             if grep -q "You cannot publish over the previously published versions" "$err"; then
@@ -1061,6 +1090,9 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
+    if: ${{ !inputs.npm_only }}
+    permissions:
+      contents: write
     # smoke-windows: nothing ships unless the package launches + inits ONNX
     # on non-AVX2 CPUs (#3125 regression guard).
     needs: [build-macos, build-windows, build-linux, smoke-windows]

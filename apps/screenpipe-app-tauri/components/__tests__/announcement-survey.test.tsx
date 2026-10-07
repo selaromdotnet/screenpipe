@@ -49,6 +49,34 @@ const ANNOUNCEMENT = parseAnnouncement({
 })!;
 
 describe("announcement survey", () => {
+  it("randomizes acquisition sources without reordering other questions", () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+
+    try {
+      render(<SurveyForm announcement={ANNOUNCEMENT} onSubmit={() => true} />);
+
+      expect(
+        screen
+          .getAllByRole("radio")
+          .map((choice) => choice.getAttribute("Value")),
+      ).toEqual(["friend", "hn"]);
+      expect(
+        screen
+          .getAllByRole("checkbox")
+          .map((choice) => choice.getAttribute("Value")),
+      ).toEqual(["memory", "automation"]);
+
+      fireEvent.click(screen.getByLabelText("A friend or colleague"));
+      expect(
+        screen
+          .getAllByRole("radio")
+          .map((choice) => choice.getAttribute("Value")),
+      ).toEqual(["friend", "hn"]);
+    } finally {
+      random.mockRestore();
+    }
+  });
+
   it("requires configured answers and submits option ids only", () => {
     const onSubmit = vi.fn(() => true);
     render(<SurveyForm announcement={ANNOUNCEMENT} onSubmit={onSubmit} />);
@@ -101,9 +129,9 @@ describe("announcement survey", () => {
       expect(screen.getByTestId("announcement-sidebar")).toBeInTheDocument(),
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "open survey: quick question" }),
+      screen.getByRole("button", { name: "Open survey: quick question" }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "dismiss survey" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss survey" }));
     expect(onOpen).toHaveBeenCalledOnce();
     expect(onDismiss).toHaveBeenCalledOnce();
     expect(onShown).toHaveBeenCalled();

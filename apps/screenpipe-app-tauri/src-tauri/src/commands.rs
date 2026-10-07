@@ -8,10 +8,15 @@
 mod native_actions;
 // Public so the generated command registry can name the handler by full path.
 pub(crate) mod overlay_anchor;
+pub(crate) mod starred_sessions;
 
 use crate::{
+    analytics::{AnalyticsManager, Attribution},
     native_notification, native_shortcut_reminder,
-    store::{OnboardingStore, SettingsStore},
+    store::{
+        OnboardingStore, SettingsStore, TRIAL_ACTIVATION_PAYWALL_STEP,
+        TRIAL_ACTIVATION_SUMMARY_STEP, TRIAL_ACTIVATION_UNLOCKED_STEP,
+    },
     updates::is_enterprise_build,
     window::{RewindWindowId, ShowRewindWindow},
 };
@@ -20,7 +25,6 @@ use crate::window::GatedPanelPlacement;
 use crate::window::GatedWindowPlacement;
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
-#[cfg(not(target_os = "macos"))]
 use tauri_plugin_opener::OpenerExt;
 use tracing::{debug, error, info, warn};
 
@@ -61,12 +65,28 @@ fn log_webview_build_failure(label: &str, url_hint: &str, err: &(impl std::fmt::
 mod tests {
     use super::{
         enterprise_license_key_sha256, fallback_local_api_config, is_login_callback_scheme,
-        merge_enterprise_file_configs, persist_enterprise_device_config,
+        merge_enterprise_file_configs, normalize_enterprise_config_value,
+        persist_enterprise_device_config,
         persist_recovered_enterprise_device_config, read_enterprise_config_from_path,
         notification_belongs_to_overlay, recovery_anchor_license_key, save_enterprise_team_config,
         scan_chat_entries_by_mtime, shortcut_overlay_hidden_by_choice,
         should_resume_snoozed_overlay, EnterpriseFileConfig, RecoveredEnterpriseDeviceConfig,
     };
+
+    #[test]
+    fn shortcut_reminder_star_hint_tracks_registered_settings() {
+        let mut settings = crate::store::SettingsStore::default();
+        let default_shortcut = settings.star_session_shortcut.clone();
+        assert_eq!(super::shortcut_reminder_payload(&settings)["star"], default_shortcut);
+        settings.star_session_shortcut.clear();
+        assert_eq!(super::shortcut_reminder_payload(&settings)["star"], default_shortcut);
+        settings.star_session_shortcut = "Alt+Shift+J".into();
+        assert_eq!(super::shortcut_reminder_payload(&settings)["star"], "Alt+Shift+J");
+        settings.disabled_shortcuts.push("starSessionShortcut".into());
+        assert_eq!(super::shortcut_reminder_payload(&settings)["star"], "");
+        settings.star_session_shortcut.clear();
+        assert_eq!(super::shortcut_reminder_payload(&settings)["star"], "");
+    }
 
     /// `get_local_api_config` must never await the server mutex.
     ///
@@ -307,6 +327,19 @@ mod tests {
     }
 
     #[test]
+    fn registry_enterprise_key_ignores_blank_values() {
+        assert_eq!(
+            normalize_enterprise_config_value(Some("  ENT-REGISTRY-KEY  ".to_string())),
+            Some("ENT-REGISTRY-KEY".to_string())
+        );
+        assert_eq!(
+            normalize_enterprise_config_value(Some("   ".to_string())),
+            None
+        );
+        assert_eq!(normalize_enterprise_config_value(None), None);
+    }
+
+    #[test]
     fn chat_entries_missing_dir_is_empty() {
         // First run (no chats dir yet) must be a clean empty list, not an error.
         let res =
@@ -383,6 +416,17 @@ pub fn is_enterprise_build_cmd(app_handle: tauri::AppHandle) -> bool {
     is_enterprise_build(&app_handle)
 }
 
+/// Whether the running local API currently enforces the rolling history window.
+/// This is the authoritative app-wide value shared by every webview and backend
+/// route, so detached windows do not depend on duplicating account hydration.
+#[tauri::command]
+#[specta::specta]
+pub fn is_history_access_restricted(
+    state: tauri::State<'_, crate::recording::RecordingState>,
+) -> bool {
+    state.history_access.is_restricted()
+}
+
 /// Whether an automated environment has force-disabled telemetry
 /// (`SCREENPIPE_DISABLE_TELEMETRY` / `GITHUB_ACTIONS` / `CI`).
 ///
@@ -397,6 +441,18 @@ pub fn is_enterprise_build_cmd(app_handle: tauri::AppHandle) -> bool {
 #[specta::specta]
 pub fn is_telemetry_disabled_by_env() -> bool {
     screenpipe_engine::analytics::telemetry_disabled_by_env()
+}
+
+/// Return the website UTM attribution already resolved at app startup.
+///
+/// This is read-only and never triggers another network request. Analytics can
+/// be disabled before the manager is installed, so absence is a normal result.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_onboarding_attribution(app_handle: tauri::AppHandle) -> Option<Attribution> {
+    let analytics = app_handle.try_state::<std::sync::Arc<AnalyticsManager>>()?;
+    let analytics = std::sync::Arc::clone(&analytics);
+    analytics.attribution_snapshot().await
 }
 
 /// Return the macOS bundle identifier of the running app
@@ -498,6 +554,14 @@ pub fn get_app_server_config() -> serde_json::Value {
 #[specta::specta]
 pub fn start_database_recovery(app_handle: tauri::AppHandle) -> Result<(), String> {
     crate::db_recovery_notifications::start_quarantined_database_recovery(app_handle)
+}
+
+/// Restart the app after an explicit user action so an exact short-read
+/// quarantine can be verified in a fresh process before recording resumes.
+#[tauri::command]
+#[specta::specta]
+pub fn restart_database_verification(app_handle: tauri::AppHandle) -> Result<(), String> {
+    crate::db_recovery_notifications::restart_quarantined_database_verification(app_handle)
 }
 
 /// Pure JSON shape used by the cold-spawn fallback. Extracted so the contract
@@ -691,6 +755,13 @@ fn recovery_anchor_license_key<'a>(
     bundled_license_key.unwrap_or(rejected_license_key)
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn normalize_enterprise_config_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Preserve bundled/MDM precedence except for a recovery record tied to the
 /// exact bundled key it replaces. A later MDM key automatically wins because
 /// its fingerprint no longer matches.
@@ -719,10 +790,57 @@ fn merge_enterprise_file_configs(
     bundled
 }
 
+#[cfg(target_os = "windows")]
+fn read_enterprise_config_from_windows_registry() -> Option<EnterpriseFileConfig> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    // Intune runs 64-bit PowerShell by default, but older deployment scripts
+    // may have written through a 32-bit host. Prefer the documented 64-bit view
+    // and fall back to the 32-bit view so upgrades do not strand those fleets.
+    for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+        let Ok(key) = hklm.open_subkey_with_flags("SOFTWARE\\screenpipe", KEY_READ | view) else {
+            continue;
+        };
+        let license_key = normalize_enterprise_config_value(
+            key.get_value::<String, _>("EnterpriseLicenseKey").ok(),
+        );
+        if license_key.is_some() {
+            info!(
+                "enterprise: license key loaded from HKLM\\SOFTWARE\\screenpipe ({})",
+                if view == KEY_WOW64_64KEY {
+                    "64-bit view"
+                } else {
+                    "32-bit view"
+                }
+            );
+            return Some(EnterpriseFileConfig {
+                license_key,
+                ..EnterpriseFileConfig::default()
+            });
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_enterprise_config_from_windows_registry() -> Option<EnterpriseFileConfig> {
+    None
+}
+
+/// Read an administrator-deployed config. An executable-adjacent file is the
+/// explicit cross-platform contract and therefore wins as a complete config;
+/// the Windows registry is the documented Intune fallback when no such file is
+/// bundled.
+fn read_enterprise_config_from_deployment() -> Option<EnterpriseFileConfig> {
+    read_enterprise_config_from_exe_dir().or_else(read_enterprise_config_from_windows_registry)
+}
+
 /// Read enterprise device config. Bundled/MDM config is authoritative unless
-/// the user file carries a validated recovery for that exact bundled key.
+/// the user file carries a validated recovery for that exact deployed key.
 pub fn get_enterprise_file_config() -> EnterpriseFileConfig {
-    let bundled = read_enterprise_config_from_exe_dir();
+    let bundled = read_enterprise_config_from_deployment();
     let user_path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
     let user = if user_path.exists() {
         info!(
@@ -734,13 +852,14 @@ pub fn get_enterprise_file_config() -> EnterpriseFileConfig {
         None
     };
     if bundled.is_none() && user.is_none() {
-        info!("enterprise: no enterprise.json found in any location");
+        info!("enterprise: no deployed or user enterprise config found");
     }
     merge_enterprise_file_configs(bundled, user)
 }
 
-/// Read the enterprise license key from `enterprise.json`.
-/// Returns None if no file is found or is invalid.
+/// Read the enterprise license key from deployment config (`enterprise.json`
+/// or the documented Windows registry value) and the user recovery config.
+/// Returns None if no valid key is found.
 #[tauri::command]
 #[specta::specta]
 pub fn get_enterprise_license_key() -> Option<String> {
@@ -896,7 +1015,8 @@ pub fn persist_recovered_enterprise_device_config(
     // A user recovery overlays the executable-adjacent file. Keep every
     // subsequent rotation tied to that immutable source key so recovery B can
     // replace recovery A without making the overlay disappear on restart.
-    let bundled_license_key = read_enterprise_config_from_exe_dir().and_then(|cfg| cfg.license_key);
+    let bundled_license_key =
+        read_enterprise_config_from_deployment().and_then(|cfg| cfg.license_key);
     let recovery_anchor =
         recovery_anchor_license_key(bundled_license_key.as_deref(), replaced_license_key);
     persist_enterprise_device_config_inner(Some(license_key), ingest_url, Some(recovery_anchor))
@@ -907,7 +1027,7 @@ pub fn persist_recovered_enterprise_device_config(
 #[tauri::command]
 #[specta::specta]
 pub fn save_enterprise_license_key(license_key: String) -> Result<(), String> {
-    let bundled_key = read_enterprise_config_from_exe_dir().and_then(|cfg| cfg.license_key);
+    let bundled_key = read_enterprise_config_from_deployment().and_then(|cfg| cfg.license_key);
     match bundled_key
         .as_deref()
         .filter(|key| *key != license_key.as_str())
@@ -1007,7 +1127,7 @@ pub fn get_cloud_token() -> Option<String> {
     if let Some(token) = crate::auth_token::cached_cloud_token() {
         return Some(token);
     }
-    let path = screenpipe_core::paths::default_screenpipe_data_dir().join("auth.json");
+    let path = crate::config::app_data_dir().join("auth.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     parsed
@@ -1060,6 +1180,7 @@ pub async fn set_cloud_token(
     // fallible secret-store write so the on-disk copies never outlive the
     // session even if persistence below fails.
     if should_clear_pi_auth {
+        state.deferred_account_start.cancel();
         if let Err(e) = crate::pi::clear_screenpipe_auth_token_files() {
             warn!("failed to clear pi screenpipe auth token: {}", e);
         }
@@ -1074,6 +1195,14 @@ pub async fn set_cloud_token(
         .as_ref()
         .map(|settings| settings.restricts_paid_local_features())
         .unwrap_or(true);
+    if let Some(settings) = settings.as_ref() {
+        crate::recording::refresh_history_access_policy(&state.history_access, settings);
+    } else {
+        // Missing/corrupt settings are unattributed on consumer builds.
+        state
+            .history_access
+            .set_last_24_hours(!cfg!(feature = "enterprise-build"));
+    }
     let pipe_manager = {
         let server = state.server.lock().await;
         server.as_ref().map(|core| core.pipe_manager.clone())
@@ -1093,10 +1222,16 @@ pub async fn set_cloud_token(
     // Err so the frontend won't strip the last plaintext copy of a token it
     // couldn't durably save (the caller ignores the Result for session purposes;
     // only the save-and-strip path checks it).
-    crate::auth_token::store_cloud_token(normalized.as_deref())
+    let persistence_result = crate::auth_token::store_cloud_token(normalized.as_deref())
         .await
-        .map_err(|e| format!("failed to persist cloud token to secret store: {e}"))?;
-    Ok(())
+        .map_err(|e| format!("failed to persist cloud token to secret store: {e}"));
+    if !should_clear_pi_auth {
+        // `loadUser` calls this after saving verified account data. Both
+        // in-process token caches are now updated, even if persistence failed.
+        // Resume native startup without relying on a frontend gate transition.
+        crate::recording::resume_deferred_account_start(app.clone());
+    }
+    persistence_result
 }
 
 /// Persist the user's enterprise admin status, team API token, and the org's
@@ -1724,6 +1859,11 @@ fn login_url_with_intent(
         }
         if let Some(scheme) = return_scheme {
             query.append_pair("return_scheme", scheme);
+            // The website only honors a non-consumer scheme when the caller
+            // advertises this contract. That keeps deploy order safe: older
+            // Enterprise builds requested their scheme but dropped it during
+            // warm-instance forwarding on Windows and Linux.
+            query.append_pair("callback_version", crate::deep_link::AUTH_CALLBACK_VERSION);
         }
     }
     Ok(url.to_string())
@@ -1750,6 +1890,10 @@ mod login_url_intent_tests {
             pairs.get("return_scheme").map(|value| value.as_ref()),
             Some("screenpipe")
         );
+        assert_eq!(
+            pairs.get("callback_version").map(|value| value.as_ref()),
+            Some("1")
+        );
     }
 
     #[test]
@@ -1766,24 +1910,27 @@ mod login_url_intent_tests {
             pairs.get("return_scheme").map(|value| value.as_ref()),
             Some("screenpipe-enterprise")
         );
+        assert_eq!(
+            pairs.get("callback_version").map(|value| value.as_ref()),
+            Some("1")
+        );
     }
 }
 
 /// The custom URL scheme this build registers for deep links. The enterprise
 /// build uses a distinct scheme so it does not collide with the consumer app's
 /// `screenpipe://` on machines that have both installed (see #3890). Login
-/// URLs pass a `return_scheme` query param so the website can redirect back
-/// to the right build; until the website supports the param it is ignored and
-/// redirects stay on `screenpipe://`, matching the consumer path.
+/// URLs pass an allowlisted `return_scheme` plus a versioned callback contract
+/// so the website can redirect back to the right build without making rollout
+/// order unsafe for older Enterprise clients.
 pub fn deep_link_scheme() -> &'static str {
-    if cfg!(feature = "enterprise-build") {
-        "screenpipe-enterprise"
-    } else {
-        "screenpipe"
-    }
+    crate::deep_link::scheme()
 }
 
 fn is_login_callback_scheme(scheme: &str) -> bool {
+    // Keep accepting the old consumer callback inside the embedded WebView for
+    // fallback compatibility during rollout. OS-level routing remains strict
+    // and is handled by deep_link::is_for_current_build.
     scheme == deep_link_scheme() || scheme == "screenpipe"
 }
 
@@ -1804,12 +1951,11 @@ fn reset_existing_login_window<R: tauri::Runtime>(
 }
 
 /// Open the screenpipe.com login page.
-/// macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
-/// Windows/Linux: in-app WebView that intercepts the screenpipe:// redirect.
+/// Normal login opens the user's default browser and returns through the
+/// versioned app-specific deep-link callback.
 ///
-/// `fresh_session` is used by "use different account": macOS asks
-/// ASWebAuthenticationSession for an ephemeral browser session instead of
-/// reusing Safari cookies, and Windows/Linux use a throwaway webview profile.
+/// `fresh_session` is used by "use different account": macOS uses an ephemeral
+/// ASWebAuthenticationSession and Windows/Linux use a throwaway webview profile.
 #[tauri::command]
 #[specta::specta]
 /// Returns the device code when this call started the browser device-code flow,
@@ -1829,13 +1975,41 @@ pub async fn open_login_window(
     let fresh_session = fresh_session.unwrap_or(false);
     #[cfg(target_os = "macos")]
     {
+        let callback_scheme = deep_link_scheme();
+        let login_url = login_url_with_intent(auth_mode, Some(callback_scheme))?;
+
+        // Normal sign-in belongs in the user's preferred browser. It already
+        // has their password manager, passkeys and Google/GitHub sessions, and
+        // it is also where a prior screenpipe.com acquisition cookie is most
+        // likely to live. The website returns the token through the versioned,
+        // build-specific scheme handled by the existing cold/warm deep-link
+        // paths.
+        //
+        // "Use different account" deliberately stays in an ephemeral Apple
+        // auth session so it cannot silently reuse the browser's current user.
+        if !fresh_session {
+            match app_handle
+                .opener()
+                .open_url(login_url.as_str(), None::<&str>)
+            {
+                Ok(()) => {
+                    info!("opened system browser for login");
+                    return Ok(String::new());
+                }
+                Err(e) => {
+                    // Keep the previous, reliable native auth path when macOS
+                    // cannot launch a default browser.
+                    warn!("could not open system browser, falling back to auth session: {e}");
+                }
+            }
+        }
+
         // ASWebAuthenticationSession intercepts the redirect itself (no OS
-        // scheme routing), so the consumer `screenpipe` scheme cannot collide
-        // with another installed build here (#3890) and stays correct until
-        // the website honours `return_scheme`.
+        // scheme routing). It remains the isolated-account path and the
+        // launch-failure fallback.
         let callback_url = match crate::auth_session::start_session(
-            login_url_with_intent(auth_mode, None)?,
-            "screenpipe".to_string(),
+            login_url,
+            callback_scheme.to_string(),
             fresh_session,
         )
         .await
@@ -1932,7 +2106,7 @@ pub async fn open_login_window(
             label.clone(),
             WebviewUrl::External(parsed_login_url),
         )
-        .title("sign in to screenpipe")
+        .title(crate::localization::ui_text("sign in to screenpipe"))
         .inner_size(460.0, 700.0)
         .focused_gated(true);
 
@@ -2018,7 +2192,7 @@ pub async fn open_google_calendar_auth_window(
     let parsed_url = auth_url.parse().map_err(|e| format!("invalid url: {e}"))?;
     let mut builder =
         WebviewWindowBuilder::new(&app_handle, label, WebviewUrl::External(parsed_url))
-            .title("connect google calendar")
+            .title(crate::localization::ui_text("connect google calendar"))
             .inner_size(500.0, 700.0)
             .focused_gated(true);
 
@@ -2615,31 +2789,193 @@ pub async fn get_onboarding_status(
     OnboardingStore::get(&app_handle).map(|o| o.unwrap_or_default())
 }
 
+// Preserve receipt identity on retry. The store cache may already contain
+// completion after a failed disk save, so emit after every successful save;
+// consumers can deduplicate retries by completion_id. Completion means saved
+// setup, not that the destination window opened successfully.
+fn mark_onboarding_completed(onboarding: &mut OnboardingStore) -> serde_json::Value {
+    if !onboarding.is_completed || onboarding.completed_at.is_none() {
+        onboarding.complete();
+    }
+    serde_json::json!({
+        "telemetry_schema_version": 2,
+        "owner": "native",
+        "completion_id": onboarding.completed_at,
+        "outcome": "saved",
+    })
+}
+
+fn onboarding_completion_failure(stage: &str, attempt_id: &str, error: &str) -> String {
+    let lower = error.to_lowercase();
+    let code = if lower.contains("permission denied") || lower.contains("access is denied")
+        || lower.contains("operation not permitted") {
+        "permission_denied"
+    } else if lower.contains("no space left") || lower.contains("disk full") {
+        "disk_full"
+    } else if lower.contains("deserialize") || lower.contains("invalid") {
+        "invalid_state"
+    } else {
+        "operation_failed"
+    };
+    let diagnostic = serde_json::json!({
+        "stage": stage, "attempt_id": attempt_id, "error_code": code,
+        "outcome": "retry_available"
+    });
+    // Error strings can contain paths or provider credentials. The fixed stage
+    // and cause are sufficient for support without retaining their raw text.
+    tracing::warn!("onboarding_completion_failed {}", diagnostic);
+    diagnostic.to_string()
+}
+
+#[cfg(test)]
+mod onboarding_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_a_failed_save_preserves_completion_time_and_receipt_identity() {
+        let mut onboarding = OnboardingStore::default();
+        let receipt = mark_onboarding_completed(&mut onboarding);
+        assert!(onboarding.is_completed);
+        let completed_at = onboarding.completed_at.clone();
+        assert_eq!(receipt["completion_id"], serde_json::json!(completed_at));
+        assert_eq!(mark_onboarding_completed(&mut onboarding), receipt);
+        assert_eq!(onboarding.completed_at, completed_at);
+    }
+
+    #[tokio::test]
+    async fn setup_failures_and_recovery_survive_rotation_and_support_redaction() {
+        let logs = tempfile::tempdir().unwrap();
+        let current = logs.path().join("screenpipe-app.2026-09-22.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::fs::File::create(&current).unwrap())
+            .finish();
+        let events: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../lib/__tests__/fixtures/onboarding-support-events.json"
+        ))
+        .unwrap();
+        let attempt_id = "00000000-0000-4000-8000-000000000001";
+        tracing::subscriber::with_default(subscriber, || {
+            for event in &events {
+                let mut properties = event["properties"].clone();
+                properties["attempt_id"] = serde_json::json!(attempt_id);
+                write_browser_log(
+                    "warn".into(),
+                    format!("{} {}", event["event"].as_str().unwrap(), properties),
+                );
+            }
+            write_browser_log(
+                "warn".into(),
+                serde_json::json!({
+                    "event": "trial_activation_assignment_failed", "reason": "load_error",
+                    "stage": "waiting_for_fresh_response", "attempt_id": attempt_id,
+                    "response_count": 2, "elapsed_ms": 10, "identity_matches": true,
+                    "fallback_variant": "control", "outcome": "continue_setup"
+                })
+                .to_string(),
+            );
+            let error = onboarding_completion_failure(
+                "persist",
+                attempt_id,
+                "Operation not permitted: /private/person@example.com/token=secret",
+            );
+            assert!(!error.contains("secret"));
+            assert!(!error.contains("person@example.com"));
+        });
+        std::fs::rename(
+            &current,
+            logs.path().join("screenpipe-app.2026-09-22.1.log"),
+        )
+        .unwrap();
+        std::fs::write(
+            &current,
+            "onboarding_completion_persisted outcome=saved\ncontact=person@example.com\n",
+        )
+        .unwrap();
+        let report =
+            crate::diagnostic_logs::collect_redacted_from_dirs(&[logs.path().to_path_buf()])
+                .await
+                .unwrap();
+        for expected in [
+            "onboarding_default_setup_failed",
+            "speaker-reconciliation",
+            "skill-learning",
+            "free_pipe_limit_reached",
+            "configure",
+            "permission_denied",
+            "digital-clone",
+            "onboarding_connection_cta_failed",
+            "authorization_denied",
+            "oauth_connect",
+            "onboarding_completion_failed",
+            "permission_denied",
+            "retry_available",
+            attempt_id,
+            "onboarding_completion_persisted",
+            "trial_activation_assignment_failed",
+            "load_error",
+            "waiting_for_fresh_response",
+            "continue_setup",
+        ] {
+            assert!(report.contains(expected), "missing {expected}: {report}");
+        }
+        assert!(!report.contains("person@example.com"));
+        assert!(!report.contains("secret"));
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn complete_onboarding(app_handle: tauri::AppHandle) -> Result<(), String> {
-    // Update the persistent store
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let mut receipt = None;
+    let mut persisted = None;
     OnboardingStore::update(&app_handle, |onboarding| {
-        onboarding.complete();
+        receipt = Some(mark_onboarding_completed(onboarding));
+        persisted = Some(onboarding.clone());
     })
-    .map_err(|e| e.to_string())?;
+    .map_err(|error| onboarding_completion_failure("persist", &attempt_id, &error))?;
 
-    // Update the managed state in memory
-    if let Some(managed_store) = app_handle.try_state::<OnboardingStore>() {
-        // Get the current state and create an updated version
-        let mut updated_store = managed_store.inner().clone();
-        updated_store.complete();
-        // Replace the managed state with the updated version
-        app_handle.manage(updated_store);
+    if let Some(persisted) = persisted {
+        app_handle.manage(persisted);
+    }
+    info!(
+        "onboarding_completion_persisted attempt_id={} receipt={}",
+        attempt_id,
+        receipt.as_ref().unwrap_or(&serde_json::Value::Null)
+    );
+    // Capture only after persistence succeeds. The task belongs to the native
+    // process and survives the onboarding webview being destroyed below.
+    if let (Some(properties), Some(analytics)) = (
+        receipt,
+        app_handle.try_state::<std::sync::Arc<AnalyticsManager>>(),
+    ) {
+        let analytics = std::sync::Arc::clone(&analytics);
+        tauri::async_runtime::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                analytics.send_event("onboarding_completed", Some(properties)),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "onboarding completion receipt failed"),
+                Err(_) => tracing::warn!("onboarding completion receipt timed out"),
+            }
+        });
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    close_window(app_handle.clone(), ShowRewindWindow::Onboarding).await?;
+    crate::first_run_summary::arm(&app_handle)
+        .map_err(|error| onboarding_completion_failure("arm_summary", &attempt_id, &error))?;
+    let _ = refresh_tray_menu(app_handle.clone()).await;
 
     // Hidden UI applies to the main app, but incomplete onboarding remains
     // visible long enough to finish permissions. Once onboarding completes,
     // close that sole exemption without trying to open Home.
     if crate::enterprise_policy::is_app_ui_hidden() {
+        close_window(app_handle.clone(), ShowRewindWindow::Onboarding)
+            .await
+            .map_err(|error| onboarding_completion_failure("close_setup", &attempt_id, &error))?;
         info!("enterprise: onboarding completed; keeping main UI hidden");
         return Ok(());
     }
@@ -2654,7 +2990,13 @@ pub async fn complete_onboarding(app_handle: tauri::AppHandle) -> Result<(), Str
             page: Some("home".to_string()),
         },
     )
-    .await?;
+    .await
+    .map_err(|error| onboarding_completion_failure("open_home", &attempt_id, &error))?;
+
+    // Retain the retry UI until all fallible destination work succeeds.
+    close_window(app_handle.clone(), ShowRewindWindow::Onboarding)
+        .await
+        .map_err(|error| onboarding_completion_failure("close_setup", &attempt_id, &error))?;
 
     Ok(())
 }
@@ -2682,9 +3024,36 @@ pub async fn reset_onboarding(app_handle: tauri::AppHandle) -> Result<(), String
 #[tauri::command]
 #[specta::specta]
 pub async fn set_onboarding_step(app_handle: tauri::AppHandle, step: String) -> Result<(), String> {
+    let previous_step = OnboardingStore::get(&app_handle)
+        .ok()
+        .flatten()
+        .and_then(|onboarding| onboarding.current_step);
     OnboardingStore::update(&app_handle, |onboarding| {
-        onboarding.current_step = Some(step);
+        onboarding.current_step = Some(step.clone());
+        if step == TRIAL_ACTIVATION_SUMMARY_STEP
+            && crate::store::trial_activation_dev_force_enabled()
+        {
+            onboarding.trial_activation_fresh_install = true;
+        }
     })?;
+    let _ = refresh_tray_menu(app_handle.clone()).await;
+
+    if !crate::should_skip_onboarding() && step == TRIAL_ACTIVATION_PAYWALL_STEP {
+        let state = app_handle.state::<crate::recording::RecordingState>();
+        crate::recording::stop_capture(state, app_handle.clone()).await?;
+        let _ = app_handle.emit("trial-activation-state", "paywall");
+    } else if step == TRIAL_ACTIVATION_UNLOCKED_STEP
+        && previous_step.as_deref() == Some(TRIAL_ACTIVATION_PAYWALL_STEP)
+    {
+        let _ = app_handle.emit("trial-activation-state", "trial-unlocked");
+        let recording_app = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = recording_app.state::<crate::recording::RecordingState>();
+            if let Err(error) = crate::spawn_screenpipe(state, recording_app.clone(), None).await {
+                warn!("failed to restart capture after trial activation: {error}");
+            }
+        });
+    }
     Ok(())
 }
 
@@ -2799,22 +3168,23 @@ pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
         "Keychain access denied or unavailable. Credentials will remain unencrypted.".to_string()
     })?;
 
-    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
-    if let Err(e) = screenpipe_secrets::mark_encryption_enabled(&data_dir) {
-        tracing::warn!("failed to write .encrypt-store flag: {}", e);
-    }
+    for data_dir in crate::config::secret_store_dirs() {
+        if let Err(e) = screenpipe_secrets::mark_encryption_enabled(&data_dir) {
+            tracing::warn!("failed to write .encrypt-store flag: {}", e);
+        }
 
-    if let Ok(store) =
-        screenpipe_secrets::SecretStore::open_for_data_dir(&data_dir, Some(key)).await
-    {
-        match store.reencrypt_unencrypted_secrets(&key).await {
-            Ok(count) if count > 0 => {
-                tracing::info!("re-encrypted {} secrets after keychain opt-in", count);
+        if let Ok(store) =
+            screenpipe_secrets::SecretStore::open_for_data_dir(&data_dir, Some(key)).await
+        {
+            match store.reencrypt_unencrypted_secrets(&key).await {
+                Ok(count) if count > 0 => {
+                    tracing::info!("re-encrypted {} secrets after keychain opt-in", count);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to re-encrypt secrets: {}", e);
+                }
+                _ => {}
             }
-            Err(e) => {
-                tracing::warn!("failed to re-encrypt secrets: {}", e);
-            }
-            _ => {}
         }
     }
 
@@ -2826,57 +3196,61 @@ pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
 #[tauri::command]
 #[specta::specta]
 pub async fn disable_keychain_encryption() -> Result<KeychainStatus, String> {
-    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
-    let secrets_path = screenpipe_secrets::secrets_database_path(&data_dir);
+    let data_dirs = crate::config::secret_store_dirs();
+    for data_dir in &data_dirs {
+        let secrets_path = screenpipe_secrets::secrets_database_path(data_dir);
 
-    if secrets_path.exists() || data_dir.join("db.sqlite").exists() {
-        let plain_store = screenpipe_secrets::SecretStore::open_for_data_dir(&data_dir, None)
-            .await
-            .map_err(|e| format!("failed to open secret store: {e}"))?;
-        let encrypted_count = plain_store
-            .encrypted_secret_count()
-            .await
-            .map_err(|e| format!("failed to inspect encrypted secrets: {e}"))?;
+        if secrets_path.exists() || data_dir.join("db.sqlite").exists() {
+            let plain_store = screenpipe_secrets::SecretStore::open_for_data_dir(data_dir, None)
+                .await
+                .map_err(|e| format!("failed to open secret store: {e}"))?;
+            let encrypted_count = plain_store
+                .encrypted_secret_count()
+                .await
+                .map_err(|e| format!("failed to inspect encrypted secrets: {e}"))?;
 
-        if encrypted_count > 0 {
-            let key = match crate::secrets::get_key() {
-                crate::secrets::KeyResult::Found(key) => key,
-                crate::secrets::KeyResult::AccessDenied => {
-                    return Err(format!(
-                        "Cannot disable encryption yet: {encrypted_count} stored secret(s) are encrypted, but keychain access was denied."
-                    ));
-                }
-                crate::secrets::KeyResult::NotFound => {
-                    return Err(format!(
-                        "Cannot disable encryption yet: {encrypted_count} stored secret(s) are encrypted, but the keychain key was not found."
-                    ));
-                }
-                crate::secrets::KeyResult::Unavailable => {
-                    return Err(format!(
-                        "Cannot disable encryption yet: {encrypted_count} stored secret(s) are encrypted, but the keychain is unavailable."
-                    ));
-                }
-            };
+            if encrypted_count > 0 {
+                let key = match crate::secrets::get_key() {
+                    crate::secrets::KeyResult::Found(key) => key,
+                    crate::secrets::KeyResult::AccessDenied => {
+                        return Err(format!(
+                            "Cannot disable encryption yet: {encrypted_count} stored secret(s) are encrypted, but keychain access was denied."
+                        ));
+                    }
+                    crate::secrets::KeyResult::NotFound => {
+                        return Err(format!(
+                            "Cannot disable encryption yet: {encrypted_count} stored secret(s) are encrypted, but the keychain key was not found."
+                        ));
+                    }
+                    crate::secrets::KeyResult::Unavailable => {
+                        return Err(format!(
+                            "Cannot disable encryption yet: {encrypted_count} stored secret(s) are encrypted, but the keychain is unavailable."
+                        ));
+                    }
+                };
 
-            let encrypted_store =
-                screenpipe_secrets::SecretStore::open_for_data_dir(&data_dir, Some(key))
-                    .await
-                    .map_err(|e| format!("failed to open encrypted secret store: {e}"))?;
-            match encrypted_store.decrypt_encrypted_secrets().await {
-                Ok(count) => {
-                    tracing::info!("decrypted {} secrets before keychain opt-out", count);
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "Cannot disable encryption until encrypted secrets are decrypted: {e}"
-                    ));
+                let encrypted_store =
+                    screenpipe_secrets::SecretStore::open_for_data_dir(data_dir, Some(key))
+                        .await
+                        .map_err(|e| format!("failed to open encrypted secret store: {e}"))?;
+                match encrypted_store.decrypt_encrypted_secrets().await {
+                    Ok(count) => {
+                        tracing::info!("decrypted {} secrets before keychain opt-out", count);
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "Cannot disable encryption until encrypted secrets are decrypted: {e}"
+                        ));
+                    }
                 }
             }
         }
     }
 
-    screenpipe_secrets::mark_encryption_disabled(&data_dir)
-        .map_err(|e| format!("failed to remove .encrypt-store flag: {e}"))?;
+    for data_dir in &data_dirs {
+        screenpipe_secrets::mark_encryption_disabled(data_dir)
+            .map_err(|e| format!("failed to remove .encrypt-store flag: {e}"))?;
+    }
     if let Err(e) = crate::secrets::delete_key() {
         tracing::warn!("failed to delete keychain key on opt-out: {}", e);
     }
@@ -2978,6 +3352,21 @@ fn shortcut_reminder_payload(
         serde_json::Value::String(shortcut_reminder_label(
             &settings.search_shortcut,
             "searchShortcut",
+            &settings.disabled_shortcuts,
+        )),
+    );
+    // Older stores omit this key, while the global shortcut still registers
+    // the platform default. Disabled shortcuts must keep an empty hint.
+    let star_shortcut = if settings.star_session_shortcut.is_empty() {
+        crate::store::SettingsStore::default().star_session_shortcut
+    } else {
+        settings.star_session_shortcut.clone()
+    };
+    map.insert(
+        "star".to_string(),
+        serde_json::Value::String(shortcut_reminder_label(
+            &star_shortcut,
+            "starSessionShortcut",
             &settings.disabled_shortcuts,
         )),
     );
@@ -3142,6 +3531,17 @@ pub(crate) async fn show_shortcut_reminder_impl(
     let label = "shortcut-reminder";
 
     info!("show_shortcut_reminder called");
+
+    let trial_locked = !crate::should_skip_onboarding()
+        && OnboardingStore::get(&app_handle)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .blocks_trial_activation_app();
+    if trial_locked {
+        info!("trial activation: suppressed shortcut reminder overlay");
+        return Ok(());
+    }
 
     // The screenpipe shortcut only opens the timeline/rewind overlay, so the
     // reminder is pointless when the timeline is disabled. Suppress it here so
@@ -3697,23 +4097,18 @@ pub async fn show_notification_panel(
     app_handle: tauri::AppHandle,
     payload: String,
 ) -> Result<(), String> {
-    deliver_notification_panel(app_handle, payload, true)
+    deliver_notification_panel(app_handle, payload)
         .await
         .map(|_| ())
 }
 
 /// Render an alert, returning what actually happened to it.
 ///
-/// `apply_repeat_gate` exists because the repeat gate is check-and-record, so
-/// running it twice for one alert makes the second call collide with the
-/// record the first call just wrote. `/notify` already gates before it
-/// persists, so it passes `false` and stays the single recorder for that path;
-/// the direct callers (capture-stall, audio device/health) come straight here
-/// and pass `true`.
+/// This is the single check-and-record owner for repeat suppression. `/notify`
+/// only peeks before persisting, while direct callers come straight here.
 pub(crate) async fn deliver_notification_panel(
     app_handle: tauri::AppHandle,
     payload: String,
-    apply_repeat_gate: bool,
 ) -> Result<NotificationDelivery, String> {
     use tauri::{Emitter, WebviewWindowBuilder};
 
@@ -3748,14 +4143,12 @@ pub(crate) async fn deliver_notification_panel(
         crate::notifications::gate::title_from_payload(&payload).unwrap_or_default();
     let notification_body =
         crate::notifications::gate::body_from_payload(&payload).unwrap_or_default();
-    if apply_repeat_gate
-        && crate::notifications::gate::repeat_suppressed_now(
-            notification_type.as_deref(),
-            notification_pipe.as_deref(),
-            &notification_title,
-            &notification_body,
-        )
-    {
+    if crate::notifications::gate::repeat_suppressed_now(
+        notification_type.as_deref(),
+        notification_pipe.as_deref(),
+        &notification_title,
+        &notification_body,
+    ) {
         info!(
             "show_notification_panel: suppressed (repeat within cooldown, type={:?})",
             notification_type
@@ -4470,16 +4863,12 @@ pub async fn open_note_path(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
         let obsidian_uri = format!("obsidian://open?path={}", urlencoding::encode(&path));
-        let mut a = Command::new("cmd");
-        a.args(["/C", "start", "", &obsidian_uri]);
-        a.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let mut b = Command::new("cmd");
-        b.args(["/C", "start", "", &path]);
-        b.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        if a.spawn().is_ok() || b.spawn().is_ok() {
+        if open_windows_shell_target(obsidian_uri).is_ok() {
+            return Ok(());
+        }
+
+        if open_windows_shell_target(path.clone()).is_ok() {
             Ok(())
         } else {
             Err(format!("failed to open note path: {}", path))
@@ -4501,23 +4890,43 @@ pub async fn open_note_path(path: String) -> Result<(), String> {
 pub fn open_windows_shell_target(target: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", "", &target])
-            .creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let target = target.trim().to_string();
+        if target.is_empty() {
+            return Err("failed to open Windows shell target: target is empty".to_string());
+        }
 
-        match cmd.status() {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!(
-                "failed to open Windows shell target {}: {}",
-                target, status
-            )),
-            Err(e) => Err(format!(
-                "failed to open Windows shell target {}: {}",
-                target, e
-            )),
+        let operation = "open"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let target_wide = target
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(operation.as_ptr()),
+                PCWSTR(target_wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+
+        let result_code = result.0 as isize;
+        if result_code > 32 {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to open Windows shell target {}: ShellExecuteW returned {}",
+                target, result_code
+            ))
         }
     }
 
@@ -4718,6 +5127,16 @@ fn dir_size(path: &std::path::Path) -> u64 {
 #[specta::specta]
 pub fn set_autostart(app_handle: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+
+    #[cfg(all(feature = "enterprise-build", target_os = "windows"))]
+    if crate::enterprise_persistence::installed() {
+        // The protected service owns startup for this package. Keep the
+        // user-writable Run entry absent even if an old setting is toggled.
+        return app_handle
+            .autolaunch()
+            .disable()
+            .map_err(|error| error.to_string());
+    }
 
     #[cfg(all(feature = "enterprise-build", target_os = "macos"))]
     crate::enterprise_autostart::set_macos_employee_autostart(&app_handle, enabled)?;

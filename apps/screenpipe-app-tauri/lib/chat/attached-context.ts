@@ -27,9 +27,11 @@ export function attachContextToUserMessage({
 }): string {
   const contextLabel = source?.startsWith("connected-share-")
     ? "reviewed Screenpipe snapshot"
-    : source === "timeline"
-      ? "timeline selection"
-      : "search";
+    : source?.startsWith("activity-history-")
+      ? "activity episode"
+      : source === "timeline"
+        ? "timeline selection"
+        : "search";
   return `[Context from ${contextLabel}: ${context}]\n\n${message}`;
 }
 
@@ -52,7 +54,7 @@ function describeSnapshot(
         ? `${value.snapshot.length.toLocaleString()} characters`
         : null;
     return {
-      label: "frozen Screenpipe snapshot",
+      label: "Frozen Screenpipe snapshot",
       detail: [title, surface, size].filter(Boolean).join(" · "),
     };
   } catch {

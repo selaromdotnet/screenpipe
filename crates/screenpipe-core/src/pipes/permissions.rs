@@ -124,7 +124,10 @@ fn parse_bare_api(s: &str) -> Option<PermissionRule> {
 
 pub const DEFAULT_ALLOWED_ENDPOINTS: &[&str] = &[
     "GET /search",
+    "GET /starred-sessions",
     "GET /activity-summary",
+    "GET /workflows",
+    "GET /workflows/*",
     "GET /elements",
     "GET /frames/*",
     "GET /meetings",
@@ -766,6 +769,9 @@ mod tests {
         p.use_default_allowlist = true;
         assert!(p.is_endpoint_allowed("GET", "/search"));
         assert!(p.is_endpoint_allowed("GET", "/meetings/42"));
+        assert!(p.is_endpoint_allowed("GET", "/workflows"));
+        assert!(p.is_endpoint_allowed("GET", "/workflows/wf-example"));
+        assert!(!p.is_endpoint_allowed("POST", "/workflows"));
         assert!(p.is_endpoint_allowed("POST", "/notify"));
         assert!(p.is_endpoint_allowed("GET", "/feedback"));
         assert!(p.is_endpoint_allowed("GET", "/outputs/targets"));
@@ -952,6 +958,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: crate::pipes::PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -962,6 +969,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
@@ -983,6 +991,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: crate::pipes::PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::Preset("reader".to_string()),
@@ -993,6 +1002,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
@@ -1014,6 +1024,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: crate::pipes::PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::Rules {
@@ -1036,6 +1047,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,

@@ -4,11 +4,10 @@
 
 import { Env, UserTier, type AccountPlan } from '../types';
 import { createSuccessResponse, createErrorResponse, addCorsHeaders } from '../utils/cors';
-import { getTierConfig, getModelWeight, isModelGatingEnabled } from '../services/usage-tracker';
+import { getTierConfig, isModelGatingEnabled } from '../services/usage-tracker';
 import { getHostedAiAllowedModels, getHostedAiPlan } from '../services/hosted-ai-policy';
 import { getModelHealth, ModelHealthStatus } from '../services/model-health';
 import { isGooglePolicyBlockedModel } from '../utils/model-policy';
-import { isHostedChatGatewayEnabled } from '../services/cloudflare-ai-gateway';
 
 /** Enriched model metadata — OpenAI-compatible (extra fields ignored by standard clients) */
 interface ModelEntry {
@@ -50,7 +49,7 @@ interface ModelEntry {
    * provider spend rules replace this proactive legacy query meter.
    * UI uses `floor(remaining / query_weight)` to warn when the user is
    * about to run out for a weighted model. Populated server-side from
-   * `getModelWeight()` so client doesn't have to mirror the table.
+   * Cloudflare AI Gateway owns hosted-chat allowance, so this is always zero.
    */
   query_weight?: number;
 }
@@ -83,6 +82,24 @@ const CURATED_MODELS: ModelEntry[] = [
     recommended_for: ['pipes', 'chat', 'coding', 'analysis'],
   },
   // ── OpenAI API (shown only when OPENAI_API_KEY is configured) ──
+  {
+    id: 'gpt-6-astra',
+    object: 'model',
+    owned_by: 'openai',
+    name: 'GPT-6 Astra (Low)',
+    description: 'advanced reasoning, coding, and analysis with low reasoning effort',
+    tags: ['premium', 'reasoning', 'coding', 'vision', 'new'],
+    free: false,
+    context_window: 1050000,
+    max_output_tokens: 128000,
+    best_for: ['hard reasoning', 'agentic coding', 'complex analysis', 'vision'],
+    speed: 'medium',
+    intelligence: 'highest',
+    cost_tier: 'very_high',
+    recommended_for: ['chat', 'analysis', 'coding'],
+    warning: 'Uses more of your included allowance.',
+    requires_env: 'OPENAI_API_KEY',
+  },
   {
     id: 'gpt-5.6-sol',
     object: 'model',
@@ -117,6 +134,23 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'medium',
     recommended_for: ['chat', 'analysis', 'coding'],
     warning: 'expensive for continuous high-volume pipes — use GPT-5.6 Luna for those workloads',
+    requires_env: 'OPENAI_API_KEY',
+  },
+  {
+    id: 'gpt-6-luna',
+    object: 'model',
+    owned_by: 'openai',
+    name: 'GPT-6 Luna',
+    description: 'cost-efficient GPT-6 model for high-volume extraction, classification, and pipe workloads',
+    tags: ['premium', 'fast', 'vision', 'new'],
+    free: false,
+    context_window: 1050000,
+    max_output_tokens: 128000,
+    best_for: ['high-volume', 'extraction', 'classification', 'vision'],
+    speed: 'fast',
+    intelligence: 'high',
+    cost_tier: 'low',
+    recommended_for: ['pipes', 'chat', 'analysis'],
     requires_env: 'OPENAI_API_KEY',
   },
   {
@@ -298,6 +332,24 @@ const CURATED_MODELS: ModelEntry[] = [
     recommended_for: ['chat', 'analysis', 'coding'],
     warning: 'Very expensive Business model — use only when Sonnet or Opus is insufficient',
   },
+  {
+    id: 'glm-5.3-flash-reap50-iq3m',
+    object: 'model',
+    owned_by: 'screenpipe',
+    name: 'GLM-5.3 Flash REAP50 IQ3_M',
+    description: 'quantized text model running in Screenpipe\'s confidential Tinfoil container',
+    tags: ['business', 'confidential', 'text-only', 'experimental'],
+    free: false,
+    context_window: 32768,
+    max_output_tokens: 8192,
+    best_for: ['text extraction', 'summarization', 'analysis'],
+    speed: 'medium',
+    intelligence: 'high',
+    cost_tier: 'low',
+    recommended_for: ['chat', 'analysis'],
+    warning: 'Experimental single-slot, text-only model — requests may queue under load',
+    requires_env: 'TINFOIL_GLM_API_KEY',
+  },
 ];
 
 /**
@@ -319,11 +371,10 @@ export async function handleModelListing(
 
     // Avoid advertising models that would immediately fail because their
     // provider secret is not configured in the Worker environment yet.
-    const cloudflareGateway = isHostedChatGatewayEnabled(env);
     models = models.filter(model =>
       !model.requires_env ||
       hasConfiguredSecret(env[model.requires_env]) ||
-      (cloudflareGateway && model.requires_env === 'OPENAI_API_KEY')
+      model.requires_env === 'OPENAI_API_KEY'
     );
     models = models.filter(model => !isGooglePolicyBlockedModel(model.id));
 
@@ -349,7 +400,7 @@ export async function handleModelListing(
 
       // Attach per-message query weight so UIs can warn the user before
       // they run out for a weighted model. 0 means "doesn't count."
-      model.query_weight = cloudflareGateway ? 0 : getModelWeight(model.id);
+      model.query_weight = 0;
     }
 
     const responseModels = models.map(({ requires_env, ...model }) => {

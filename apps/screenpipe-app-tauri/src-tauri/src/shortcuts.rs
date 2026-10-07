@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
 use tauri::AppHandle;
 use tauri::Emitter;
 use tauri::Manager;
@@ -15,8 +16,40 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
 use tracing::{error, info};
 
 use crate::commands::{hide_main_window, show_main_window};
-use crate::store::{get_store, SettingsStore};
+use crate::store::{get_store, OnboardingStore, SettingsStore};
 use crate::window::ShowRewindWindow;
+
+#[derive(Clone, Serialize)]
+struct SearchShortcutOutcome {
+    success: bool,
+}
+
+fn search_transition_succeeded(visible: bool, focused: bool) -> bool {
+    visible && focused
+}
+
+fn emit_search_shortcut_outcome_after_settle(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        let app_for_check = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            let (visible, focused) = app_for_check
+                .get_webview_window("search")
+                .map(|window| {
+                    (
+                        window.is_visible().unwrap_or(false),
+                        window.is_focused().unwrap_or(false),
+                    )
+                })
+                .unwrap_or((false, false));
+            let success = search_transition_succeeded(visible, focused);
+            let _ = app_for_check.emit("shortcut-show-search", SearchShortcutOutcome { success });
+        }) {
+            error!("failed to verify search shortcut outcome: {}", error);
+        }
+    });
+}
 
 /// Record a physical global-shortcut press once, before any app-wide events
 /// are broadcast to webviews. This avoids duplicate analytics from multiple
@@ -51,6 +84,7 @@ struct ShortcutConfig {
     show_chat: String,
     search: String,
     lock_vault: String,
+    star_session: String,
     disabled: Vec<String>,
 }
 
@@ -88,6 +122,16 @@ impl ShortcutConfig {
             show_chat: store.show_chat_shortcut,
             search: store.search_shortcut,
             lock_vault: store.lock_vault_shortcut,
+            star_session: if store.star_session_shortcut.is_empty() {
+                if cfg!(target_os = "windows") {
+                    "Alt+Shift+B"
+                } else {
+                    "Control+Super+B"
+                }
+                .to_string()
+            } else {
+                store.star_session_shortcut
+            },
             disabled: store.disabled_shortcuts,
         })
     }
@@ -102,6 +146,7 @@ impl ShortcutConfig {
             "show_chat" => "showChatShortcut",
             "search" => "searchShortcut",
             "lock_vault" => "lockVaultShortcut",
+            "star_session" => "starSessionShortcut",
             _ => shortcut_type,
         };
         self.disabled.contains(&shortcut_type.to_string())
@@ -126,6 +171,16 @@ async fn register_shortcut(
     global_shortcut
         .on_shortcut(shortcut, move |app, _shortcut, event| {
             if matches!(event.state, ShortcutState::Pressed) {
+                let trial_locked = !crate::should_skip_onboarding()
+                    && OnboardingStore::get(app)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .blocks_trial_activation_app();
+                if trial_locked {
+                    info!("trial activation: suppressed global shortcut");
+                    return;
+                }
                 if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handler(app);
                 })) {
@@ -157,6 +212,7 @@ pub async fn update_global_shortcuts(
         show_chat: store_config.show_chat,
         search: store_config.search,
         lock_vault: store_config.lock_vault,
+        star_session: store_config.star_session,
         disabled: store_config.disabled,
     };
     apply_shortcuts(&app, &config).await
@@ -165,6 +221,77 @@ pub async fn update_global_shortcuts(
 pub async fn initialize_global_shortcuts(app: &AppHandle) -> Result<(), String> {
     let config = ShortcutConfig::from_store(app).await?;
     apply_shortcuts(app, &config).await
+}
+
+/// Register ONLY the start/stop capture shortcuts, and route them through the
+/// native recording path rather than the normal `shortcut-*-recording` webview
+/// events.
+///
+/// Enterprise policy can leave the app with no tray and no windows. In that state
+/// the regular handlers are dead: `shortcut-start-recording` / `-stop-recording`
+/// are consumed by `deeplink-handler` and the home page, and every webview is
+/// destroyed, so the emit lands on nothing and the user cannot pause capture.
+/// The native path is authoritative and needs no webview, which keeps a working
+/// pause control in a fully surface-free deployment.
+pub async fn initialize_recording_control_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let config = ShortcutConfig::from_store(app).await?;
+    let global_shortcut = app.global_shortcut();
+    if let Err(e) = global_shortcut.unregister_all() {
+        error!("failed to unregister all shortcuts for recording-only setup: {}", e);
+    }
+
+    register_shortcut(
+        app,
+        &config.start,
+        config.is_disabled("start_recording"),
+        |app| {
+            track_shortcut_used(app, "start_recording");
+            crate::tray::start_recording_native(app);
+        },
+    )
+    .await?;
+
+    register_shortcut(
+        app,
+        &config.stop,
+        config.is_disabled("stop_recording"),
+        |app| {
+            track_shortcut_used(app, "stop_recording");
+            crate::tray::stop_recording_native(app);
+        },
+    )
+    .await?;
+
+    info!("registered recording control shortcuts only (hidden UI mode)");
+    Ok(())
+}
+
+/// Reconcile the global shortcut set against enterprise policy.
+///
+/// Called at startup and on every enterprise-policy transition, so a policy that
+/// arrives after launch (or is later relaxed) converges on the same state.
+///
+/// - normal mode: the full shortcut set.
+/// - hidden UI, tray visible: nothing registered. The tray carries Pause, and
+///   registering hotkeys here would change behavior for existing deployments and
+///   risk colliding with another app's shortcut.
+/// - hidden UI, tray also suppressed: start/stop capture only, routed natively.
+///   This is the one state with no visible pause affordance at all, so it must
+///   not be left without one.
+pub async fn reconcile_with_enterprise_policy(app: &AppHandle, ui_hidden: bool, tray_hidden: bool) {
+    let result = if ui_hidden && tray_hidden {
+        info!("shortcuts: hidden UI with suppressed tray, recording controls only");
+        initialize_recording_control_shortcuts(app).await
+    } else if ui_hidden {
+        info!("shortcuts: hidden UI, tray retains pause, registering none");
+        Ok(())
+    } else {
+        initialize_global_shortcuts(app).await
+    };
+
+    if let Err(e) = result {
+        error!("failed to reconcile global shortcuts: {}", e);
+    }
 }
 
 async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(), String> {
@@ -237,8 +364,8 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
             // global hotkey is used. Fire a notification panel so the user gets
             // glance-level confirmation regardless of window visibility.
             crate::notifications::client::send(
-                "recording started",
-                "screen recording has been initiated",
+                crate::localization::ui_text("recording started"),
+                crate::localization::ui_text("screen recording has been initiated"),
             );
         },
     )
@@ -252,8 +379,8 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
             track_shortcut_used(app, "stop_recording");
             let _ = app.emit("shortcut-stop-recording", ());
             crate::notifications::client::send(
-                "recording paused",
-                "capture paused — pipes and search still available",
+                crate::localization::ui_text("recording paused"),
+                crate::localization::ui_text("capture paused — pipes and search still available"),
             );
         },
     )
@@ -307,7 +434,12 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
                     {
                         use tauri_nspanel::ManagerExt;
                         if let Ok(panel) = app.get_webview_panel("chat") {
-                            if panel.is_visible() {
+                            // A panel on another Space is also "visible". Only toggle
+                            // it closed when it is on the Space the user is viewing;
+                            // otherwise the shared show path moves it to this Space.
+                            if panel.is_visible()
+                                && crate::window::panel_is_on_active_space(&*panel)
+                            {
                                 panel.order_out(None);
                                 return;
                             }
@@ -334,9 +466,28 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
             let app = &app_for_closure;
             info!("search shortcut triggered");
             hide_main_window(app.clone());
-            let _ = ShowRewindWindow::Search { query: None }.show(app);
+            if let Err(error) = (ShowRewindWindow::Search { query: None }).show(app) {
+                error!("failed to show search from shortcut: {}", error);
+            }
+            emit_search_shortcut_outcome_after_settle(app);
         });
     })
+    .await?;
+
+    register_shortcut(
+        app,
+        &config.star_session,
+        config.is_disabled("star_session"),
+        |app| {
+            track_shortcut_used(app, "star_session");
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Err(e) = crate::commands::starred_sessions::toggle(&handle) {
+                    error!("failed to open starred sessions: {e}");
+                }
+            });
+        },
+    )
     .await?;
 
     Ok(())
@@ -437,4 +588,17 @@ pub fn parse_shortcut(shortcut_str: &str) -> Result<Shortcut, String> {
     };
 
     Ok(Shortcut::new(Some(modifiers), code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_transition_succeeded;
+
+    #[test]
+    fn search_shortcut_outcome_requires_visible_focused_search() {
+        assert!(search_transition_succeeded(true, true));
+        assert!(!search_transition_succeeded(true, false));
+        assert!(!search_transition_succeeded(false, true));
+        assert!(!search_transition_succeeded(false, false));
+    }
 }

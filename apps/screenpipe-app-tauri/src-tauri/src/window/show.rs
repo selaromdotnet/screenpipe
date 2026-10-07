@@ -473,11 +473,36 @@ impl ShowRewindWindow {
         app: &AppHandle,
         search_origin: Option<&str>,
     ) -> tauri::Result<WebviewWindow> {
+        let window = self.show_with_search_origin_inner(app, search_origin)?;
+        #[cfg(target_os = "macos")]
+        super::watch_visible(&window, self.clone());
+        Ok(window)
+    }
+
+    fn show_with_search_origin_inner(
+        &self,
+        app: &AppHandle,
+        search_origin: Option<&str>,
+    ) -> tauri::Result<WebviewWindow> {
         let id = self.id();
         let onboarding_store = OnboardingStore::get(app)
             .unwrap_or_else(|_| None)
             .unwrap_or_default();
         let allowed_while_hidden = allowed_while_hidden_ui(&id, onboarding_store.is_completed);
+
+        if onboarding_store.blocks_trial_activation_app()
+            && !crate::should_skip_onboarding()
+            && !matches!(&id, RewindWindowId::Home | RewindWindowId::PermissionRecovery)
+        {
+            info!(
+                "trial activation: routing blocked {} entry point to first summary",
+                id.label()
+            );
+            return ShowRewindWindow::Home {
+                page: Some("home".to_string()),
+            }
+            .show(app);
+        }
 
         if crate::enterprise_policy::is_app_ui_hidden() && !allowed_while_hidden {
             info!(
@@ -623,12 +648,13 @@ impl ShowRewindWindow {
             // Settings window: navigate to the requested section if specified
             // and ensure it comes to front (macOS set_focus alone is unreliable from tray context)
             if id.label() == RewindWindowId::Home.label() {
-                if let ShowRewindWindow::Home {
-                    page: Some(ref section),
-                } = self
-                {
-                    let url = format!("/home?section={}", section);
-                    let _ = window.emit("navigate", serde_json::json!({ "url": url }));
+                if let ShowRewindWindow::Home { ref page } = self {
+                    let url = home_navigation_url(page.as_deref());
+                    // Opening the app should preserve an existing Home view, but
+                    // leave Settings when the same webview is showing that route.
+                    if page.is_some() {
+                        let _ = window.emit("navigate", serde_json::json!({ "url": url }));
+                    }
                     if let Ok(url_literal) = serde_json::to_string(&url) {
                         let _ = window.eval(&format!(
                             "if (window.location.pathname !== '/home') window.location.replace({});",
@@ -717,6 +743,14 @@ impl ShowRewindWindow {
 
                         if let Ok(panel) = app_clone.get_webview_panel(RewindWindowId::Chat.label())
                         {
+                            // A panel pinned to another Space still reports itself as
+                            // visible. Order it out first so MoveToActiveSpace is applied
+                            // when it is ordered front again on the current Space.
+                            if panel.is_visible()
+                                && !crate::window::panel_is_on_active_space(&*panel)
+                            {
+                                panel.order_out(None);
+                            }
                             apply_chat_panel_on_top(&*panel, chat_on_top);
                             let _: () =
                                 unsafe { msg_send![&*panel, setMovableByWindowBackground: true] };
@@ -913,12 +947,26 @@ impl ShowRewindWindow {
 
                     // Auto-hide on focus loss (debounced to survive workspace swipe animations)
                     let app_clone = app.clone();
+                    let window_clone = window.clone();
                     let focus_cancel =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     window.on_window_event(move |event| {
                         match event {
                             tauri::WindowEvent::Focused(is_focused) => {
                                 if !is_focused {
+                                    #[cfg(target_os = "macos")]
+                                    if appkit_focus_is_descendant_of(&window_clone) {
+                                        info!(
+                                            "Window-mode focus moved to an attached child; keeping overlay visible"
+                                        );
+                                        focus_cancel
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                                        MAIN_PANEL_SHOWN.store(
+                                            true,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                        return;
+                                    }
                                     // Synchronous alpha=0 — no order_out (which
                                     // causes focus-fight loops when restored).
                                     #[cfg(target_os = "macos")]
@@ -934,10 +982,56 @@ impl ShowRewindWindow {
                                     focus_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
                                     let cancel = focus_cancel.clone();
                                     let app = app_clone.clone();
+                                    #[cfg(target_os = "macos")]
+                                    let window = window_clone.clone();
                                     std::thread::spawn(move || {
                                         std::thread::sleep(std::time::Duration::from_millis(300));
                                         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                                             return;
+                                        }
+                                        // AppKit may deliver the parent's blur before
+                                        // keyWindow points at the attached Timeline. Re-check
+                                        // after the debounce and treat the two native windows
+                                        // as one logical overlay.
+                                        #[cfg(target_os = "macos")]
+                                        {
+                                            let (sender, receiver) =
+                                                std::sync::mpsc::sync_channel(1);
+                                            let app2 = app.clone();
+                                            let window2 = window.clone();
+                                            if app
+                                                .run_on_main_thread(move || {
+                                                    let keep_visible =
+                                                        appkit_focus_is_descendant_of(&window2);
+                                                    if keep_visible {
+                                                        if let Ok(panel) =
+                                                            app2.get_webview_panel("main-window")
+                                                        {
+                                                            unsafe {
+                                                                use objc::{msg_send, sel, sel_impl};
+                                                                let _: () = msg_send![
+                                                                    &*panel,
+                                                                    setAlphaValue: 1.0f64
+                                                                ];
+                                                            }
+                                                        }
+                                                        MAIN_PANEL_SHOWN.store(
+                                                            true,
+                                                            std::sync::atomic::Ordering::SeqCst,
+                                                        );
+                                                    }
+                                                    let _ = sender.send(keep_visible);
+                                                })
+                                                .is_ok()
+                                                && receiver
+                                                    .recv_timeout(std::time::Duration::from_secs(1))
+                                                    .unwrap_or(false)
+                                            {
+                                                info!(
+                                                    "Window-mode focus settled on an attached child; keeping overlay visible"
+                                                );
+                                                return;
+                                            }
                                         }
                                         // Dispatch all AppKit work to main thread — this
                                         // closure runs on a spawned background thread.
@@ -1516,10 +1610,7 @@ impl ShowRewindWindow {
                 window
             }
             ShowRewindWindow::Home { page } => {
-                let url = match page {
-                    Some(p) => format!("/home?section={}", p),
-                    None => "/home".to_string(),
-                };
+                let url = home_navigation_url(page.as_deref());
 
                 let builder = self.window_builder(app, &url).focused_gated(true);
                 #[cfg(target_os = "macos")]
@@ -1758,30 +1849,9 @@ impl ShowRewindWindow {
                 let builder = builder.hidden_title(true);
                 let window = super::finalize_webview_window(builder.build()?);
 
-                // Exclude from screen capture (NSWindowSharingNone = 0)
-                // MUST run on main thread - AppKit window operations crash from background threads
-                #[cfg(target_os = "macos")]
-                {
-                    let window_clone = window.clone();
-                    run_on_main_thread_safe(app, move || {
-                        use raw_window_handle::HasWindowHandle;
-                        if let Ok(handle) = window_clone.window_handle() {
-                            if let raw_window_handle::RawWindowHandle::AppKit(appkit_handle) =
-                                handle.as_raw()
-                            {
-                                use objc::{msg_send, sel, sel_impl};
-                                let ns_view =
-                                    appkit_handle.ns_view.as_ptr() as *mut objc::runtime::Object;
-                                let ns_window: *mut objc::runtime::Object =
-                                    unsafe { msg_send![ns_view, window] };
-                                if !ns_window.is_null() {
-                                    let _: () =
-                                        unsafe { msg_send![ns_window, setSharingType: 0_u64] };
-                                }
-                            }
-                        }
-                    });
-                }
+                // Recovery contains support instructions, not private capture content.
+                // Keep the regular-window capture policy applied by finalization so
+                // users can share this window while troubleshooting permissions.
 
                 window
             }
@@ -2112,6 +2182,14 @@ impl ShowRewindWindow {
             window.set_size(size).ok();
         }
         Ok(())
+    }
+}
+
+// Used for both a newly created Home window and an existing Settings webview.
+fn home_navigation_url(page: Option<&str>) -> String {
+    match page {
+        Some(section) => format!("/home?section={}", section),
+        None => "/home".to_string(),
     }
 }
 

@@ -14,6 +14,7 @@ import {
   stat,
 } from "@tauri-apps/plugin-fs";
 import type {
+  AgentHarness,
   ChatConversation,
   ConversationKind,
   PipeContext,
@@ -28,6 +29,8 @@ import {
   messagesHaveCompletedReply,
 } from "@/lib/chat-dedup";
 import { mergeConversations } from "@/lib/chat-merge";
+import { isEphemeralSideConversationNamespaceId } from "@/lib/chat/ephemeral-side-conversation";
+import { normalizeImportedCodexConversation } from "@/lib/chat/external-chat-parser";
 
 // Cap on how many (most-recent) conversation files a content search will open
 // and scan. Title matches are cheap over the full ordered list; only the
@@ -216,8 +219,9 @@ async function persistWithMerge(conv: ChatConversation): Promise<void> {
 
   // Conflict: someone else wrote this conversation after we loaded it. Keep
   // both sides' work instead of letting the last rename win.
-  const resolved =
-    disk && diskRev > baseRev ? mergeConversations(disk, conv) : conv;
+  const resolved = normalizeImportedCodexConversation(
+    disk && diskRev > baseRev ? mergeConversations(disk, conv) : conv,
+  );
 
   await writeConversationFile({ ...resolved, rev: Math.max(diskRev, baseRev) + 1 });
 }
@@ -225,6 +229,9 @@ async function persistWithMerge(conv: ChatConversation): Promise<void> {
 export async function saveConversationFile(
   conv: ChatConversation
 ): Promise<void> {
+  // Defense in depth: temporary side chats must never reach disk even if a
+  // future caller bypasses the UI/store guards.
+  if (isEphemeralSideConversationNamespaceId(conv.id)) return;
   try {
     await withConversationLock(conv.id, () => persistWithMerge(conv));
   } catch (e) {
@@ -276,12 +283,13 @@ async function writeConversationFile(
 export async function loadConversationFile(
   id: string
 ): Promise<ChatConversation | null> {
+  if (isEphemeralSideConversationNamespaceId(id)) return null;
   const dir = await getChatsDir();
   const filePath = `${dir}/${conversationFilename(id)}`;
   try {
     if (!(await exists(filePath))) return null;
     const text = await readTextFile(filePath);
-    return JSON.parse(text) as ChatConversation;
+    return normalizeImportedCodexConversation(JSON.parse(text) as ChatConversation);
   } catch {
     return null;
   }
@@ -360,6 +368,13 @@ export interface ConversationMeta {
   /** The AI preset ID last used in this conversation. Used to restore
    *  the model selection when switching between chats. */
   presetId?: string;
+  /** Provenance for a local Codex or Claude conversation copied into screenpipe. */
+  importedFrom?: {
+    source: "claude-code" | "codex";
+    sourceId: string;
+    importedAt: number;
+    harness?: AgentHarness;
+  };
 }
 
 interface ConversationEntry {
@@ -459,7 +474,11 @@ async function orderedConversationEntries(dir: string): Promise<ConversationEntr
 
 export function conversationMetaFromJson(conv: any): ConversationMeta | null {
   if (!conv || typeof conv.id !== "string") return null;
+  if (isEphemeralSideConversationNamespaceId(conv.id)) return null;
 
+  // Saved imports can outlive the provider discovery window or its source
+  // file. Normalize when history is read; a later normal save persists it.
+  conv = normalizeImportedCodexConversation(conv);
   const messages = Array.isArray(conv.messages) ? conv.messages : [];
   let newestUserMessageAt: number | undefined;
   for (const m of messages) {
@@ -503,6 +522,13 @@ export function conversationMetaFromJson(conv: any): ConversationMeta | null {
     dedupKey: conversationDedupIdentity(conv) ?? undefined,
     branchedFrom: typeof conv.branchedFrom === "string" ? conv.branchedFrom : undefined,
     presetId: typeof conv.presetId === "string" ? conv.presetId : undefined,
+    importedFrom:
+      conv.importedFrom &&
+      (conv.importedFrom.source === "claude-code" || conv.importedFrom.source === "codex") &&
+      typeof conv.importedFrom.sourceId === "string" &&
+      typeof conv.importedFrom.importedAt === "number"
+        ? conv.importedFrom
+        : undefined,
   };
 }
 
@@ -643,7 +669,7 @@ export async function listConversations(
       }
       candidates.push({
         meta,
-        key: conversationDedupIdentity(conv),
+        key: meta.dedupKey ?? null,
         hasCompletedReply: conversationHasCompletedReply(conv),
       });
       if (limit != null && candidates.length >= limit) break;
@@ -725,7 +751,7 @@ export async function searchConversations(
       const text = await readTextFile(entry.path);
       if (!text.toLowerCase().includes(q)) continue;
 
-      const conv = JSON.parse(text) as ChatConversation;
+      const conv = normalizeImportedCodexConversation(JSON.parse(text) as ChatConversation);
       const meta = conversationMetaFromJson(conv);
       if (!meta || !matchesConversationOptions(meta, options)) continue;
       if (!conversationMatchesQuery(conv, q)) continue;
@@ -735,7 +761,7 @@ export async function searchConversations(
       }
       candidates.push({
         meta,
-        key: conversationDedupIdentity(conv),
+        key: meta.dedupKey ?? null,
         hasCompletedReply: conversationHasCompletedReply(conv),
       });
       if (limit != null && candidates.length >= limit) break;
@@ -763,6 +789,7 @@ export async function updateConversationFlags(
   id: string,
   patch: Partial<Pick<ChatConversation, "pinned" | "hidden" | "title" | "titleSource" | "browserState" | "lastViewedAt" | "sidebarGroup">>
 ): Promise<void> {
+  if (isEphemeralSideConversationNamespaceId(id)) return;
   // The read MUST happen inside the lock. Loading first and saving second was
   // the original lost-update: the sidebar would load a 4-message conversation,
   // the panel would persist a 5th message, and this write would then rename a
@@ -779,6 +806,21 @@ export async function updateConversationFlags(
     await notifySaveFailure(e);
     throw e;
   }
+}
+
+// Check the current selection inside the write lock so deleting a preset
+// cannot overwrite a newer model choice made while dependencies were scanned.
+export async function reassignConversationPreset(
+  id: string,
+  removedIds: ReadonlySet<string>,
+  replacementId: string,
+): Promise<void> {
+  if (isEphemeralSideConversationNamespaceId(id)) return;
+  await withConversationLock(id, async () => {
+    const conv = await loadConversationFile(id);
+    if (!conv?.presetId || !removedIds.has(conv.presetId)) return;
+    await persistWithMerge({ ...conv, presetId: replacementId });
+  });
 }
 
 export async function loadAllConversations(

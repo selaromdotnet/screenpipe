@@ -251,6 +251,22 @@ pub struct Speaker {
     pub metadata: String,
 }
 
+/// Result of comparing one voice embedding with the stored speaker profiles.
+///
+/// A threshold alone cannot distinguish a confident nearest neighbour from a
+/// probe sitting between two people. Callers that may create or update a
+/// profile must treat [`Self::Ambiguous`] as an abstention.
+#[derive(Debug, Clone)]
+pub enum SpeakerEmbeddingMatch {
+    Matched(Speaker),
+    Ambiguous {
+        best: Speaker,
+        best_distance: f32,
+        runner_up_distance: f32,
+    },
+    NoMatch,
+}
+
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
 pub struct TagAutocompleteItem {
     pub name: String,
@@ -458,7 +474,11 @@ pub struct MeetingTranscriptSegment {
     pub audio_transcription_id: Option<i64>,
     pub audio_chunk_id: Option<i64>,
     pub audio_file_path: Option<String>,
+    /// Seconds into the linked audio file, not a wall-clock timestamp.
+    #[serde(default)]
+    pub audio_start_time_secs: Option<f64>,
     pub speaker_id: Option<i64>,
+    pub session_speaker_id: Option<String>,
     pub speaker_name: Option<String>,
     pub transcript: String,
     pub captured_at: String,
@@ -552,6 +572,7 @@ pub struct OCREntry {
 
 #[derive(OaSchema, Debug, Clone)]
 pub struct AudioEntry {
+    pub captured_at: Option<DateTime<Utc>>,
     pub transcription: String,
     pub device_name: String,
     pub is_input: bool,

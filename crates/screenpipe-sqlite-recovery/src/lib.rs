@@ -126,8 +126,10 @@ fn path_to_cstring(path: &Path) -> Result<CString, RecoveryError> {
 
 /// Recover as much data as possible from `source` into a new `destination`.
 ///
-/// The caller must pass a disposable working copy as `source`, never the live
-/// quarantined database. Refusing an existing destination preserves fresh-file
+/// The caller must pass a private working path as `source`, never the live
+/// database path. Its main file may be a hard link to an offline quarantined
+/// database: it is opened read-only, while WAL/SHM must be private copies.
+/// Refusing an existing destination preserves fresh-file
 /// identity and prevents a retry from overwriting prior recovery evidence.
 pub fn recover_database(source: &Path, destination: &Path) -> Result<(), RecoveryError> {
     if !source.exists() {
@@ -159,7 +161,7 @@ pub fn recover_database(source: &Path, destination: &Path) -> Result<(), Recover
         sqlite::sqlite3_open_v2(
             source.as_ptr(),
             &mut database,
-            sqlite::SQLITE_OPEN_READWRITE | sqlite::SQLITE_OPEN_URI,
+            sqlite::SQLITE_OPEN_READONLY | sqlite::SQLITE_OPEN_URI,
             ptr::null(),
         )
     };
@@ -277,6 +279,107 @@ mod tests {
     }
 
     #[test]
+    fn recovers_foreign_keys_without_requiring_parent_first_order() {
+        // Recovery walks pages, not foreign-key dependencies. Cover both
+        // cross-table references and a parent stored after its child by rowid.
+        for schema in [
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));\
+             CREATE TABLE grandchild (child_id INTEGER REFERENCES child(id) DEFERRABLE INITIALLY DEFERRED);\
+             CREATE TABLE parent (id INTEGER PRIMARY KEY);\
+             INSERT INTO parent VALUES (2);\
+             INSERT INTO child VALUES (1, 2);\
+             INSERT INTO grandchild VALUES (1);",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));\
+             CREATE TABLE parent (id INTEGER PRIMARY KEY);\
+             INSERT INTO parent VALUES (2);\
+             INSERT INTO child VALUES (1, 2);",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES child(id));\
+             INSERT INTO child VALUES (2, NULL);\
+             INSERT INTO child VALUES (1, 2);",
+        ] {
+            let directory = tempfile::tempdir().expect("temporary recovery directory");
+            let source = directory.path().join("source.sqlite");
+            let destination = directory.path().join("destination.sqlite");
+            let connection = Connection::open(&source).expect("open source");
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .expect("bundled foreign-key default"),
+                1
+            );
+            connection.execute_batch(schema).expect("seed valid references");
+            drop(connection);
+            let original = std::fs::read(&source).expect("read source bytes");
+
+            recover_database(&source, &destination).expect("recover valid foreign keys");
+
+            let recovered = Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open recovered database");
+            let parent: i64 = recovered
+                .query_row("SELECT parent_id FROM child WHERE id = 1", [], |row| row.get(0))
+                .expect("child reference survives recovery");
+            assert_eq!(parent, 2);
+            let violations: i64 = recovered
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+                .expect("verify recovered references");
+            assert_eq!(violations, 0);
+            assert_eq!(
+                recovered
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .expect("new connections still enforce foreign keys"),
+                1
+            );
+            assert_eq!(std::fs::read(&source).expect("read source after recovery"), original);
+        }
+    }
+
+    #[test]
+    fn recovers_foreign_key_child_when_parent_row_is_unavailable() {
+        // Preserve readable orphan rows for the candidate verifier to reject;
+        // neither immediate nor deferred constraints may silently discard them.
+        for deferral in ["", " DEFERRABLE INITIALLY DEFERRED"] {
+            let directory = tempfile::tempdir().expect("temporary recovery directory");
+            let source = directory.path().join("source.sqlite");
+            let destination = directory.path().join("destination.sqlite");
+            let connection = Connection::open(&source).expect("open source");
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = OFF;\
+                     CREATE TABLE children (\
+                       id INTEGER PRIMARY KEY,\
+                       parent_id INTEGER NOT NULL REFERENCES parents(id){deferral}\
+                     );\
+                     CREATE TABLE parents (id INTEGER PRIMARY KEY);\
+                     INSERT INTO children VALUES (1, 1);"
+                ))
+                .expect("seed orphaned reference");
+            drop(connection);
+
+            recover_database(&source, &destination).expect("recover foreign-key relationships");
+
+            let recovered =
+                Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .expect("open recovered database");
+            assert_eq!(
+                recovered
+                    .query_row("SELECT COUNT(*) FROM children", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("count recovered children"),
+                1
+            );
+            let violations: i64 = recovered
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .expect("verify recovered references");
+            assert_eq!(
+                violations, 1,
+                "candidate verification must still detect the orphan"
+            );
+        }
+    }
+
+    #[test]
     fn salvages_rows_when_an_index_page_is_corrupt() {
         let directory = tempfile::tempdir().expect("temporary recovery directory");
         let source = directory.path().join("corrupt.sqlite");
@@ -313,7 +416,13 @@ mod tests {
         file.sync_all().expect("sync corruption");
         drop(file);
 
-        recover_database(&source, &destination).expect("recover corrupted database");
+        let original = std::fs::read(&source).expect("original corrupted bytes");
+        let working = directory.path().join("working.sqlite");
+        std::fs::hard_link(&source, &working).expect("link recovery input");
+        recover_database(&working, &destination).expect("recover corrupted database");
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        std::fs::remove_file(&working).expect("remove working link");
+        assert_eq!(std::fs::read(&source).unwrap(), original);
 
         let recovered = Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("open recovered database");
@@ -327,6 +436,75 @@ mod tests {
                 .expect("integrity check"),
             "ok"
         );
+    }
+
+    #[test]
+    fn linked_readonly_source_recovers_committed_wal_without_changing_original_triplet() {
+        for (copy_shm, fail_output) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let seed = directory.path().join("seed.sqlite");
+            let connection = Connection::open(&seed).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                 CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT); \
+                 PRAGMA wal_checkpoint(TRUNCATE); \
+                 INSERT INTO records VALUES (1, 'only-in-wal');",
+                )
+                .unwrap();
+            // Snapshot an idle writer so the fixture retains committed WAL
+            // frames after the seed connection closes. Never open the snapshot.
+            let original_dir = directory.path().join("original");
+            let working_dir = directory.path().join("working");
+            std::fs::create_dir(&original_dir).unwrap();
+            std::fs::create_dir(&working_dir).unwrap();
+            let mut original_bytes = Vec::new();
+            for suffix in ["", "-wal", "-shm"] {
+                let bytes =
+                    std::fs::read(directory.path().join(format!("seed.sqlite{suffix}"))).unwrap();
+                std::fs::write(original_dir.join(format!("db.sqlite{suffix}")), &bytes).unwrap();
+                original_bytes.push((suffix, bytes));
+            }
+            drop(connection);
+            let source = original_dir.join("db.sqlite");
+            let working = working_dir.join("db.sqlite");
+            std::fs::hard_link(&source, &working).unwrap();
+            for suffix in ["-wal", "-shm"] {
+                if suffix == "-shm" && !copy_shm {
+                    continue;
+                }
+                std::fs::copy(
+                    original_dir.join(format!("db.sqlite{suffix}")),
+                    working_dir.join(format!("db.sqlite{suffix}")),
+                )
+                .unwrap();
+            }
+            if fail_output {
+                let candidate = directory.path().join("missing-parent/candidate.sqlite");
+                recover_database(&working, &candidate).expect_err("output cannot be created");
+            } else {
+                let candidate = directory.path().join("candidate.sqlite");
+                recover_database(&working, &candidate)
+                    .expect("recover WAL through read-only main file");
+                let recovered = Connection::open(&candidate).unwrap();
+                let value: String = recovered
+                    .query_row("SELECT value FROM records WHERE id=1", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(value, "only-in-wal");
+                let integrity: String = recovered
+                    .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(integrity, "ok");
+            }
+            for (suffix, bytes) in original_bytes {
+                assert_eq!(
+                    std::fs::read(original_dir.join(format!("db.sqlite{suffix}"))).unwrap(),
+                    bytes,
+                    "original {suffix} changed (copy_shm={copy_shm})"
+                );
+            }
+        }
     }
 
     #[test]

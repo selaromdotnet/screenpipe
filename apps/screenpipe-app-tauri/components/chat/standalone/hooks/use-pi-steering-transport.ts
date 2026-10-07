@@ -20,6 +20,8 @@ import type {
   PiSendCommand,
   PiSendTransportOptions,
 } from "@/components/chat/standalone/hooks/pi-types";
+import { useGT } from "gt-react";
+
 
 export function usePiSteeringRefs() {
   const pendingNextPiUserIntentRef = useRef<"steer" | null>(null);
@@ -41,13 +43,14 @@ export function usePiSteeringTransport(
   context: PiSendTransportOptions,
   sendPiMessage: PiSendCommand,
 ) {
+  const ui = useGT();
   const {
     activePreset,
     beginQueuedAction,
     consumePendingAttachments,
     currentQueueSessionId,
     finishQueuedAction,
-    inputRef,
+    flushStreamingMessageRender,
     isLoading,
     isStreaming,
     lastUserMessageRef,
@@ -189,6 +192,12 @@ export function usePiSteeringTransport(
     const interruptedAssistantId = batch.find((item) => item.interruptedAssistantId)?.interruptedAssistantId ?? null;
     const hasActiveAssistant = Boolean(piMessageIdRef.current);
 
+    // Commit the final buffered chunk to the interrupted row before changing
+    // the stream target to the steered continuation placeholder.
+    if (hasActiveAssistant) {
+      flushStreamingMessageRender();
+    }
+
     const labelMarkers: Message[] = batch.slice(0, -1).map((item, index) => ({
       id: `${item.turnIntentId}-label`,
       role: "assistant",
@@ -273,6 +282,9 @@ export function usePiSteeringTransport(
     lastUserMessageRef.current = latest.content;
     setIsLoading(true);
     setIsStreaming(true);
+    if (hasActiveAssistant) {
+      piActiveStopRequestedRef.current = true;
+    }
 
     try {
       const result = hasActiveAssistant
@@ -289,6 +301,7 @@ export function usePiSteeringTransport(
           );
 
       if (result.status !== "ok") {
+        piActiveStopRequestedRef.current = false;
         pendingNextPiUserIntentRef.current = null;
         pendingNextPiUserDisplayRef.current = null;
         optimisticSteerRef.current = null;
@@ -297,6 +310,7 @@ export function usePiSteeringTransport(
         if (labelMarkerIds.size > 0) {
           setMessages((prev) => prev.filter((message) => !labelMarkerIds.has(message.id)));
         }
+        setMessages((prev) => prev.filter((message) => message.id !== latest.optimisticUserId));
         if (precreatedSteerAssistantId) {
           setMessages((prev) => prev.filter((message) => message.id !== precreatedSteerAssistantId));
           piMessageIdRef.current = null;
@@ -306,9 +320,18 @@ export function usePiSteeringTransport(
         pendingSteerBatchRef.current = [...batch, ...pendingSteerBatchRef.current];
         setIsLoading(false);
         setIsStreaming(false);
-        toast({ title: "failed to send steered message", description: result.error, variant: "destructive" });
+        toast({ title: ui("Failed to send steered message"), description: result.error, variant: "destructive" });
+      } else {
+        // This redirect is internal steering, not a user stop. ACP adapters
+        // inject into the open assistant stream and do not echo a second user
+        // message_start, so their accepted command is also the transition ack.
+        piActiveStopRequestedRef.current = false;
+        if (activePreset?.provider === "acp") {
+          clearPendingSteerTransportState(sessionId);
+        }
       }
     } catch (e) {
+      piActiveStopRequestedRef.current = false;
       pendingNextPiUserIntentRef.current = null;
       pendingNextPiUserDisplayRef.current = null;
       optimisticSteerRef.current = null;
@@ -317,6 +340,7 @@ export function usePiSteeringTransport(
       if (labelMarkerIds.size > 0) {
         setMessages((prev) => prev.filter((message) => !labelMarkerIds.has(message.id)));
       }
+      setMessages((prev) => prev.filter((message) => message.id !== latest.optimisticUserId));
       if (precreatedSteerAssistantId) {
         setMessages((prev) => prev.filter((message) => message.id !== precreatedSteerAssistantId));
         piMessageIdRef.current = null;
@@ -327,7 +351,7 @@ export function usePiSteeringTransport(
       setIsLoading(false);
       setIsStreaming(false);
       const description = e instanceof Error ? e.message : String(e);
-      toast({ title: "failed to send steered message", description, variant: "destructive" });
+      toast({ title: ui("Failed to send steered message"), description, variant: "destructive" });
     } finally {
       pendingSteerFlushInFlightRef.current = false;
     }
@@ -427,7 +451,6 @@ export function usePiSteeringTransport(
       useChatStore.getState().actions.setMessages(sidNow, nextRowsAfterOptimisticAppend as any);
     }
     setInput("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
 
     if (shouldClearPastedImages) setPastedImages([]);
 
@@ -447,91 +470,12 @@ export function usePiSteeringTransport(
       },
     ];
     if (hadActiveReply) {
-      const sid = piSessionIdRef.current;
-      if (sid) {
-        const prepared = prepareSteerBatch(sid);
-        if (!prepared) return;
-        const { batch, latest, prompt, combinedImages } = prepared;
-
-        piActiveStopRequestedRef.current = true;
-        const interruptedAssistantId =
-          latest.interruptedAssistantId ?? null;
-
-        await commands
-          .piSteer(
-            sid,
-            prompt,
-            combinedImages.length > 0 ? combinedImages : null,
-          )
-          .then((result) => {
-            if (result.status === "ok") {
-              // Clear the flag — this stop was an internal steering redirect,
-              // not a user-initiated stop. Without this the steered response
-              // inherits stoppedByUser=true when it completes.
-              piActiveStopRequestedRef.current = false;
-            } else {
-              console.warn("[steer] piSteer returned non-ok:", result);
-              revertFailedComposerSteer(
-                batch,
-                latest,
-                interruptedAssistantId,
-                result.error ?? "steer command rejected",
-              );
-            }
-          })
-          .catch((err: unknown) => {
-            console.warn("[steer] piSteer failed, reverting", err);
-            revertFailedComposerSteer(
-              batch,
-              latest,
-              interruptedAssistantId,
-              err instanceof Error ? err.message : String(err),
-            );
-          });
-      }
+      await flushPendingSteerBatch();
       return;
     }
     if (!piMessageIdRef.current) {
       void flushPendingSteerBatch();
     }
-  }
-
-  function revertFailedComposerSteer(
-    batch: PendingSteerBatchItem[],
-    latest: PendingSteerBatchItem,
-    interruptedAssistantId: string | null,
-    errorDescription: string,
-  ) {
-    pendingNextPiUserIntentRef.current = null;
-    pendingNextPiUserDisplayRef.current = null;
-    optimisticSteerRef.current = null;
-    piActiveStopRequestedRef.current = false;
-    removeTurnIntent(latest.turnIntentId);
-
-    setAssistantInterruptedState(interruptedAssistantId, false);
-
-    const optimisticId = latest.optimisticUserId;
-    setMessages((prev) =>
-      prev.filter(
-        (message) =>
-          !(
-            message.id === optimisticId &&
-            message.role === "user" &&
-            message.intent === "steer"
-          ),
-      ),
-    );
-
-    pendingSteerBatchRef.current = [
-      ...batch,
-      ...pendingSteerBatchRef.current,
-    ];
-
-    toast({
-      title: "failed to send steered message",
-      description: errorDescription,
-      variant: "destructive",
-    });
   }
 
   async function steerQueuedPrompt(prompt: PiQueuedPrompt) {
@@ -613,7 +557,7 @@ export function usePiSteeringTransport(
         );
         restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
         setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
-        toast({ title: "failed to steer queued message", description: result.error, variant: "destructive" });
+        toast({ title: ui("Failed to steer queued message"), description: result.error, variant: "destructive" });
         return;
       }
       if (!result.data) {
@@ -633,8 +577,8 @@ export function usePiSteeringTransport(
         restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
         setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
         toast({
-          title: "message already started",
-          description: "That follow-up has moved out of the queue.",
+          title: ui("Message already started"),
+          description: ui("That follow-up has moved out of the queue."),
         });
         return;
       }
@@ -658,7 +602,7 @@ export function usePiSteeringTransport(
       restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
       setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
       toast({
-        title: "failed to steer queued message",
+        title: ui("Failed to steer queued message"),
         description: e instanceof Error ? e.message : String(e),
         variant: "destructive",
       });

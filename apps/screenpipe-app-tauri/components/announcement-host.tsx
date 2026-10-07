@@ -26,6 +26,10 @@ import { cn } from "@/lib/utils";
 import { type Announcement, type SurveyAnswers } from "@/lib/announcements";
 import { useAnnouncement } from "@/lib/hooks/use-announcement";
 import { isPrimaryWindow } from "@/lib/utils/is-primary-window";
+import { useGT } from "gt-react";
+import { useMessages } from "gt-react";
+import { localizeDefinitions } from "@/lib/i18n/definitions";
+
 
 /** Auto-close the surface after `ms`, if set. Used by banner/card (not modal).
  *  Re-arms only when the announcement id or the duration changes. */
@@ -35,6 +39,35 @@ function useAutoDismiss(ms: number | undefined, onDismiss: () => void) {
     const t = setTimeout(onDismiss, ms);
     return () => clearTimeout(t);
   }, [ms, onDismiss]);
+}
+
+function shuffle<T>(items: readonly T[]) {
+  const shuffled = [...items];
+
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[randomIndex]] = [
+      shuffled[randomIndex],
+      shuffled[index],
+    ];
+  }
+
+  return shuffled;
+}
+
+function createSurveyChoiceOrder(announcement: Announcement) {
+  const randomizeAcquisitionSource = announcement.id.startsWith(
+    "acquisition-survey-",
+  );
+
+  return new Map(
+    (announcement.survey?.questions ?? []).map((question) => [
+      question.id,
+      randomizeAcquisitionSource && question.type === "single-choice"
+        ? shuffle(question.choices)
+        : question.choices,
+    ]),
+  );
 }
 
 function AnnouncementModal({
@@ -48,6 +81,8 @@ function AnnouncementModal({
   onCta: () => void;
   onSubmit: (answers: SurveyAnswers) => boolean;
 }) {
+
+  const ui = useGT();
   const { dismissible, cta } = announcement;
   // never trap the user: if it can't be dismissed and has no cta to close it,
   // fall back to showing a close button anyway.
@@ -83,7 +118,11 @@ function AnnouncementModal({
         </DialogDescription>
         <AnnouncementBody body={announcement.body} />
         {announcement.survey && (
-          <SurveyForm announcement={announcement} onSubmit={onSubmit} />
+          <SurveyForm
+            key={announcement.id}
+            announcement={announcement}
+            onSubmit={onSubmit}
+          />
         )}
         <DialogFooter className="mt-2 gap-2 sm:justify-start">
           {cta && (
@@ -98,7 +137,7 @@ function AnnouncementModal({
               data-testid="announcement-dismiss"
               onClick={onDismiss}
             >
-              {cta ? "later" : "got it"}
+              {cta ? ui("Later") : ui("Got it")}
             </Button>
           )}
         </DialogFooter>
@@ -114,9 +153,13 @@ export function SurveyForm({
   announcement: Announcement;
   onSubmit: (answers: SurveyAnswers) => boolean;
 }) {
+
   const survey = announcement.survey;
   const [answers, setAnswers] = useState<SurveyAnswers>({});
   const [attempted, setAttempted] = useState(false);
+  const [choicesByQuestion] = useState(() =>
+    createSurveyChoiceOrder(announcement),
+  );
   if (!survey) return null;
 
   const complete = survey.questions.every(
@@ -135,12 +178,13 @@ export function SurveyForm({
     >
       {survey.questions.map((question) => {
         const selected = answers[question.id] ?? [];
+        const choices = choicesByQuestion.get(question.id) ?? question.choices;
         return (
           <fieldset key={question.id} className="space-y-2">
             <legend className="text-sm font-medium text-foreground">
               {question.prompt}
               {!question.required && (
-                <span className="ml-1 text-muted-foreground">optional</span>
+                <span className="ml-1 text-muted-foreground">Optional</span>
               )}
             </legend>
             {question.description && (
@@ -149,7 +193,7 @@ export function SurveyForm({
               </p>
             )}
             <div className="grid gap-1.5">
-              {question.choices.map((choice) => {
+              {choices.map((choice) => {
                 const checked = selected.includes(choice.id);
                 return (
                   <label
@@ -184,7 +228,7 @@ export function SurveyForm({
             </div>
             {attempted && question.required && selected.length === 0 && (
               <p role="alert" className="text-xs text-destructive">
-                choose an answer
+                Choose an answer
               </p>
             )}
           </fieldset>
@@ -200,6 +244,7 @@ export function SurveyForm({
 }
 
 function useSidebarSlot() {
+
   const [slot, setSlot] = useState<HTMLElement | null>(null);
   useEffect(() => {
     const findSlot = () =>
@@ -223,6 +268,7 @@ export function AnnouncementSidebarPrompt({
   onDismiss: () => void;
   onShown: () => void;
 }) {
+  const ui = useGT();
   const slot = useSidebarSlot();
   useEffect(() => {
     if (slot) onShown();
@@ -238,7 +284,7 @@ export function AnnouncementSidebarPrompt({
         type="button"
         onClick={onOpen}
         className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-2 text-left text-xs hover:bg-muted/40"
-        aria-label={`open survey: ${announcement.title}`}
+        aria-label={ui("Open survey: {value1}", { value1: announcement.title })}
       >
         <span
           className="h-2 w-2 shrink-0 rounded-full bg-foreground"
@@ -250,7 +296,7 @@ export function AnnouncementSidebarPrompt({
         type="button"
         onClick={onDismiss}
         className="p-2 text-muted-foreground hover:text-foreground"
-        aria-label="dismiss survey"
+        aria-label={ui("Dismiss survey")}
       >
         <X className="h-3.5 w-3.5" />
       </button>
@@ -268,7 +314,9 @@ function AnnouncementBanner({
   onDismiss: () => void;
   onCta: () => void;
 }) {
-  const { icon: Icon, label } = ANNOUNCEMENT_KIND_META[announcement.kind];
+  const uiMessages = useMessages();
+  const ui = useGT();
+  const { icon: Icon, label } = localizeDefinitions(ANNOUNCEMENT_KIND_META, uiMessages)[announcement.kind];
   const { dismissible, cta } = announcement;
   // never trap the user: keep the close affordance unless there's a cta to act on.
   const showClose = dismissible || !cta;
@@ -288,7 +336,7 @@ function AnnouncementBanner({
     >
       <div className="flex min-w-0 items-center gap-2">
         <Icon className="h-4 w-4 shrink-0 text-foreground" />
-        <span className="hidden shrink-0 font-mono text-[10px] uppercase tracking-wide text-muted-foreground sm:inline">
+        <span className="hidden shrink-0 font-mono text-[10px] normal-case tracking-wide text-muted-foreground sm:inline">
           {label}
         </span>
         <span className="truncate">
@@ -312,7 +360,7 @@ function AnnouncementBanner({
         {showClose && (
           <button
             type="button"
-            aria-label="dismiss"
+            aria-label={ui("Dismiss")}
             data-testid="announcement-dismiss"
             onClick={onDismiss}
             className="rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
@@ -349,6 +397,7 @@ function AnnouncementCard({
   onDismiss: () => void;
   onCta: () => void;
 }) {
+  const ui = useGT();
   const { dismissible, cta } = announcement;
   const showClose = dismissible || !cta;
   const pos = CARD_POSITION_CLASS[announcement.position ?? "bottom-right"];
@@ -368,7 +417,7 @@ function AnnouncementCard({
         {showClose && (
           <button
             type="button"
-            aria-label="dismiss"
+            aria-label={ui("Dismiss")}
             data-testid="announcement-dismiss"
             onClick={onDismiss}
             className="-mr-1 -mt-1 rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
@@ -377,7 +426,7 @@ function AnnouncementCard({
           </button>
         )}
       </div>
-      <div className="mb-1 font-mono text-sm font-medium lowercase">
+      <div className="mb-1 font-mono text-sm font-medium normal-case">
         {announcement.title}
       </div>
       <AnnouncementBody body={announcement.body} className="text-[13px]" />

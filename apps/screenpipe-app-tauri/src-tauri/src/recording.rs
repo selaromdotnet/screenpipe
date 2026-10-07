@@ -12,7 +12,7 @@ use crate::capture_session::CaptureSession;
 use crate::config;
 use crate::permissions::{do_permissions_check, OSPermissionStatus};
 use crate::server_core::ServerCore;
-use crate::store::{LocalPlanPolicy, SettingsStore};
+use crate::store::{LocalPlanPolicy, OnboardingStore, SettingsStore};
 use screenpipe_engine::RecordingConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+#[cfg(feature = "enterprise-build")]
+mod authorized_start;
 
 pub const DEFAULT_LOCAL_API_PORT: u16 = 3030;
 
@@ -68,7 +71,7 @@ impl LocalApiContext {
 /// Build a `RecordingConfig` from the current settings store.
 fn build_config(app: &tauri::AppHandle) -> Result<RecordingConfig, String> {
     let store = SettingsStore::get(app).ok().flatten().unwrap_or_default();
-    let (data_dir, _) = config::resolve_data_dir(&store.data_dir)
+    let data_dir = config::resolve_data_dir(&store.data_dir)
         .map_err(|e| format!("failed to prepare recording data directory: {e}"))?;
     Ok(store.to_recording_config(data_dir))
 }
@@ -125,7 +128,34 @@ fn recording_access_policy(
     is_enterprise_build: bool,
     dev_bypass: bool,
     has_verified_local_plan: bool,
-    app_entitled: bool,
+    enterprise_authorized: bool,
+    consumer_requires_enterprise_app: bool,
+    trial_activation_paywall: bool,
+    authentication_status: crate::startup_auth::AuthenticationStatus,
+) -> bool {
+    if authentication_status == crate::startup_auth::AuthenticationStatus::LoggedOut {
+        return false;
+    }
+    if trial_activation_paywall {
+        return false;
+    }
+    if authentication_status == crate::startup_auth::AuthenticationStatus::NotRequired {
+        return true;
+    }
+    server_access_policy(
+        is_enterprise_build,
+        dev_bypass,
+        has_verified_local_plan,
+        enterprise_authorized,
+        consumer_requires_enterprise_app,
+    )
+}
+
+fn server_access_policy(
+    is_enterprise_build: bool,
+    dev_bypass: bool,
+    has_verified_local_plan: bool,
+    enterprise_authorized: bool,
     consumer_requires_enterprise_app: bool,
 ) -> bool {
     if dev_bypass {
@@ -135,31 +165,95 @@ fn recording_access_policy(
         return false;
     }
     if is_enterprise_build {
-        return app_entitled;
+        // Consumer billing entitlement is not an Enterprise credential. Both
+        // account and key deployments use the same process-local grant, set
+        // only after policy and seat enrollment succeed for the organization.
+        return enterprise_authorized;
     }
     has_verified_local_plan
+}
+
+pub(crate) fn server_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
+    let startup_authentication = app
+        .try_state::<crate::startup_auth::AuthenticationStatus>()
+        .map(|status| *status)
+        .unwrap_or(crate::startup_auth::AuthenticationStatus::LoggedOut);
+    let authenticated_after_startup = if cfg!(feature = "enterprise-build") {
+        crate::enterprise_policy::recording_authorized()
+    } else {
+        store.has_cloud_authentication()
+    };
+    if startup_authentication == crate::startup_auth::AuthenticationStatus::LoggedOut
+        && !authenticated_after_startup
+    {
+        return false;
+    }
+
+    server_access_policy(
+        cfg!(feature = "enterprise-build"),
+        cfg!(debug_assertions),
+        store.local_plan_policy() != LocalPlanPolicy::Unknown,
+        crate::enterprise_policy::recording_authorized(),
+        !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
+    )
 }
 
 /// Consumer builds allow signed-in accounts to record on the free plan.
 /// Enterprise builds keep their native entitlement guard, and consumer builds
 /// still reject accounts that are required to use an enterprise binary.
-pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
+pub(crate) fn recording_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
+    let trial_activation_paywall = !crate::should_skip_onboarding()
+        && OnboardingStore::get(app)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .blocks_trial_activation_recording();
+    let resolved_authentication = app
+        .try_state::<crate::startup_auth::AuthenticationStatus>()
+        .map(|status| *status)
+        .unwrap_or(crate::startup_auth::AuthenticationStatus::LoggedOut);
+    // The bootstrap result owns initial startup ordering. A later successful
+    // sign-in may open recording without relaunching the already-initialized
+    // app, so derive the current authenticated state from the same native
+    // authorities used by the runtime guards.
+    let authentication_status = if resolved_authentication
+        == crate::startup_auth::AuthenticationStatus::LoggedOut
+        && if cfg!(feature = "enterprise-build") {
+            crate::enterprise_policy::recording_authorized()
+        } else {
+            store.has_cloud_authentication()
+        } {
+        crate::startup_auth::AuthenticationStatus::Authenticated
+    } else {
+        resolved_authentication
+    };
     recording_access_policy(
         cfg!(feature = "enterprise-build"),
         cfg!(debug_assertions) || cfg!(feature = "dev-billing-bypass"),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
-        store.app_entitled_or_dev(),
+        crate::enterprise_policy::recording_authorized(),
         !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
+        trial_activation_paywall,
+        authentication_status,
     )
 }
 
-fn require_recording_access(store: &SettingsStore) -> Result<(), String> {
-    if recording_access_allowed(store) {
+fn require_recording_access(app: &tauri::AppHandle, store: &SettingsStore) -> Result<(), String> {
+    if recording_access_allowed(app, store) {
         return Ok(());
     }
 
     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
     Err("account_required: sign in to start screenpipe recording".to_string())
+}
+
+fn require_server_access(app: &tauri::AppHandle, store: &SettingsStore) -> Result<(), String> {
+    if server_access_allowed(app, store) {
+        return Ok(());
+    }
+
+    crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
+    Err("account_required: sign in to start screenpipe".to_string())
 }
 
 pub fn notify_audio_engine_fallback(store: &SettingsStore) {
@@ -206,9 +300,13 @@ const RESTART_COOLDOWN_SECS: u64 = 30;
 const CAPTURE_RESTART_MEETING_REATTACH_WINDOW: Duration = Duration::from_secs(120);
 
 mod db_wedge;
+pub(crate) mod recovery_log;
+mod retry;
+mod server_shutdown;
 pub use db_wedge::{
-    make_db_wedge_recovery_hook, new_db_wedge_breaker, DbWedgeBreaker, DbWedgeState,
+    make_database_restart_hook, new_db_wedge_breaker, DbWedgeBreaker, DbWedgeState,
 };
+pub(crate) use server_shutdown::ServerShutdown;
 
 #[derive(Clone, Debug)]
 pub(crate) struct InterruptedMeeting {
@@ -232,19 +330,15 @@ pub struct RecordingState {
     pub server_lifecycle: Arc<Mutex<()>>,
     /// Long-lived server core (DB, HTTP, pipes). None until first start.
     pub server: Arc<Mutex<Option<ServerCore>>>,
+    pub(crate) server_shutdown: ServerShutdown,
     /// Current capture session. None when recording is stopped/paused.
     /// Self-contained — `CaptureSession::stop()` needs no external references.
     pub capture: Arc<Mutex<Option<CaptureSession>>>,
     /// True while a server start is in progress (prevents race between main.rs boot and frontend)
     pub is_starting: Arc<AtomicBool>,
-    /// True while a `start_capture` invocation is in flight. The frontend
-    /// mounts `<DeeplinkHandler />` in every webview window, and the tray
-    /// emits `shortcut-start-recording` app-wide — every listening window
-    /// fires `commands.startCapture()` simultaneously. Without this guard,
-    /// concurrent calls both pass the is_some() check, both build a
-    /// CaptureSession, and the second clobbers the first — dropping the
-    /// first runs its shutdown handlers and tears down workers shared with
-    /// the second, surfacing as a PoolClosed cascade and lost audio chunks.
+    /// True while the caller holding `capture` is building a capture session.
+    /// Duplicate app-wide start requests wait on that mutex, then observe the
+    /// installed session instead of starting another one.
     pub is_starting_capture: Arc<AtomicBool>,
     /// Epoch seconds of last successful spawn — enforces cooldown between restarts
     pub last_spawn_epoch: Arc<AtomicU64>,
@@ -257,6 +351,9 @@ pub struct RecordingState {
     /// recording" that keeps the server up. `last_spawn_epoch` can't carry this
     /// — it's reset to 0 on a failed spawn too, and never sees the tray toggle.
     pub wants_recording: Arc<AtomicBool>,
+    pub(crate) deferred_account_start: crate::startup_auth::DeferredAccountStart,
+    #[cfg(feature = "enterprise-build")]
+    pub(crate) authorization_recovery: authorized_start::Recovery,
     /// Recently active meeting to revive when capture is immediately restarted.
     pub(crate) interrupted_meeting: Arc<Mutex<Option<InterruptedMeeting>>>,
     /// App-scoped cloud-auth token (Clerk JWT). Outlives the Server (which
@@ -268,6 +365,9 @@ pub struct RecordingState {
     /// one update propagates to all three readers (cloud_proxy.rs, the
     /// pi-agent's models.json apiKey, and any future Tauri-side consumer).
     pub cloud_token: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// Live rolling-history policy shared with the local HTTP server. Consumer
+    /// plan refreshes update this in place; server restart is not required.
+    pub history_access: screenpipe_engine::history_access::HistoryAccessPolicy,
     /// Restart-storm guard for DB-wedge auto-recovery. Shared across server
     /// restarts so a DB that stays broken after N restarts stops retrying.
     pub db_wedge_breaker: DbWedgeBreaker,
@@ -275,10 +375,7 @@ pub struct RecordingState {
 
 /// Install a fully constructed capture session before activating any monitor
 /// that can synchronously request its teardown.
-pub(crate) fn install_capture_session(
-    slot: &mut Option<CaptureSession>,
-    session: CaptureSession,
-) {
+pub(crate) fn install_capture_session(slot: &mut Option<CaptureSession>, session: CaptureSession) {
     *slot = Some(session);
     slot.as_ref()
         .expect("capture session was just installed")
@@ -292,13 +389,35 @@ impl RecordingState {
     /// `stop_screenpipe` clear it. (Capture has two on-paths and two off-paths;
     /// missing any one is how a tray-stopped capture got resurrected.)
     pub fn set_capture_intent(&self, on: bool) {
-        self.wants_recording.store(on, Ordering::SeqCst);
+        // An explicit start owns the lifecycle now; an explicit stop must not
+        // be undone by a later background account refresh.
+        self.deferred_account_start.cancel();
+        #[cfg(feature = "enterprise-build")]
+        self.authorization_recovery.cancel();
+        self.wants_recording.store(
+            on && !crate::search_only::capture_paused() && !crate::search_only::is_active(),
+            Ordering::SeqCst,
+        );
     }
 
     /// Whether capture is currently intended to be running.
     pub fn capture_intended(&self) -> bool {
         capture_intended_now(&self.wants_recording)
     }
+}
+
+pub(crate) fn refresh_history_access_policy(
+    policy: &screenpipe_engine::history_access::HistoryAccessPolicy,
+    settings: &SettingsStore,
+) {
+    policy.set_last_24_hours(history_access_restricted(
+        cfg!(feature = "enterprise-build"),
+        settings.is_free_or_unattributed_user(),
+    ));
+}
+
+fn history_access_restricted(is_enterprise_build: bool, free_or_unattributed: bool) -> bool {
+    !is_enterprise_build && free_or_unattributed
 }
 
 fn capture_intended_now(wants_recording: &AtomicBool) -> bool {
@@ -449,7 +568,7 @@ pub async fn stop_capture(
 
     let mut capture_guard = state.capture.lock().await;
     if let Some(session) = capture_guard.take() {
-        session.stop().await;
+        session.stop_checked().await?;
         info!("Capture session stopped");
     } else {
         debug!("No capture session running");
@@ -471,16 +590,23 @@ async fn remember_active_meeting_for_capture_restart(state: &RecordingState) {
     let Some(server) = server_guard.as_ref() else {
         return;
     };
+    remember_active_meeting_from_server(state, server).await;
+}
 
+/// Also used after DB recovery takes the server out of the shared slot, before
+/// stopping the watcher closes its meeting and disconnects live transcription.
+async fn remember_active_meeting_from_server(state: &RecordingState, server: &ServerCore) {
     let manual_id = *server.manual_meeting.read().await;
     let meeting = match manual_id {
-        Some(id) => server.db.get_active_meeting_by_id(id).await.ok().flatten(),
-        None => server
-            .db
-            .get_most_recent_active_meeting()
-            .await
-            .ok()
-            .flatten(),
+        Some(id) => server.db.get_active_meeting_by_id(id).await,
+        None => server.db.get_most_recent_active_meeting().await,
+    };
+    let meeting = match meeting {
+        Ok(meeting) => meeting,
+        Err(error) => {
+            warn!(%error, "could not preserve active meeting for live transcription across recording recovery");
+            None
+        }
     };
 
     let Some(meeting) = meeting else {
@@ -615,21 +741,33 @@ async fn probe_server_health(health_url: &str, api_key: Option<&str>) -> bool {
         if let Some(key) = api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        match req.send().await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => {
-                warn!(
-                    "health probe {} failed (timeout {}s), {}",
-                    health_url,
-                    timeout_secs,
-                    if timeout_secs == 2 {
-                        "retrying once before declaring the server dead"
-                    } else {
-                        "server considered dead"
-                    }
-                );
+        let healthy = match req.send().await {
+            Ok(r) => {
+                let status = r.status().as_u16();
+                r.json::<serde_json::Value>()
+                    .await
+                    .map(|payload| {
+                        screenpipe_engine::health_identity::is_screenpipe_health_response(
+                            status, &payload,
+                        )
+                    })
+                    .unwrap_or(false)
             }
+            Err(_) => false,
+        };
+        if healthy {
+            return true;
         }
+        warn!(
+            "health probe {} failed identity check (timeout {}s), {}",
+            health_url,
+            timeout_secs,
+            if timeout_secs == 2 {
+                "retrying once before declaring the server dead"
+            } else {
+                "server considered dead"
+            }
+        );
     }
     false
 }
@@ -641,29 +779,58 @@ pub async fn start_capture(
     state: State<'_, RecordingState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    start_capture_inner(state, app, true).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn restart_capture_after_permission(
+    state: State<'_, RecordingState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    start_capture_inner(state, app, false).await
+}
+
+async fn start_capture_inner(
+    state: State<'_, RecordingState>,
+    app: tauri::AppHandle,
+    explicit_resume: bool,
+) -> Result<(), String> {
+    if crate::storage_migration::is_running(&app) {
+        return Err("Storage migration is running. Recording resumes when it finishes.".into());
+    }
     info!("Starting capture session");
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    require_recording_access(&store)?;
+    require_recording_access(&app, &store)?;
+
+    if explicit_resume {
+        crate::search_only::resume_capture()?;
+    } else if crate::search_only::capture_paused() {
+        return Err("Recording was stopped by Quit; explicit resume is required.".into());
+    }
 
     // Capture is now intended to run (tray/shortcut start, mic-grant reinit, …)
     // — record it so the health watchdog will respawn a crashed engine instead
     // of treating the absence of capture as a deliberate stop.
     state.set_capture_intent(true);
 
-    // Race guard: short-circuit duplicate invocations.
+    // Serialize duplicate invocations on the capture slot.
     //
     // `<DeeplinkHandler />` is mounted in every non-overlay webview, and the
-    // tray emits `shortcut-start-recording` app-wide — every listening window
-    // fires `commands.startCapture()` simultaneously. Without this guard, two
-    // concurrent calls both pass the `is_some()` check, both build a
-    // CaptureSession (~290ms), and the second clobbers the first. Dropping
-    // the first runs its shutdown handlers, which tear down workers shared
-    // with the second — surfacing as a PoolClosed cascade and silently lost
-    // audio chunks.
-    if state.is_starting_capture.swap(true, Ordering::SeqCst) {
-        info!("Capture start already in progress, skipping duplicate");
+    // global shortcut emits `shortcut-start-recording` app-wide — every listening window
+    // fires `commands.startCapture()` simultaneously. Holding this lock through
+    // the session build makes later calls wait for the winning call. On success
+    // they observe the installed session and return success only after capture
+    // is actually running, so their webviews cannot toast success prematurely.
+    let mut capture_guard = state.capture.lock().await;
+    if !state.capture_intended() {
+        return Err("Recording was stopped while capture startup was pending.".into());
+    }
+    if capture_guard.is_some() {
+        info!("Capture session already running");
         return Ok(());
     }
+
+    state.is_starting_capture.store(true, Ordering::SeqCst);
     struct ResetGuard<'a>(&'a AtomicBool);
     impl Drop for ResetGuard<'_> {
         fn drop(&mut self) {
@@ -671,15 +838,6 @@ pub async fn start_capture(
         }
     }
     let _reset = ResetGuard(&state.is_starting_capture);
-
-    // Hold the capture lock from the is_some check through the assign so a
-    // concurrent `start_capture_internal` (called from spawn_screenpipe's
-    // existing-server path, not gated by is_starting_capture) can't race us.
-    let mut capture_guard = state.capture.lock().await;
-    if capture_guard.is_some() {
-        info!("Capture session already running");
-        return Ok(());
-    }
 
     // `state.server.is_some()` only means ServerCore was constructed once; it
     // does NOT mean the HTTP serve task is still alive. Long-running sessions
@@ -689,7 +847,9 @@ pub async fn start_capture(
     let (port, api_key) = {
         let server_guard = state.server.lock().await;
         let Some(ref core) = *server_guard else {
-            return Err("Server not running — cannot start capture".to_string());
+            warn!("Server not running — requesting full restart");
+            request_server_restart(&app, "server missing when Start recording was requested");
+            return Err("Server not running — full restart requested".to_string());
         };
         (core.port, core.local_api_key.clone())
     };
@@ -704,7 +864,10 @@ pub async fn start_capture(
             "Server unresponsive on port {} — requesting full restart",
             port
         );
-        let _ = app.emit("request-server-restart", ());
+        request_server_restart(
+            &app,
+            "server health probe failed when Start recording was requested",
+        );
         return Err(format!(
             "Server not responding on port {} — full restart requested",
             port
@@ -748,7 +911,7 @@ pub async fn stop_screenpipe(
     stop_screenpipe_inner(&state).await
 }
 
-async fn stop_screenpipe_inner(state: &RecordingState) -> Result<(), String> {
+pub(crate) async fn stop_screenpipe_inner(state: &RecordingState) -> Result<(), String> {
     info!("stop_screenpipe: stopping capture and server");
 
     // Stop capture first
@@ -774,13 +937,14 @@ async fn stop_screenpipe_inner(state: &RecordingState) -> Result<(), String> {
     // Shut down the server so the next spawn_screenpipe does a full restart
     // with fresh settings (auth key, port, etc.). Without this, spawn_screenpipe
     // sees the server as healthy and skips the restart entirely.
-    {
-        let mut server_guard = state.server.lock().await;
-        if let Some(server) = server_guard.take() {
-            server.shutdown().await;
-            info!("Server stopped");
-        }
-    }
+    shutdown_server(
+        &state.server,
+        &state.server_shutdown,
+        &crate::db_relaunch::active_data_dir(),
+        ServerCore::shutdown,
+    )
+    .await?;
+    info!("Server stopped");
 
     // Reset flags so the next spawn_screenpipe takes the full-start path
     // rather than the "server already in progress" wait loop.
@@ -788,6 +952,25 @@ async fn stop_screenpipe_inner(state: &RecordingState) -> Result<(), String> {
     state.last_spawn_epoch.store(0, Ordering::SeqCst);
 
     Ok(())
+}
+
+async fn shutdown_server<T, F, Fut>(
+    slot: &Mutex<Option<T>>,
+    pending: &ServerShutdown,
+    data_dir: &std::path::Path,
+    shutdown: F,
+) -> Result<(), String>
+where
+    T: Send + 'static,
+    F: FnOnce(T) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    // Full stop/start callers retain server_lifecycle while cleanup runs. Only
+    // the slot lock must be released: readers can need it before returning a
+    // connection or storage pin that database close is waiting to drain.
+    // Keep this separate from `if let`, whose temporary guard spans the body.
+    let server = slot.lock().await.take();
+    pending.finish(server, data_dir, shutdown).await
 }
 
 /// Hard ceiling on capture/server teardown that runs *immediately before* the
@@ -840,10 +1023,19 @@ pub async fn spawn_screenpipe(
     app: tauri::AppHandle,
     _override_args: Option<Vec<String>>,
 ) -> Result<(), String> {
-    // Mark recording as intended-ON up front (even if the start below fails or
-    // is deferred by cooldown) so the health watchdog will keep trying to bring
-    // a crashed/failed server back instead of treating it as a user stop.
-    state.set_capture_intent(true);
+    if crate::storage_migration::is_running(&app) {
+        return Err("Storage migration is running. Recording resumes when it finishes.".into());
+    }
+    // A summary-paywall install still needs the long-lived local read server
+    // for Timeline, but it must not publish capture intent or restart capture.
+    let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
+    require_server_access(&app, &store)?;
+    let capture_allowed = recording_access_allowed(&app, &store);
+
+    // Normal starts publish capture intent before touching lifecycle state.
+    // The paywall deliberately leaves it OFF, so the same server startup path
+    // cannot accidentally create a CaptureSession.
+    state.set_capture_intent(capture_allowed);
 
     // Do not wait for the lifecycle lock. It is held across a full stop/start,
     // so when the app is already bringing the server up — the ordinary case
@@ -867,7 +1059,172 @@ pub async fn spawn_screenpipe(
     spawn_screenpipe_inner(&state, app).await
 }
 
-async fn spawn_screenpipe_inner(
+/// Account verification can complete on either side of the native startup
+/// check, without the frontend ever rendering an access gate. Reconcile both
+/// events against current settings and the same native access policy.
+pub(crate) fn resume_deferred_account_start(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<RecordingState>();
+        // Wait before claiming the deferred start so a busy lifecycle cannot
+        // discard recovery. An explicit start/stop or sign-out cancels it.
+        let _lifecycle_guard = state.server_lifecycle.lock().await;
+        if crate::process_exit::QUIT_REQUESTED.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(settings) = SettingsStore::get(&app).ok().flatten() else {
+            return;
+        };
+        let access_allowed =
+            state.cloud_token.load().as_ref().is_some() && server_access_allowed(&app, &settings);
+        let capture_allowed = recording_access_allowed(&app, &settings);
+        if !state
+            .deferred_account_start
+            .take_if_allowed(access_allowed, || {
+                state
+                    .wants_recording
+                    .store(capture_allowed, Ordering::SeqCst);
+            })
+        {
+            return;
+        }
+        info!("Account access verified; resuming deferred server auto-start");
+        if let Err(error) = spawn_screenpipe_inner(&state, app.clone()).await {
+            error!(
+                "Failed to resume server after account verification: {}",
+                error
+            );
+        }
+    });
+}
+
+/// Schedule one bounded native recovery request for this intent generation.
+/// Policy refresh remains free to revoke access while startup is retrying.
+#[cfg(feature = "enterprise-build")]
+pub(crate) async fn resume_enterprise_recording(app: &tauri::AppHandle) {
+    let generation = app
+        .state::<RecordingState>()
+        .authorization_recovery
+        .generation();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<RecordingState>();
+        let allowed = || {
+            state.authorization_recovery.is_current(generation)
+                && state.capture_intended()
+                && crate::enterprise_policy::recording_authorized()
+                && !crate::process_exit::QUIT_REQUESTED.load(Ordering::SeqCst)
+                && !crate::db_relaunch::manual_recovery_required()
+        };
+        let delays = [1, 5, 15, 30].map(std::time::Duration::from_secs);
+        let result = state
+            .authorization_recovery
+            .run(
+                generation,
+                allowed,
+                || async {
+                    // Settings failures belong to the same retry budget. Do not
+                    // abandon first login or start from the previous policy.
+                    crate::enterprise::managed_settings::apply(&app).await?;
+                    authorized_start::attempt(&state.server_lifecycle, allowed, || async {
+                        // Drop each slot guard before acquiring the other;
+                        // capture teardown can itself need the server slot.
+                        let server_running = state.server.lock().await.is_some();
+                        let capture_running = state.capture.lock().await.is_some();
+                        if server_running && capture_running {
+                            return Ok(());
+                        }
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let last = state.last_spawn_epoch.load(Ordering::SeqCst);
+                        if last > 0 && now.saturating_sub(last) < RESTART_COOLDOWN_SECS {
+                            // The general spawn command defers through a webview event.
+                            // Keep ownership here when no webview exists.
+                            return Err("recording restart cooldown is still active".into());
+                        }
+                        spawn_screenpipe_inner(&state, app.clone()).await?;
+                        let server_running = state.server.lock().await.is_some();
+                        let capture_running = state.capture.lock().await.is_some();
+                        if allowed() && (!server_running || !capture_running) {
+                            return Err(
+                                "native startup completed without an active capture session".into(),
+                            );
+                        }
+                        Ok(())
+                    })
+                    .await
+                },
+                &delays,
+            )
+            .await;
+        if let Err(error) = result {
+            recovery_log::append(
+                &crate::db_relaunch::active_data_dir(),
+                "enterprise_start_exhausted",
+                &error,
+            );
+            warn!("enterprise: native authorization recovery exhausted: {error}");
+        }
+    });
+}
+
+/// Automatic retry preserves capture intent; unlike the user command it must
+/// not turn recording back on after the user stopped it.
+#[tauri::command]
+#[specta::specta]
+pub async fn retry_screenpipe(
+    state: State<'_, RecordingState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    // The watchdog owns retry timing. Do not enter the user command's
+    // cooldown path, which schedules a frontend restart request later.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let Some(_lifecycle_guard) = retry::admit(
+        &state.server_lifecycle,
+        &state.wants_recording,
+        &crate::process_exit::QUIT_REQUESTED,
+        &state.last_spawn_epoch,
+        now,
+    ) else {
+        return Ok(());
+    };
+    retry::run(
+        &crate::db_relaunch::active_data_dir(),
+        &state.wants_recording,
+        spawn_screenpipe_inner(&state, app),
+    )
+    .await
+}
+
+fn request_server_restart(app: &tauri::AppHandle, reason: &str) {
+    let data_dir = crate::db_relaunch::active_data_dir();
+    recovery_log::append(&data_dir, "retry_requested", reason);
+    if let Err(error) = app.emit("request-server-restart", ()) {
+        recovery_log::append(&data_dir, "retry_event_failed", &error.to_string());
+    }
+}
+
+pub(crate) async fn spawn_screenpipe_inner(
+    state: &RecordingState,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let resumed = crate::storage_migration::resume_before_startup(&app, state).await?;
+    let result = spawn_screenpipe_after_migration(state, app.clone()).await;
+    if let Some(resumed) = resumed {
+        crate::storage_migration::finish_startup(&app, resumed, result).await
+    } else {
+        if result.is_ok() {
+            crate::storage_migration::finish_recording_recovery(&app).await?;
+        }
+        result
+    }
+}
+
+async fn spawn_screenpipe_after_migration(
     state: &RecordingState,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
@@ -916,20 +1273,20 @@ async fn spawn_screenpipe_inner(
             info!("Deferred spawn: server dead, triggering restart");
             is_starting.store(false, Ordering::SeqCst);
             last_spawn_epoch.store(0, Ordering::SeqCst);
-            let _ = app_handle.emit("request-server-restart", ());
+            request_server_restart(&app_handle, "server missing after restart cooldown");
         });
         return Ok(());
     }
 
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    if let Err(err) = require_recording_access(&store) {
+    if let Err(err) = require_server_access(&app, &store) {
         state.is_starting.store(false, Ordering::SeqCst);
         state.is_starting_capture.store(false, Ordering::SeqCst);
         return Err(err);
     }
     // `to_recording_config` applies SCREENPIPE_PORT for isolated dev/E2E
-    // instances. Lifecycle health checks and orphan cleanup must use that
-    // same effective port or a restart can kill an unrelated app on :3030.
+    // instances. Lifecycle health checks and conflict detection must use that
+    // same effective port or one instance can block an unrelated app on :3030.
     let port = configured_local_api_port(&app);
     let health_url = format!("http://localhost:{}/health", port);
 
@@ -1043,6 +1400,22 @@ async fn spawn_screenpipe_inner(
         }
     }
 
+    // A timed-out stop can leave the old core draining outside this caller.
+    // Join it before probing the port (which may still be ours) or opening DB.
+    if let Err(error) = state
+        .server_shutdown
+        .finish(
+            None::<ServerCore>,
+            &crate::db_relaunch::active_data_dir(),
+            ServerCore::shutdown,
+        )
+        .await
+    {
+        state.is_starting.store(false, Ordering::SeqCst);
+        state.is_starting_capture.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+
     // --- Check existing server ---
     {
         let server_guard = state.server.lock().await;
@@ -1077,47 +1450,69 @@ async fn spawn_screenpipe_inner(
         }
     }
 
+    // A healthy server without our in-process handle belongs to another
+    // Screenpipe instance. Preserve it and ask the user to quit that instance.
+    // Only an owner that fails the Screenpipe health probe may be reclaimed.
+    let settings_key = if store.recording.api_key.is_empty() {
+        None
+    } else {
+        Some(store.recording.api_key.as_str())
+    };
+    let external_owner = state.server.lock().await.is_none();
+    if external_owner && probe_server_health(&health_url, settings_key).await {
+        state.is_starting.store(false, Ordering::SeqCst);
+        state.is_starting_capture.store(false, Ordering::SeqCst);
+        crate::port_conflict::show_healthy_screenpipe(&app, port);
+        return Err(format!(
+            "another healthy screenpipe is already using local port {port}"
+        ));
+    }
+
     // --- Full start: server + capture ---
     // Stop any existing capture first (self-contained, no server lock needed)
     if let Some(session) = state.capture.lock().await.take() {
         session.stop().await;
     }
     // Shutdown existing server if any
+    if let Err(error) = shutdown_server(
+        &state.server,
+        &state.server_shutdown,
+        &crate::db_relaunch::active_data_dir(),
+        ServerCore::shutdown,
+    )
+    .await
     {
-        let mut server_guard = state.server.lock().await;
-        if let Some(server) = server_guard.take() {
-            server.shutdown().await;
-        }
+        state.is_starting.store(false, Ordering::SeqCst);
+        state.is_starting_capture.store(false, Ordering::SeqCst);
+        return Err(error);
     }
 
-    // Kill orphaned processes. Bound the cleanup so a hung OS helper cannot
-    // leak `is_starting=true` and wedge future restarts behind the
-    // "start already in progress" guard.
+    // The health probe above ruled out a healthy Screenpipe owner. Reclaim an
+    // unhealthy or unrelated owner gracefully first, with a forced fallback.
     if tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        kill_process_on_port(port),
+        crate::port_conflict::reclaim_owner(port, false),
     )
     .await
     .is_err()
     {
-        warn!(
-            "Timed out while killing orphaned process(es) on port {}; continuing with port-release wait",
-            port
-        );
+        warn!("Timed out while reclaiming unhealthy owner of port {port}");
     }
 
-    // Wait for port release
+    // Wait for port release.
     let max_poll_iters = if cfg!(windows) { 40 } else { 20 };
+    let mut port_released = false;
     for i in 0..max_poll_iters {
         match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
             Ok(_) => {
                 debug!("Port {} is free after {}ms", port, i * 250);
+                port_released = true;
                 break;
             }
             Err(_) => {
                 if i == max_poll_iters - 1 {
                     warn!(
-                        "Port {} still in use after {}s, will attempt start anyway",
+                        "Port {} still in use after {}s after reclaim attempt",
                         port,
                         max_poll_iters * 250 / 1000
                     );
@@ -1126,6 +1521,15 @@ async fn spawn_screenpipe_inner(
                 }
             }
         }
+    }
+    if !port_released {
+        state.is_starting.store(false, Ordering::SeqCst);
+        state.is_starting_capture.store(false, Ordering::SeqCst);
+        crate::health::set_recording_status(crate::health::RecordingStatus::Error);
+        crate::port_conflict::show_reclaim_failed(&app, port);
+        return Err(format!(
+            "local port {port} is already in use; quit the other screenpipe or app and retry"
+        ));
     }
 
     // Permissions check. The UI-facing status includes the engine's sticky
@@ -1137,7 +1541,7 @@ async fn spawn_screenpipe_inner(
 
     #[cfg(target_os = "macos")]
     let screen_recording_start_permitted =
-        screenpipe_core::permissions::check_screen_recording_tauri().is_granted();
+        crate::permissions::screen_recording_permission_usable_in_process();
     #[cfg(not(target_os = "macos"))]
     let screen_recording_start_permitted = true;
 
@@ -1163,7 +1567,7 @@ async fn spawn_screenpipe_inner(
         return Err(error.to_string());
     }
 
-    if state.capture_intended() && !disable_audio && !permissions_check.microphone.permitted() {
+    if state.capture_intended() && crate::permissions::microphone_required(&store.recording) && !permissions_check.microphone.permitted() {
         warn!(
             "Microphone permission not granted: {:?}. Audio recording will not work.",
             permissions_check.microphone
@@ -1177,22 +1581,34 @@ async fn spawn_screenpipe_inner(
         permissions_check.microphone
     );
 
-    let (data_dir, fell_back) = config::resolve_data_dir(&store.data_dir)
-        .map_err(|e| format!("failed to prepare recording data directory: {e}"))?;
-    if fell_back {
-        warn!(
-            "Custom data dir '{}' unavailable, using default: {}",
-            store.data_dir,
-            data_dir.display()
-        );
+    if let Ok(selected) = config::selected_recording_data_dir(&store.data_dir) {
+        crate::db_relaunch::set_active_database(&selected);
     }
+    let data_dir = match config::resolve_data_dir(&store.data_dir) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let message = format!(
+                "Failed to initialize database: cannot access recording data directory: {error}"
+            );
+            crate::health::set_boot_error(&message);
+            state.is_starting.store(false, Ordering::SeqCst);
+            state.is_starting_capture.store(false, Ordering::SeqCst);
+            return Err(message);
+        }
+    };
+    crate::db_relaunch::set_active_database(&data_dir);
 
-    // Resolve the API auth key exactly once per process via the shared
-    // helper and seed the cache before `to_recording_config` reads it. The
-    // helper handles env var / settings / secret-store / auth.json lookup
+    // Build the effective config before deciding whether auth needs a key.
+    // `from_settings` force-enables auth when LAN access is enabled, even if
+    // the persisted `apiAuth` field is false. Checking the persisted field
+    // here used to start an auth-enforcing server without any accepted key.
+    let mut recording_config = store.to_recording_config(data_dir.clone());
+
+    // Resolve the API auth key exactly once per process via the shared helper.
+    // The helper handles env var / settings / secret-store / auth.json lookup
     // and persists auto-generated keys to the secret store itself, so every
     // reader (server, MCP, auth CLI) sees the same value.
-    if store.recording.api_auth {
+    if recording_config.api_auth {
         let settings_key_opt = if store.recording.api_key.is_empty() {
             None
         } else {
@@ -1204,18 +1620,21 @@ async fn spawn_screenpipe_inner(
         )
         .await
         {
-            Ok(key) => crate::store::seed_api_auth_key(key),
+            Ok(key) => {
+                crate::store::seed_api_auth_key(key.clone());
+                recording_config.api_auth_key = Some(key);
+            }
             Err(e) => tracing::error!("failed to resolve api auth key: {}", e),
         }
     }
 
     notify_audio_engine_fallback(&store);
-    let recording_config = store.to_recording_config(data_dir);
 
     let server_arc = state.server.clone();
     let capture_arc = state.capture.clone();
     let wants_recording = state.wants_recording.clone();
     let cloud_token_arc = state.cloud_token.clone();
+    let history_access = state.history_access.clone();
     // Orphan-closing exists to clean up meetings a *crash* left open. When this
     // restart is the thing that interrupted the meeting we already know which
     // one is still running, so sweeping it is not cleanup — it is the bug: the
@@ -1235,7 +1654,14 @@ async fn spawn_screenpipe_inner(
     // topic with either a per-run or stable continued session id (see the matching
     // helper in `apps/screenpipe-app-tauri/lib/events/types.ts`).
     let app_for_pipe = app.clone();
+    let app_for_chat_destination = app.clone();
     let app_for_owned = app.clone();
+    let app_for_port_conflict = app.clone();
+    let workflow_catalog_dir = app
+        .path()
+        .app_local_data_dir()
+        .ok()
+        .map(|dir| dir.join("workflows"));
 
     // Owned-browser: create the connect-side instance and kick off the
     // webview install in the background. The engine starts immediately;
@@ -1250,11 +1676,18 @@ async fn spawn_screenpipe_inner(
         owned_browser.clone(),
     );
     let pipe_agent_events = crate::agent_event_emitter::PipeAgentEventEmitter::new(app_for_pipe);
-    let on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine> = Some(
-        std::sync::Arc::new(move |pipe_name: &str, exec_id: i64, continues_chat: bool, line: &str| {
-            pipe_agent_events.emit_line(pipe_name, exec_id, continues_chat, line);
-        }),
-    );
+    let on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine> =
+        Some(std::sync::Arc::new(
+            move |pipe_name: &str, exec_id: i64, continues_chat: bool, line: &str| {
+                pipe_agent_events.emit_line(pipe_name, exec_id, continues_chat, line);
+            },
+        ));
+    let chat_destination: Option<
+        screenpipe_core::agents::chat_destination::ChatDestinationDispatch,
+    > = Some(std::sync::Arc::new(move |request| {
+        let app = app_for_chat_destination.clone();
+        Box::pin(async move { crate::chat_control::run_pipe_in_existing_chat(&app, request).await })
+    }));
 
     // Oneshot for result
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -1279,18 +1712,29 @@ async fn spawn_screenpipe_inner(
             };
 
             server_runtime.block_on(async move {
+                let (runtime_lifetime, runtime_finished) = tokio::sync::oneshot::channel();
                 // Phase 1: Start server
                 let server = match ServerCore::start(
                     &recording_config,
                     on_pipe_output,
+                    chat_destination,
                     Some(owned_browser),
                     cloud_token_arc.clone(),
+                    history_access.clone(),
+                    workflow_catalog_dir,
+                    runtime_lifetime,
                 )
                 .await
                 {
                     Ok(s) => s,
                     Err(e) => {
                         error!("Failed to start server core: {}", e);
+                        if crate::port_conflict::is_error(&e, recording_config.port) {
+                            crate::port_conflict::show_reclaim_failed(
+                                &app_for_port_conflict,
+                                recording_config.port,
+                            );
+                        }
                         let _ = result_tx.send(Err(e));
                         return;
                     }
@@ -1301,7 +1745,7 @@ async fn spawn_screenpipe_inner(
                 let db_health = server.db.write_queue_health();
                 server
                     .db
-                    .set_persistent_failure_hook(make_db_wedge_recovery_hook(
+                    .set_database_restart_hook(make_database_restart_hook(
                         app_for_db_wedge.clone(),
                         db_wedge_breaker.clone(),
                         db_health,
@@ -1330,7 +1774,9 @@ async fn spawn_screenpipe_inner(
                                 let mut guard = server_arc.lock().await;
                                 *guard = Some(server);
                             }
+                            drop(capture_guard);
                             let _ = result_tx.send(Err(e));
+                            let _ = runtime_finished.await;
                             return;
                         }
                     }
@@ -1351,15 +1797,10 @@ async fn spawn_screenpipe_inner(
                 drop(capture_guard);
                 let _ = result_tx.send(Ok(()));
 
-                // Keep runtime alive as long as server exists
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    let guard = server_arc.lock().await;
-                    if guard.is_none() {
-                        info!("Server removed from state, shutting down server thread");
-                        break;
-                    }
-                }
+                // The core owns the sender through shutdown. The shared slot
+                // can be empty while database readers and pools are draining.
+                let _ = runtime_finished.await;
+                info!("Server core released, shutting down server thread");
             });
         })
         .map_err(|e| format!("Failed to spawn server thread: {}", e))?;
@@ -1368,6 +1809,15 @@ async fn spawn_screenpipe_inner(
         Ok(Ok(())) => {
             info!("Screenpipe started successfully");
             crate::db_relaunch::reset_db_boot_failures();
+            recovery_log::append(
+                &crate::db_relaunch::active_data_dir(),
+                "engine_started",
+                if state.capture_intended() {
+                    "recording requested; server and capture startup completed"
+                } else {
+                    "server started; recording deliberately stopped"
+                },
+            );
             state.is_starting.store(false, Ordering::SeqCst);
             state.is_starting_capture.store(false, Ordering::SeqCst);
             // A meeting that was in progress when this restart began is still
@@ -1415,14 +1865,20 @@ async fn spawn_screenpipe_inner(
 ///
 /// Lock-first pattern matches `start_capture` so a concurrent `start_capture`
 /// can't build a parallel session and clobber ours.
-async fn start_capture_internal(
+pub(crate) async fn start_capture_internal(
     state: &RecordingState,
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     let store = SettingsStore::get(app).ok().flatten().unwrap_or_default();
-    require_recording_access(&store)?;
+    require_recording_access(app, &store)?;
 
-    let mut capture_guard = state.capture.lock().await;
+    let Some(mut capture_guard) =
+        retry::lock_intended_capture(&state.capture, &state.wants_recording).await
+    else {
+        state.is_starting.store(false, Ordering::SeqCst);
+        info!("Capture was deliberately stopped while recovery waited; leaving server running");
+        return Ok(());
+    };
     if capture_guard.is_some() {
         // A concurrent start_capture beat us to it.
         state.is_starting.store(false, Ordering::SeqCst);
@@ -1448,117 +1904,221 @@ async fn start_capture_internal(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Port cleanup (unchanged)
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod shutdown_storage_tests {
+    use super::*;
+    use screenpipe_db::DatabaseManager;
+    use tokio::sync::oneshot;
 
-async fn kill_process_on_port(port: u16) {
-    #[allow(unused_variables)]
-    let my_pid = std::process::id().to_string();
-
-    #[cfg(unix)]
-    {
-        let child = match tokio::process::Command::new("lsof")
-            .args(["-nP", "-ti", &format!(":{}", port)])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let child_id = child.id();
-        let output =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
-                .await
+    async fn shutdown_with_reader(hybrid: bool, cancel_waiter: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().to_path_buf();
+        let (runtime_lifetime, runtime_finished) = oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let thread = std::thread::spawn(move || {
             {
-                Ok(Ok(o)) => o,
-                _ => {
-                    if let Some(pid) = child_id {
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &pid.to_string()])
-                            .output();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let db = if hybrid {
+                        DatabaseManager::new_hybrid(
+                            &data_dir,
+                            Default::default(),
+                            Default::default(),
+                        )
+                        .await
+                    } else {
+                        DatabaseManager::new(
+                            data_dir.join("db.sqlite").to_str().unwrap(),
+                            Default::default(),
+                        )
+                        .await
                     }
-                    warn!("lsof timed out checking port {}, killed", port);
-                    return;
-                }
-            };
+                    .unwrap();
+                    assert!(ready_tx
+                        .send((Arc::new(db), tokio::runtime::Handle::current()))
+                        .is_ok());
+                    let _ = runtime_finished.await;
+                });
+            }
+            let _ = stopped_tx.send(());
+        });
+        let (db, runtime) = ready_rx.await.unwrap();
+        db.execute_raw_sql_write(
+            "INSERT INTO frames(id,timestamp,full_text) VALUES(1,'2026-09-17T00:00:00Z','saved recording')",
+        ).await.unwrap();
+        let pin = db.storage_read_token().await.unwrap();
+        let connection = db.pool.acquire().await.unwrap();
+        let slot = Arc::new(Mutex::new(Some((Arc::clone(&db), runtime_lifetime))));
+        let closing_slot = Arc::clone(&slot);
+        let pending = Arc::new(ServerShutdown::default());
+        let pending_for_close = Arc::clone(&pending);
+        let close_root = root.path().to_path_buf();
+        let mut closing = tokio::spawn(async move {
+            shutdown_server(
+                &closing_slot,
+                &pending_for_close,
+                &close_root,
+                |(db, runtime_lifetime)| async move {
+                    db.close().await;
+                    drop(runtime_lifetime);
+                },
+            )
+            .await
+            .unwrap();
+        });
+        db.pool.close_event().await;
+        assert!(
+            !closing.is_finished(),
+            "shutdown must drain admitted readers"
+        );
 
-        if output.status.success() {
-            let pids_str = String::from_utf8_lossy(&output.stdout);
-            let pids: Vec<&str> = pids_str
-                .trim()
-                .split('\n')
-                .filter(|s| !s.is_empty() && *s != my_pid)
-                .collect();
-            if pids.is_empty() {
-                debug!("No orphaned processes on port {} (only our own PID)", port);
-                return;
-            }
-            warn!(
-                "Found {} orphaned process(es) on port {}: {:?}. Killing to free port (our pid: {}).",
-                pids.len(), port, pids, my_pid
+        if cancel_waiter {
+            // The health overlay bounds stop_screenpipe with a timeout. Dropping
+            // that caller must neither abandon close nor release the old lease.
+            closing.abort();
+            assert!(closing.await.unwrap_err().is_cancelled());
+            let reopen = DatabaseManager::new(
+                root.path().join("db.sqlite").to_str().unwrap(),
+                Default::default(),
+            )
+            .await;
+            assert!(reopen
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("already owns a live DatabaseManager"));
+            let closing_slot = Arc::clone(&slot);
+            let close_root = root.path().to_path_buf();
+            closing = tokio::spawn(async move {
+                shutdown_server(
+                    &closing_slot,
+                    &pending,
+                    &close_root,
+                    |(_db, _lifetime)| async {
+                        panic!("the next start must join the original shutdown, not replace it");
+                    },
+                )
+                .await
+                .unwrap();
+            });
+        }
+
+        // A reader on the server runtime needs the state slot before releasing
+        // its connection/export pin. Shutdown must neither lock it out nor tear
+        // down its runtime merely because the core was taken from the slot.
+        let mut reader = runtime.spawn(async move {
+            let stopped = slot.lock().await.is_none();
+            drop(connection);
+            drop(pin);
+            stopped
+        });
+        let released = tokio::time::timeout(Duration::from_secs(2), &mut reader).await;
+        if released.is_err() {
+            // Let the old, deadlocking implementation clean up before failing.
+            reader.abort();
+            let _ = reader.await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stopped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        thread.join().unwrap();
+        assert!(
+            matches!(released, Ok(Ok(true))),
+            "reader blocked by shutdown: {released:?}"
+        );
+
+        if !hybrid {
+            screenpipe_db::storage::migrate(root.path(), Default::default(), Default::default())
+                .await
+                .unwrap();
+            assert!(root
+                .path()
+                .join("storage-migration-complete.json")
+                .is_file());
+            assert!(!root.path().join("storage-migration.json").exists());
+        }
+        let reopened = DatabaseManager::new(
+            root.path().join("db.sqlite").to_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(reopened.storage_descriptor().is_some());
+        reopened.execute_raw_sql_write(
+            "INSERT INTO frames(id,timestamp,full_text) VALUES(2,'2026-09-17T00:01:00Z','recording after migration')",
+        ).await.unwrap();
+        let rows = reopened
+            .query_raw_sql("SELECT id FROM frames ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        let payloads = reopened
+            .frame_payloads(&[1, 2], screenpipe_db::storage::Projection::All)
+            .await
+            .unwrap();
+        assert_eq!(payloads[&1].full_text.as_deref(), Some("saved recording"));
+        assert_eq!(
+            payloads[&2].full_text.as_deref(),
+            Some("recording after migration")
+        );
+        reopened.close().await;
+
+        if cancel_waiter {
+            recovery_log::append(
+                root.path(),
+                "engine_started",
+                "old and new recording payloads verified after database reopen",
             );
-            for pid in &pids {
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-9", pid])
-                    .output()
-                    .await;
+            crate::process_exit::configure_relaunch_home(
+                &mut std::process::Command::new("unused-test-replacement"),
+                Some(false),
+                root.path(),
+            );
+            // Simulate app-log rotation/restart and enough noisy logs to fill
+            // the normal five-file support limit. Lifecycle evidence persists.
+            for day in 1..=7 {
+                std::fs::write(
+                    root.path()
+                        .join(format!("screenpipe-app.2026-09-{day:02}.log")),
+                    "app restarted\npassword=hunter2\n",
+                )
+                .unwrap();
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            info!("Killed orphaned process(es) on port {}", port);
+            let report =
+                crate::diagnostic_logs::collect_redacted_from_dirs(&[root.path().to_path_buf()])
+                    .await
+                    .unwrap();
+            assert!(report.contains("shutdown_wait_cancelled"));
+            assert!(report.contains("cleanup continues and database reopen must wait"));
+            assert!(report.contains("shutdown_completed"));
+            assert!(report.contains("engine_started"));
+            assert!(report.contains("relaunch_window_state: home_visible=Some(false)"));
+            assert!(!report.contains("hunter2"));
         }
     }
 
-    #[cfg(windows)]
-    {
-        let my_pid_num: u32 = std::process::id();
-        let mut netstat_cmd = tokio::process::Command::new("cmd");
-        netstat_cmd.args(["/C", &format!("netstat -ano | findstr :{}", port)]);
-        {
-            #[allow(unused_imports)]
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            netstat_cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        match netstat_cmd.output().await {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout);
-                let mut pids = std::collections::HashSet::new();
-                for line in text.lines() {
-                    if let Some(pid) = line.split_whitespace().last() {
-                        if let Ok(pid_num) = pid.parse::<u32>() {
-                            if pid_num > 0 && pid_num != my_pid_num {
-                                pids.insert(pid_num);
-                            }
-                        }
-                    }
-                }
-                if pids.is_empty() {
-                    debug!("No orphaned processes on port {} (only our own PID)", port);
-                    return;
-                }
-                warn!(
-                    "Found {} orphaned process(es) on port {}: {:?}. Killing to free port (our pid: {}).",
-                    pids.len(), port, pids, my_pid_num
-                );
-                for pid in &pids {
-                    let mut kill_cmd = tokio::process::Command::new("taskkill");
-                    kill_cmd.args(["/F", "/PID", &pid.to_string()]);
-                    {
-                        #[allow(unused_imports)]
-                        use std::os::windows::process::CommandExt;
-                        const CREATE_NO_WINDOW: u32 = 0x08000000;
-                        kill_cmd.creation_flags(CREATE_NO_WINDOW);
-                    }
-                    let _ = kill_cmd.output().await;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                info!("Killed orphaned process(es) on port {}", port);
-            }
-            _ => {}
-        }
+    #[tokio::test]
+    async fn legacy_reader_drains_then_migration_completes_and_recording_can_resume() {
+        shutdown_with_reader(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn hybrid_reader_releases_storage_pin_before_runtime_exits() {
+        shutdown_with_reader(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_drains_old_owner_then_reopens_migrated_recordings() {
+        shutdown_with_reader(true, true).await;
     }
 }
 
@@ -1586,7 +2146,10 @@ mod spawn_lifecycle_lock_tests {
             .find(fn_needle)
             .expect("spawn_screenpipe renamed — repoint this guard at it");
         let body = &source[start..];
-        let end = body.find("\n}\n").expect("unterminated function body");
+        let end = body
+            .find("\n}\n")
+            .or_else(|| body.find("\r\n}\r\n"))
+            .expect("unterminated function body");
         let body = &body[..end];
 
         assert!(
@@ -1621,33 +2184,261 @@ mod capture_intent_tests {
 }
 
 #[cfg(test)]
+mod local_api_auth_tests {
+    use super::SettingsStore;
+    use serde_json::json;
+
+    #[test]
+    fn managed_lan_access_requires_a_key_when_persisted_api_auth_is_false() {
+        // This is the exact flattened store shape produced when enterprise
+        // policy enables LAN access on a device that previously disabled API
+        // auth. Startup must follow the effective config, not `apiAuth` alone.
+        let store: SettingsStore = serde_json::from_value(json!({
+            "apiAuth": false,
+            "listenOnLan": true
+        }))
+        .expect("managed settings shape should deserialize");
+
+        let config = store.to_recording_config(std::path::PathBuf::from("test-data"));
+
+        assert!(config.api_auth);
+    }
+}
+
+#[cfg(test)]
 mod recording_access_tests {
-    use super::recording_access_policy;
+    use super::{recording_access_policy, server_access_policy};
+    use crate::startup_auth::{AuthenticationStatus, DeferredAccountStart};
+    use crate::store::{LocalPlanPolicy, SettingsStore};
+
+    #[test]
+    fn account_refresh_recovers_deferred_start_without_a_frontend_gate() {
+        let pending = DeferredAccountStart::default();
+        let mut settings = SettingsStore::default();
+        settings.user.id = Some("subscribed-user".into());
+        settings.user.subscription_plan = Some("pro".into());
+        settings.user.app_entitled = Some(true);
+        let access = |settings: &SettingsStore| {
+            server_access_policy(
+                false,
+                false,
+                settings.local_plan_policy() != LocalPlanPolicy::Unknown,
+                false,
+                false,
+            )
+        };
+
+        // Boot has a signed-in paid account but no verified cached evidence.
+        assert!(!access(&settings));
+        pending.defer();
+        assert!(!pending.take_if_allowed(access(&settings), || {}));
+
+        // /api/user refresh supplies verified evidence before any UI gate
+        // mounts. Recovery must not require a frontend stop or gate transition.
+        settings.user.entitlement = Some(serde_json::json!({
+            "plan": "pro",
+            "active": true,
+            "source": "subscription",
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+            "features": { "app": true }
+        }));
+        assert!(access(&settings));
+        assert!(pending.take_if_allowed(access(&settings), || {}));
+        assert!(!pending.take_if_allowed(access(&settings), || {}));
+    }
+
+    #[test]
+    fn account_refresh_does_not_start_an_unrequested_or_cancelled_engine() {
+        let pending = DeferredAccountStart::default();
+        assert!(!pending.take_if_allowed(true, || {}));
+        pending.defer();
+        pending.cancel(); // explicit capture stop or sign-out
+        assert!(!pending.take_if_allowed(true, || {}));
+    }
+
+    #[test]
+    fn account_refresh_before_native_deferral_is_reconciled_at_deferral() {
+        let pending = DeferredAccountStart::default();
+        // A refresh before the native gate has nothing to resume yet.
+        assert!(!pending.take_if_allowed(true, || {}));
+        pending.defer();
+        // Native deferral also checks current access, not its old snapshot.
+        assert!(pending.take_if_allowed(true, || {}));
+        assert!(!pending.take_if_allowed(true, || {}));
+    }
+
+    #[test]
+    fn concurrent_account_refreshes_claim_only_one_deferred_start() {
+        let pending = std::sync::Arc::new(DeferredAccountStart::default());
+        pending.defer();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let pending = pending.clone();
+                std::thread::spawn(move || pending.take_if_allowed(true, || {}))
+            })
+            .collect();
+        let starts = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(starts, 1);
+    }
+
+    #[test]
+    fn explicit_stop_wins_over_an_in_flight_account_resume() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pending = DeferredAccountStart::default();
+        let wants_recording = AtomicBool::new(false);
+        pending.defer();
+        let (stop_requested, stop_request) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            pending.take_if_allowed(true, || {
+                scope.spawn(|| {
+                    stop_requested.send(()).unwrap();
+                    pending.cancel();
+                    wants_recording.store(false, Ordering::SeqCst);
+                });
+                stop_request.recv().unwrap();
+                wants_recording.store(true, Ordering::SeqCst);
+            });
+        });
+        assert!(!wants_recording.load(Ordering::SeqCst));
+        assert!(!pending.take_if_allowed(true, || panic!("stop was lost")));
+    }
 
     #[test]
     fn verified_free_consumer_can_record_without_a_paid_entitlement() {
-        assert!(recording_access_policy(false, false, true, false, false));
+        assert!(recording_access_policy(
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
     }
 
     #[test]
     fn consumer_with_unknown_plan_cannot_record() {
-        assert!(!recording_access_policy(false, false, false, false, false));
+        assert!(!recording_access_policy(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
     }
 
     #[test]
     fn signed_out_consumer_cannot_start_recording() {
-        assert!(!recording_access_policy(false, false, false, false, false));
+        assert!(!recording_access_policy(
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            AuthenticationStatus::LoggedOut,
+        ));
     }
 
     #[test]
-    fn enterprise_build_still_requires_entitlement() {
-        assert!(!recording_access_policy(true, false, true, false, false));
-        assert!(recording_access_policy(true, false, true, true, false));
+    fn enterprise_build_requires_verified_enterprise_session() {
+        assert!(!recording_access_policy(
+            true,
+            false,
+            true,
+            false,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
+        assert!(recording_access_policy(
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
     }
 
     #[test]
     fn mandatory_enterprise_org_cannot_record_from_consumer_binary() {
-        assert!(!recording_access_policy(false, false, true, true, true));
+        assert!(!recording_access_policy(
+            false,
+            false,
+            true,
+            true,
+            true,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
+    }
+
+    #[test]
+    fn summary_paywall_blocks_capture_even_in_debug_builds() {
+        assert!(!recording_access_policy(
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            AuthenticationStatus::Authenticated,
+        ));
+    }
+
+    #[test]
+    fn signup_free_startup_does_not_require_account_or_enterprise_auth() {
+        assert!(recording_access_policy(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            AuthenticationStatus::NotRequired,
+        ));
+        assert!(recording_access_policy(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            AuthenticationStatus::NotRequired,
+        ));
+    }
+
+    #[test]
+    fn summary_paywall_keeps_the_local_read_server_available() {
+        assert!(server_access_policy(false, true, true, false, false));
+        assert!(server_access_policy(false, false, true, false, false));
+    }
+}
+
+#[cfg(test)]
+mod history_access_tests {
+    use super::history_access_restricted;
+
+    #[test]
+    fn consumer_free_and_unattributed_accounts_are_restricted() {
+        assert!(history_access_restricted(false, true));
+    }
+
+    #[test]
+    fn verified_paid_consumer_is_unrestricted() {
+        assert!(!history_access_restricted(false, false));
+    }
+
+    #[test]
+    fn enterprise_build_is_unrestricted_without_consumer_plan_truth() {
+        assert!(!history_access_restricted(true, true));
     }
 }
 

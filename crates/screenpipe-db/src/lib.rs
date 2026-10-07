@@ -33,6 +33,7 @@ mod db;
 mod failpoint_vfs;
 mod recovery;
 mod sqlite_error;
+pub mod storage;
 pub mod text_normalizer;
 pub mod text_similarity;
 mod types;
@@ -49,24 +50,32 @@ pub use db::{
     ActivityIntervalRecord, ActivityLedgerObservation, ActivityTaskDraft, DatabaseManager,
     DeleteTimeRangeResult, ImmediateTx, NewMeetingTranscriptSegment, SemanticActor,
     SemanticActorAlias, SemanticActorReference, SemanticAttachResult, SemanticCleanupResult,
-    SemanticContextQuery, SemanticFrameContext, SemanticProjectionWriteResult,
-    MEETING_END_REASON_AUTO_END, MEETING_END_REASON_EXPLICIT_STOP, MEETING_END_REASON_SHUTDOWN,
+    SemanticContextQuery, SemanticFrameContext, SemanticProjectionWriteResult, StarredSession,
+    MEETING_END_REASON_AUTO_END, MEETING_END_REASON_EXPLICIT_STOP, MEETING_END_REASON_ROOM_CHANGED,
+    MEETING_END_REASON_SHUTDOWN,
 };
 pub use recovery::{
-    probe_quarantined_generation_health, rebuild_recovered_fts5_indexes,
-    verify_fresh_sqlite_recovery_candidate, QuarantineHealthProbe, RecoveryVerification,
+    inspect_database_health, probe_quarantined_generation_health, rebuild_recovered_fts5_indexes,
+    verify_fresh_sqlite_recovery_candidate, DatabaseHealthError, QuarantineHealthProbe,
+    RecoveryVerification,
 };
+/// Retry database availability without exhausting a permanent failure budget.
+pub const SQLITE_ACCESS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub use screenpipe_sqlite_coordinator::{
-    archive_resolved_sqlite_quarantine, persist_sqlite_quarantine,
-    prepare_sqlite_quarantine_reserve, read_sqlite_quarantine, resolve_verified_sqlite_quarantine,
+    admit_verified_sqlite_generation, archive_resolved_sqlite_quarantine,
+    begin_sqlite_verification, persist_sqlite_quarantine, persist_verified_sqlite_quarantine,
+    prepare_sqlite_quarantine_reserve, quarantine_verified_sqlite_generation,
+    read_sqlite_quarantine, resolve_verified_sqlite_quarantine, sqlite_confirmed_corruption_exists,
     sqlite_file_identity, sqlite_hard_fault_latched, sqlite_quarantine_exists,
-    sqlite_quarantine_is_self_healable, sqlite_quarantine_marker_path, SqliteFileIdentity,
-    SqliteQuarantineMarker,
+    sqlite_quarantine_marker_path, sqlite_quarantine_self_heal_prerequisite,
+    sqlite_verification_pending_exists, SqliteFileIdentity, SqliteQuarantineMarker,
+    SqliteQuarantineSelfHealPrerequisite,
 };
 pub use text_normalizer::{expand_search_query, sanitize_fts5_query};
 pub use types::*;
 pub use write_queue::{
     is_retryable_write_stall, is_write_lock_contention, is_write_pool_starved, request_write_pause,
-    request_write_resume, PersistentFailureHook, SyncTable, WriteQueueHealth,
-    WRITE_LOCK_HELD_MESSAGE, WRITE_POOL_STARVED_MESSAGE,
+    request_write_resume, DatabaseRestartHook, DatabaseRestartReason, PersistentFailureHook,
+    SyncTable, WriteQueueHealth, WRITE_LOCK_HELD_MESSAGE, WRITE_POOL_STARVED_MESSAGE,
 };

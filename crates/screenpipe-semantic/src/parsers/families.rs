@@ -90,9 +90,11 @@ impl FamilyParser {
             priority,
         );
         if family == AppFamily::Conversation {
-            manifest.parser_version = "3".into();
+            manifest.parser_version = "6".into();
         } else if family == AppFamily::Mail {
-            manifest.parser_version = "2".into();
+            manifest.parser_version = "5".into();
+        } else if family == AppFamily::Task {
+            manifest.parser_version = "3".into();
         }
         Self { family, manifest }
     }
@@ -180,6 +182,9 @@ fn parse_conversation(
         messages = action_anchored_turns(tree, &["Reply", "Add reaction"]);
     }
     if messages.is_empty() {
+        if let Some(codex_surface) = macos_codex_surface(profile, tree) {
+            return codex_surface;
+        }
         return chromium_chat_list(profile, tree).unwrap_or_default();
     }
 
@@ -260,6 +265,200 @@ fn parse_conversation(
     items
 }
 
+/// ChatGPT Desktop's macOS Codex mode retains the central task/composer as
+/// depth-gapped AX nodes without DOM classes or message containers. Sidebar
+/// rows have similar roles, so require the explicit Codex mode control plus a
+/// central-only anchor: either `Chat actions` for an open task or the composer
+/// text area for a new task. This intentionally does not turn the sidebar or
+/// settings screens into conversations.
+fn macos_codex_surface(
+    profile: &BuiltinAppProfile,
+    tree: &SemanticTree,
+) -> Option<Vec<SemanticItem>> {
+    if !matches!(profile.id, "chatgpt" | "chatgptlegacy") {
+        return None;
+    }
+
+    let mut codex_mode = false;
+    let mut codex_scaffold = false;
+    let mut title: Option<(NodeId, String)> = None;
+    let mut previous_content: Option<(NodeId, String)> = None;
+    let composer = macos_codex_composer(tree);
+    let mut project: Option<String> = None;
+    let mut run_location: Option<String> = None;
+    let mut environment: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut permissions: Option<String> = None;
+    let model = composer.as_ref().and_then(|(_, _, model)| model.clone());
+    let mut awaiting: Option<&'static str> = None;
+    let mut has_chat_actions = false;
+    let mut working = false;
+
+    for index in 0..tree.len() {
+        let node = NodeId(index as u32);
+        let role = tree.role(node).unwrap_or("");
+        let Some(content) = node_content(tree, node) else {
+            continue;
+        };
+
+        codex_mode |= content.eq_ignore_ascii_case("Switch mode, current mode: Codex");
+        codex_scaffold |= content.starts_with("What should we build")
+            || content.starts_with("Change project: ")
+            || content.eq_ignore_ascii_case("Select where to run the chat");
+        working |= content.eq_ignore_ascii_case("Stop")
+            || content.eq_ignore_ascii_case("Steer")
+            || content.starts_with("Working for ");
+
+        if content.eq_ignore_ascii_case("Chat actions") {
+            has_chat_actions = true;
+            title = previous_content.take().filter(|(_, candidate)| {
+                !candidate.is_empty() && candidate.len() <= 240 && !candidate.contains(['\n', '\r'])
+            });
+        }
+
+        if let Some(value) = content.strip_prefix("Change project: ") {
+            project = nonempty_owned(value);
+        } else if content.eq_ignore_ascii_case("Select where to run the chat") {
+            awaiting = Some("run_location");
+        } else if content.eq_ignore_ascii_case("Select a local environment") {
+            awaiting = Some("environment");
+        } else if content.eq_ignore_ascii_case("What branch should this chat start from?") {
+            awaiting = Some("branch");
+        } else if content.eq_ignore_ascii_case("Change permissions") {
+            awaiting = Some("permissions");
+        } else if let Some(field) = awaiting.take() {
+            if is_static_text_role(role) {
+                match field {
+                    "run_location" => run_location = Some(content.to_owned()),
+                    "environment" => environment = Some(content.to_owned()),
+                    "branch" => branch = Some(content.to_owned()),
+                    "permissions" => permissions = Some(content.to_owned()),
+                    _ => {}
+                }
+            }
+        }
+
+        previous_content = Some((node, content.to_owned()));
+    }
+
+    if !(codex_mode || codex_scaffold || has_chat_actions)
+        || (!has_chat_actions && composer.is_none())
+    {
+        return None;
+    }
+
+    let (title_node, title) = title.unwrap_or_else(|| {
+        composer
+            .as_ref()
+            .map(|(node, _, _)| (*node, "New chat".to_owned()))
+            .unwrap_or((NodeId(0), "ChatGPT".to_owned()))
+    });
+    let mut conversation = SemanticItem::new(
+        "conversation",
+        SemanticKind::Conversation,
+        format!("{}:conversation:{}", profile.id, key_component(&title)),
+        IdentityQuality::Derived,
+    );
+    conversation.title = Some(title);
+    conversation.status = Some(if working { "working" } else { "ready" }.into());
+    conversation
+        .metadata
+        .insert("app".into(), profile.display_name.into());
+    conversation
+        .metadata
+        .insert("family".into(), "conversation".into());
+    conversation
+        .metadata
+        .insert("surface".into(), "macos_codex".into());
+    for (key, value) in [
+        ("project", project),
+        ("run_location", run_location),
+        ("environment", environment),
+        ("branch", branch),
+        ("permissions", permissions),
+        ("model", model),
+    ] {
+        if let Some(value) = value {
+            conversation.metadata.insert(key.into(), value);
+        }
+    }
+    conversation.source_nodes.push(title_node);
+
+    let Some((draft_node, draft_body, _)) = composer else {
+        return Some(vec![conversation]);
+    };
+    if draft_body.eq_ignore_ascii_case("Do anything") {
+        return Some(vec![conversation]);
+    }
+    let mut draft_message = SemanticItem::new(
+        "message-0",
+        SemanticKind::Message,
+        format!("{}:draft", profile.id),
+        IdentityQuality::Ephemeral,
+    );
+    draft_message.parent_local_id = Some("conversation".into());
+    draft_message.actor = Some("[user]".into());
+    draft_message.body = Some(draft_body);
+    draft_message.status = Some("draft".into());
+    draft_message
+        .metadata
+        .insert("actor_evidence".into(), "composer".into());
+    draft_message.source_nodes.push(draft_node);
+    Some(vec![conversation, draft_message])
+}
+
+/// Identify the central Codex composer by its local control sequence rather
+/// than accepting every text area. Artifact viewers and side panels can expose
+/// their own editors later in the same flat capture.
+fn macos_codex_composer(tree: &SemanticTree) -> Option<(NodeId, String, Option<String>)> {
+    for index in 0..tree.len() {
+        let node = NodeId(index as u32);
+        if !tree
+            .role(node)
+            .is_some_and(|role| role.eq_ignore_ascii_case("AXTextArea"))
+        {
+            continue;
+        }
+        let Some(body) = node_content(tree, node) else {
+            continue;
+        };
+        let mut model = None;
+        let mut send_control = false;
+        for following in (index + 1)..tree.len().min(index + 7) {
+            let candidate = NodeId(following as u32);
+            let role = tree.role(candidate).unwrap_or("");
+            let Some(content) = node_content(tree, candidate) else {
+                continue;
+            };
+            if ["Send", "Stop"]
+                .iter()
+                .any(|label| content.eq_ignore_ascii_case(label))
+            {
+                send_control = true;
+            } else if model.is_none()
+                && matches!(role, "AXPopUpButton" | "PopUpButton" | "ComboBox")
+            {
+                model = Some(content.to_owned());
+            }
+        }
+        if send_control {
+            return Some((node, body.to_owned(), model));
+        }
+    }
+    None
+}
+
+fn nonempty_owned(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn is_static_text_role(role: &str) -> bool {
+    ["AXStaticText", "Text", "Static"]
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(role))
+}
+
 fn conversation_actor(
     profile: &BuiltinAppProfile,
     tree: &SemanticTree,
@@ -330,6 +529,9 @@ fn parse_mail(profile: &BuiltinAppProfile, tree: &SemanticTree) -> Vec<SemanticI
         if profile.id == "gmail" {
             return parse_persisted_gmail(profile, tree);
         }
+        if profile.id == "protonmail" {
+            return parse_proton_mail(profile, tree);
+        }
         return Vec::new();
     }
 
@@ -347,6 +549,97 @@ fn parse_mail(profile: &BuiltinAppProfile, tree: &SemanticTree) -> Vec<SemanticI
 
     let mut items = Vec::with_capacity(messages.len() + 1);
     items.push(conversation);
+    for (index, (node, sender, body)) in messages.into_iter().enumerate() {
+        let mut message = SemanticItem::new(
+            format!("mail-{index}"),
+            SemanticKind::Message,
+            format!("{}:mail-message:{index}", profile.id),
+            IdentityQuality::Ephemeral,
+        );
+        message.parent_local_id = Some("thread".into());
+        message.actor = Some(sender);
+        message.body = Some(body);
+        message.source_nodes.push(node);
+        items.push(message);
+    }
+    items
+}
+
+/// Proton Mail exposes each expanded message through stable structural classes:
+/// a `message-header` containing `message-header-recipient-labels`, paired with
+/// a `message-content` body below their nearest shared ancestor. Require that
+/// full trio so mailbox chrome or an empty composer cannot become a message.
+fn parse_proton_mail(profile: &BuiltinAppProfile, tree: &SemanticTree) -> Vec<SemanticItem> {
+    let mut messages = Vec::new();
+    let mut message_roots = HashSet::new();
+    'roots: for root in tree.roots() {
+        for header in tree
+            .descendants(root)
+            .filter(|node| tree.has_class(*node, "message-header"))
+        {
+            let Some(sender_root) = tree
+                .descendants(header)
+                .find(|node| tree.has_class(*node, "message-header-recipient-labels"))
+            else {
+                continue;
+            };
+            let Some(sender) = tree
+                .descendants(sender_root)
+                .find_map(|node| node_content(tree, node))
+                .filter(|sender| sender.len() <= 240)
+            else {
+                continue;
+            };
+
+            let mut ancestor = Some(header);
+            let mut message = None;
+            for _ in 0..=4 {
+                let Some(candidate) = ancestor else {
+                    break;
+                };
+                if let Some(body) = first_marked_subtree_text(tree, candidate, &["message-content"])
+                {
+                    message = Some((candidate, body));
+                    break;
+                }
+                ancestor = tree.parent(candidate);
+            }
+            let Some((message_root, body)) = message else {
+                continue;
+            };
+            if !message_roots.insert(message_root) || body.trim().is_empty() {
+                continue;
+            }
+            messages.push((message_root, sender.to_owned(), body));
+            if messages.len() == MAX_STRUCTURAL_CANDIDATES {
+                break 'roots;
+            }
+        }
+    }
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let subject = first_heading(tree)
+        .unwrap_or(profile.display_name)
+        .to_owned();
+    let mut thread = SemanticItem::new(
+        "thread",
+        SemanticKind::Conversation,
+        format!("{}:mail:{}", profile.id, key_component(&subject)),
+        IdentityQuality::Derived,
+    );
+    thread.title = Some(subject);
+    thread
+        .metadata
+        .insert("app".into(), profile.display_name.into());
+    thread.metadata.insert("family".into(), "mail".into());
+    thread
+        .metadata
+        .insert("surface".into(), "proton_message".into());
+
+    let mut items = Vec::with_capacity(messages.len() + 1);
+    items.push(thread);
     for (index, (node, sender, body)) in messages.into_iter().enumerate() {
         let mut message = SemanticItem::new(
             format!("mail-{index}"),
@@ -429,9 +722,13 @@ fn parse_tasks(profile: &BuiltinAppProfile, tree: &SemanticTree) -> Vec<Semantic
     );
     let mut items = Vec::new();
     for (index, node) in candidates.into_iter().enumerate() {
-        let title = first_marked_text_in(tree, node, &["task-title", "item-title", "title"])
-            .or_else(|| first_text_in(tree, node));
-        let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) else {
+        let title = task_field(tree, node, &["task-title", "item-title", "title"])
+            .or_else(|| first_text_in(tree, node).map(str::to_owned));
+        let Some(title) = title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        else {
             continue;
         };
         let mut task = SemanticItem::new(
@@ -441,12 +738,66 @@ fn parse_tasks(profile: &BuiltinAppProfile, tree: &SemanticTree) -> Vec<Semantic
             IdentityQuality::Derived,
         );
         task.title = Some(title.to_owned());
-        task.status =
-            if signature_has_any(tree, node, &["completed", "complete", "done", "checked"]) {
-                Some("completed".into())
-            } else {
-                first_marked_text_in(tree, node, &["status"]).map(str::to_owned)
-            };
+        // A visible status field outranks a wrapper's presentation class.
+        // Substring matching made `unchecked` and `incomplete` completed, and
+        // also mistook human-readable task descriptions for state evidence.
+        task.status = task_field(
+            tree,
+            node,
+            &["status", "task-status", "item-status", "issue-status"],
+        )
+        .or_else(|| {
+            structural_marker_is(
+                tree,
+                node,
+                &[
+                    "completed",
+                    "complete",
+                    "done",
+                    "checked",
+                    "is-completed",
+                    "is-complete",
+                    "is-done",
+                    "is-checked",
+                    "task-completed",
+                ],
+            )
+            .then(|| "completed".to_owned())
+        });
+        for (key, markers) in [
+            (
+                "assignee",
+                &[
+                    "assignee",
+                    "task-assignee",
+                    "item-assignee",
+                    "issue-assignee",
+                ][..],
+            ),
+            (
+                "due",
+                &[
+                    "due-date",
+                    "task-due-date",
+                    "task-due",
+                    "item-due-date",
+                    "issue-due-date",
+                ][..],
+            ),
+            (
+                "priority",
+                &[
+                    "priority",
+                    "task-priority",
+                    "item-priority",
+                    "issue-priority",
+                ][..],
+            ),
+        ] {
+            if let Some(value) = task_field(tree, node, markers) {
+                task.metadata.insert(key.into(), value);
+            }
+        }
         task.metadata
             .insert("app".into(), profile.display_name.into());
         task.metadata.insert("family".into(), "task".into());
@@ -454,6 +805,35 @@ fn parse_tasks(profile: &BuiltinAppProfile, tree: &SemanticTree) -> Vec<Semantic
         items.push(task);
     }
     items
+}
+
+fn structural_marker_is(tree: &SemanticTree, node: NodeId, markers: &[&str]) -> bool {
+    [tree.identifier(node), tree.dom_identifier(node)]
+        .into_iter()
+        .flatten()
+        .chain(tree.classes(node))
+        .any(|field| {
+            markers
+                .iter()
+                .any(|marker| field.eq_ignore_ascii_case(marker))
+        })
+}
+
+/// Retain explicit decision fields, including labels inside structural wrappers.
+/// Do not infer owners or deadlines from arbitrary task prose or action labels.
+fn task_field(tree: &SemanticTree, root: NodeId, markers: &[&str]) -> Option<String> {
+    tree.descendants(root)
+        .filter(|node| structural_marker_is(tree, *node, markers))
+        .find_map(|node| {
+            let value = collect_text(tree, node).or_else(|| {
+                node_content(tree, node)
+                    .filter(|value| !is_control_type_label(value, tree.role(node)))
+                    .map(str::to_owned)
+            })?;
+            let value = value.trim();
+            (!value.is_empty() && value.len() <= 240 && !value.contains(['\n', '\r']))
+                .then(|| value.to_owned())
+        })
 }
 
 fn parse_calendar(profile: &BuiltinAppProfile, tree: &SemanticTree) -> Vec<SemanticItem> {
@@ -1079,7 +1459,7 @@ fn is_simple_slash_date(token: &str) -> bool {
 
 fn tree_any(tree: &SemanticTree, predicate: impl Fn(NodeId) -> bool) -> bool {
     tree.roots()
-        .any(|root| tree.descendants(root).any(|node| predicate(node)))
+        .any(|root| tree.descendants(root).any(&predicate))
 }
 
 /// `collect_text` starting below `root`. A Fluent message container is itself a
@@ -1393,7 +1773,7 @@ fn collect_text(tree: &SemanticTree, root: NodeId) -> Option<String> {
     let mut lines: Vec<&str> = Vec::new();
     let mut bytes = 0usize;
     'nodes: for node in tree.descendants(root) {
-        if !is_text_role(tree.role(node)) {
+        if !is_text_role(tree.role(node)) || inside_action_control(tree, node, root) {
             continue;
         }
         let Some(content) = node_content(tree, node) else {
@@ -1412,6 +1792,47 @@ fn collect_text(tree: &SemanticTree, root: NodeId) -> Option<String> {
         }
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn inside_action_control(tree: &SemanticTree, node: NodeId, root: NodeId) -> bool {
+    // Captured trees can reparent real body text below an interactive node.
+    // A control ancestor alone is insufficient: discard only a recognized
+    // action label, preserving link previews, poll choices and attachment names.
+    let Some(content) = node_content(tree, node) else {
+        return false;
+    };
+    if ![
+        "Reply",
+        "Reply to thread",
+        "Add reaction",
+        "More actions",
+        "Copy message",
+        "Copy link",
+        "Edit message",
+        "Delete message",
+        "Download attachment",
+        "Forward message",
+    ]
+    .iter()
+    .any(|label| content.eq_ignore_ascii_case(label))
+    {
+        return false;
+    }
+    let mut ancestor = tree.parent(node);
+    while let Some(parent) = ancestor {
+        if parent == root {
+            return false;
+        }
+        if tree.role(parent).is_some_and(|role| {
+            ["Button", "AXButton", "MenuItem", "AXMenuItem"]
+                .iter()
+                .any(|control| role.eq_ignore_ascii_case(control))
+        }) {
+            return true;
+        }
+        ancestor = tree.parent(parent);
+    }
+    false
 }
 
 fn truncate_body(value: &str) -> &str {

@@ -101,7 +101,7 @@ describe("pipe store error state", () => {
     fireEvent.click(screen.getByTestId("tab-discover"));
 
     await waitFor(() => {
-      expect(screen.getByText("couldn't load scheduled tasks")).toBeTruthy();
+      expect(screen.getByText("Couldn't load scheduled tasks")).toBeTruthy();
     });
     expect(screen.queryByText("No scheduled tasks found")).toBeNull();
     expect(mocks.cacheSet).not.toHaveBeenCalledWith(
@@ -115,5 +115,21 @@ describe("pipe store error state", () => {
     await waitFor(() => expect(screen.getByText("Daily summary")).toBeTruthy());
     expect(storeAttempts).toBe(2);
     expect(mocks.invalidatePrefix).toHaveBeenCalledWith("pipes/store");
+  });
+
+  it("keeps Automations scoped to scheduled tasks", async () => {
+    mocks.localFetch.mockImplementation(async (url: string) => {
+      if (url === "/pipes") {
+        return jsonResponse([{ config: { name: "installed" } }]);
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    render(<PipeStoreView />);
+
+    expect(screen.getByTestId("tab-my-pipes")).toBeTruthy();
+    expect(screen.getByTestId("tab-discover")).toBeTruthy();
+    expect(screen.queryByTestId("tab-connections")).toBeNull();
+    expect(screen.queryByTestId("provider-skill-catalog")).toBeNull();
   });
 });

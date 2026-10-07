@@ -50,6 +50,28 @@ impl DatabaseManager {
         attendees: Option<&str>,
         calendar_event_id: Option<&str>,
     ) -> Result<i64, SqlxError> {
+        self.insert_meeting_with_calendar_at(
+            meeting_app,
+            detection_source,
+            title,
+            attendees,
+            calendar_event_id,
+            chrono::Utc::now(),
+        )
+        .await
+    }
+
+    /// Insert a meeting with an explicit start timestamp in the same immediate
+    /// transaction that creates the row.
+    pub async fn insert_meeting_with_calendar_at(
+        &self,
+        meeting_app: &str,
+        detection_source: &str,
+        title: Option<&str>,
+        attendees: Option<&str>,
+        calendar_event_id: Option<&str>,
+        meeting_start: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64, SqlxError> {
         match self
             .try_insert_meeting(
                 meeting_app,
@@ -57,14 +79,22 @@ impl DatabaseManager {
                 title,
                 attendees,
                 calendar_event_id,
+                meeting_start,
             )
             .await
         {
             Err(e) if calendar_event_id.is_some() && is_calendar_event_conflict(&e) => {
                 // Lost the race to another meeting between the pre-check and
                 // this insert. The event belongs to whoever claimed it first.
-                self.try_insert_meeting(meeting_app, detection_source, None, None, None)
-                    .await
+                self.try_insert_meeting(
+                    meeting_app,
+                    detection_source,
+                    None,
+                    None,
+                    None,
+                    meeting_start,
+                )
+                .await
             }
             other => other,
         }
@@ -77,15 +107,14 @@ impl DatabaseManager {
         title: Option<&str>,
         attendees: Option<&str>,
         calendar_event_id: Option<&str>,
+        meeting_start: chrono::DateTime<chrono::Utc>,
     ) -> Result<i64, SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let meeting_start = meeting_start.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let id = sqlx::query(
             "INSERT INTO meetings (meeting_start, meeting_app, detection_source, title, attendees, calendar_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
-        .bind(&now)
+        .bind(&meeting_start)
         .bind(meeting_app)
         .bind(detection_source)
         .bind(title)
@@ -110,6 +139,37 @@ impl DatabaseManager {
             .bind(calendar_event_id)
             .fetch_optional(&self.pool)
             .await
+    }
+
+    /// The calendar event this meeting is bound to, if any. The detector reads
+    /// this at a suspected meeting boundary to tell "same scheduled event,
+    /// mic hiccup" apart from "the calendar rolled into the next event".
+    pub async fn meeting_calendar_event_id(
+        &self,
+        meeting_id: i64,
+    ) -> Result<Option<String>, SqlxError> {
+        let key = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT calendar_event_id FROM meetings WHERE id = ?1",
+        )
+        .bind(meeting_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten()
+        .filter(|key| !key.is_empty());
+        Ok(key)
+    }
+
+    /// How the meeting was finalized: one of the `MEETING_END_REASON_*`
+    /// constants, or `None` for an open row / legacy natural end.
+    pub async fn meeting_end_reason(&self, meeting_id: i64) -> Result<Option<String>, SqlxError> {
+        let reason = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT end_reason FROM meetings WHERE id = ?1",
+        )
+        .bind(meeting_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(reason)
     }
 
     /// Claim `calendar_event_id` for `meeting_id`. Atomic, and idempotent for
@@ -677,6 +737,37 @@ impl DatabaseManager {
         transcript: &str,
         captured_at: DateTime<Utc>,
     ) -> Result<i64, SqlxError> {
+        self.insert_meeting_transcript_segment_with_identity(
+            meeting_id,
+            provider,
+            model,
+            item_id,
+            device_name,
+            device_type,
+            "legacy",
+            None,
+            speaker_name,
+            transcript,
+            captured_at,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_meeting_transcript_segment_with_identity(
+        &self,
+        meeting_id: i64,
+        provider: &str,
+        model: Option<&str>,
+        item_id: &str,
+        device_name: &str,
+        device_type: &str,
+        stream_id: &str,
+        session_speaker_id: Option<&str>,
+        speaker_name: Option<&str>,
+        transcript: &str,
+        captured_at: DateTime<Utc>,
+    ) -> Result<i64, SqlxError> {
         let trimmed = transcript.trim();
         if trimmed.is_empty() {
             return Ok(0);
@@ -685,8 +776,8 @@ impl DatabaseManager {
         let mut tx = self.begin_immediate_with_retry().await?;
         let result = sqlx::query(
             "INSERT OR IGNORE INTO meeting_transcript_segments \
-             (meeting_id, provider, model, item_id, device_name, device_type, speaker_name, transcript, captured_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (meeting_id, provider, model, item_id, device_name, device_type, stream_id, session_speaker_id, speaker_name, transcript, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(meeting_id)
         .bind(provider)
@@ -694,6 +785,8 @@ impl DatabaseManager {
         .bind(item_id)
         .bind(device_name)
         .bind(device_type)
+        .bind(stream_id)
+        .bind(session_speaker_id)
         .bind(speaker_name)
         .bind(trimmed)
         .bind(captured_at.to_rfc3339())
@@ -956,8 +1049,10 @@ impl DatabaseManager {
                     // In-window chunks (false) sort before out-of-window (true); the
                     // nearest wins within each group. So an in-window chunk is always
                     // preferred, but a far same-device chunk still beats dropping.
-                    let dt = (c.1 - seg_ms).abs();
-                    (dt > window_ms, dt)
+                    let dt = seg_ms - c.1;
+                    // Chunk timestamps mark their START. Nearest-by-distance
+                    // picks the next file for the second half of each chunk.
+                    (!(0..=window_ms).contains(&dt), dt.unsigned_abs())
                 });
             let Some(chunk) = pick else {
                 continue;
@@ -968,7 +1063,7 @@ impl DatabaseManager {
                 "INSERT OR IGNORE INTO audio_transcriptions \
                  (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, \
                   device, is_input_device, speaker_id, start_time, end_time, text_length) \
-                 VALUES (?1, ?2, 0, ?3, 'live', ?4, ?5, NULL, 0, 0, ?6)",
+                 VALUES (?1, ?2, 0, ?3, 'live', ?4, ?5, NULL, ?7, NULL, ?6)",
             )
             .bind(chunk_id)
             .bind(&s.transcript)
@@ -976,6 +1071,7 @@ impl DatabaseManager {
             .bind(&s.device_name)
             .bind(s.is_input)
             .bind(text_length)
+            .bind((seg_ms >= chunk.1).then_some((seg_ms - chunk.1) as f64 / 1000.0))
             .execute(&mut **tx.conn())
             .await?;
             inserted += res.rows_affected();
@@ -984,79 +1080,62 @@ impl DatabaseManager {
         Ok(inserted)
     }
 
-    /// Give live meeting-transcript segments the SAME global `speaker_id` that the
-    /// engine-agnostic backfill (`backfill_missing_speakers`) resolved on
-    /// `audio_transcriptions` — so the Meeting view shows the cross-meeting, nameable
-    /// identity instead of Deepgram's per-stream "speaker N" label.
-    ///
-    /// For each segment still missing a speaker (and `captured_at >= since`), take the
-    /// `speaker_id` of the nearest already-identified `audio_transcriptions` row within
-    /// `coverage_window_secs`. The mirrored live row shares the segment's exact
-    /// timestamp, so once the chunk backfill stamps it, it matches first. Idempotent —
-    /// only fills NULLs, and the `EXISTS` guard avoids no-op NULL writes. Returns rows
-    /// updated. Cheap: runs on the reconciliation sweep, never the hot path.
+    /// Copy an identity only from this turn's identified live mirror. A nearby
+    /// same-direction row may be a different participant, device, or stream.
+    /// Exact time, text and device are required, and conflicting mirror identities
+    /// leave the provider-local label unresolved. Existing assignments survive.
     pub async fn backfill_meeting_segment_speakers(
         &self,
         since: DateTime<Utc>,
-        coverage_window_secs: f64,
+        _coverage_window_secs: f64,
     ) -> Result<u64, SqlxError> {
-        // One statement instead of fetch-candidates → per-row nearest-lookup →
-        // update-by-id (up to 501 round-trips per pass). The scalar lookup is
-        // correlated to each of the capped candidates, but — critically — its
-        // timestamp predicates leave `at.timestamp` bare. SQLite can therefore
-        // range-scan `idx_audio_transcriptions_timestamp` instead of materializing
-        // candidate × the entire audio history under a BEGIN IMMEDIATE lock.
-        //
-        // Device match preserved: a mic segment (device_type = 'input') only
-        // pulls an input-device speaker, everything else an output-device one;
-        // COALESCE(is_input_device, 1) keeps the old NULL-defaults-to-input
-        // behaviour. Resolved segments drop out of the candidate set, so
-        // steady-state work is just newly-mirrored segments.
-        //
-        // Calculate proximity from rounded epoch milliseconds rather than a
-        // julianday delta. Equal offsets around a timestamp can differ by one
-        // floating-point ULP in julianday(), which would bypass the documented
-        // timestamp/id tie breakers.
+        // Keep each mirror lookup bounded by the timestamp index. Limit eligible
+        // updates, not unresolved candidates: newer unknown turns must not starve
+        // older turns whose exact mirrors have since acquired an identity.
+        // The old proximity window is retained in the API for callers but cannot
+        // widen identity evidence beyond an exact timestamp match.
         const PER_PASS_LIMIT: i64 = 500;
         let mut tx = self.begin_immediate_with_retry().await?;
         let r = sqlx::query(
-            "WITH cand AS ( \
-                 SELECT id, device_type, captured_at \
-                 FROM meeting_transcript_segments \
-                 WHERE speaker_id IS NULL AND julianday(captured_at) >= julianday(?1) \
-                 ORDER BY captured_at DESC LIMIT ?3 \
-             ), \
-             nearest AS ( \
-                 SELECT c.id AS seg_id, at.speaker_id AS sid, \
-                        ROW_NUMBER() OVER ( \
-                            PARTITION BY c.id \
-                            ORDER BY ABS( \
-                                CAST(ROUND(unixepoch(at.timestamp, 'subsec') * 1000.0) AS INTEGER) - \
-                                CAST(ROUND(unixepoch(c.captured_at, 'subsec') * 1000.0) AS INTEGER) \
-                            ), \
-                                     at.timestamp, at.id \
-                        ) AS rn \
-                 FROM cand c \
-                 JOIN audio_transcriptions at INDEXED BY idx_audio_transcriptions_timestamp \
-                   ON at.timestamp >= strftime( \
-                          '%Y-%m-%dT%H:%M:%f+00:00', c.captured_at, printf('-%f seconds', ?2) \
-                      ) \
-                  AND at.timestamp <= strftime( \
-                          '%Y-%m-%dT%H:%M:%f+00:00', c.captured_at, printf('+%f seconds', ?2) \
-                      ) \
-                  AND at.speaker_id IS NOT NULL \
-                  AND COALESCE(at.is_input_device, 1) = \
-                      (CASE WHEN c.device_type = 'input' THEN 1 ELSE 0 END) \
-             ) \
-             UPDATE meeting_transcript_segments SET speaker_id = ( \
-                 SELECT sid FROM nearest \
-                 WHERE nearest.seg_id = meeting_transcript_segments.id AND nearest.rn = 1 \
-             ) \
-             WHERE speaker_id IS NULL \
-               AND id IN (SELECT seg_id FROM nearest WHERE rn = 1)",
+            r#"
+            WITH cand AS (
+                SELECT id, device_name, device_type, captured_at, transcript
+                FROM meeting_transcript_segments
+                WHERE speaker_id IS NULL AND julianday(captured_at) >= julianday(?1)
+                  AND TRIM(transcript) != ''
+            ), matches AS (
+                SELECT c.id AS seg_id, MIN(a.speaker_id) AS sid
+                FROM cand c
+                JOIN audio_transcriptions a INDEXED BY idx_audio_transcriptions_timestamp
+                  ON a.timestamp >= strftime('%Y-%m-%dT%H:%M:%f+00:00', c.captured_at, printf('-%f seconds', ?2))
+                 AND a.timestamp <= strftime('%Y-%m-%dT%H:%M:%f+00:00', c.captured_at, printf('+%f seconds', ?2))
+                 AND julianday(a.timestamp) = julianday(c.captured_at)
+                 AND a.transcription_engine = 'live'
+                 AND a.transcription = c.transcript
+                 AND a.device = c.device_name
+                 AND a.is_input_device = CASE WHEN c.device_type = 'input' THEN 1 ELSE 0 END
+                 AND a.speaker_id IS NOT NULL
+                WHERE c.device_type IN ('input', 'output')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM meeting_transcript_segments other
+                      WHERE other.id != c.id
+                        AND julianday(other.captured_at) = julianday(c.captured_at)
+                        AND other.device_name = c.device_name AND other.device_type = c.device_type
+                        AND other.transcript = c.transcript
+                  )
+                GROUP BY c.id HAVING COUNT(DISTINCT a.speaker_id) = 1
+                ORDER BY c.captured_at DESC, c.id DESC LIMIT ?3
+            )
+            UPDATE meeting_transcript_segments SET speaker_id = (
+                SELECT sid FROM matches WHERE matches.seg_id = meeting_transcript_segments.id
+            )
+            WHERE speaker_id IS NULL AND id IN (SELECT seg_id FROM matches)
+            "#,
         )
         .bind(since)
-        .bind(coverage_window_secs.max(0.0))
+        // SQLite timestamps are millisecond-rounded; the index envelope must
+        // include the original microsecond value on either side of that rounding.
+        .bind(0.001_f64)
         .bind(PER_PASS_LIMIT)
         .execute(&mut **tx.conn())
         .await?;
@@ -1101,7 +1180,7 @@ impl DatabaseManager {
 
         let candidate_rows = sqlx::query(
             "SELECT at.transcription, at.timestamp, at.audio_chunk_id, \
-                    at.is_input_device, ac.file_path \
+                    at.is_input_device, ac.file_path, ac.timestamp AS chunk_timestamp \
              FROM audio_transcriptions at \
              JOIN audio_chunks ac ON ac.id = at.audio_chunk_id \
              WHERE at.transcription_engine = 'live' \
@@ -1114,8 +1193,10 @@ impl DatabaseManager {
         .await?;
 
         // (is_input, text) → [(ts_ms, chunk_id, file_path)]
-        let mut candidates: std::collections::HashMap<(bool, String), Vec<(i64, i64, String)>> =
-            std::collections::HashMap::new();
+        let mut candidates: std::collections::HashMap<
+            (bool, String),
+            Vec<(i64, i64, String, Option<f64>)>,
+        > = std::collections::HashMap::new();
         for row in &candidate_rows {
             let (Ok(text), Ok(ts), Ok(chunk_id)) = (
                 row.try_get::<String, _>("transcription"),
@@ -1129,7 +1210,16 @@ impl DatabaseManager {
             candidates
                 .entry((is_input, text.trim().to_string()))
                 .or_default()
-                .push((ts.timestamp_millis(), chunk_id, file_path));
+                .push((
+                    ts.timestamp_millis(),
+                    chunk_id,
+                    file_path,
+                    row.try_get::<DateTime<Utc>, _>("chunk_timestamp")
+                        .ok()
+                        .and_then(|start| {
+                            (ts >= start).then_some((ts - start).num_milliseconds() as f64 / 1000.0)
+                        }),
+                ));
         }
 
         for (idx, seg_ms) in unresolved.drain(..) {
@@ -1141,16 +1231,33 @@ impl DatabaseManager {
             let Some(matches) = candidates.get(&key) else {
                 continue;
             };
-            if let Some((_, chunk_id, file_path)) = matches
+            if let Some((_, chunk_id, file_path, offset)) = matches
                 .iter()
-                .filter(|(ts, _, _)| (ts - seg_ms).abs() <= WINDOW_MS)
-                .min_by_key(|(ts, _, _)| (ts - seg_ms).abs())
+                .filter(|(ts, _, _, _)| (ts - seg_ms).abs() <= WINDOW_MS)
+                .min_by_key(|(ts, _, _, _)| (ts - seg_ms).abs())
             {
                 seg.audio_chunk_id = Some(*chunk_id);
                 seg.audio_file_path = Some(file_path.clone());
+                seg.audio_start_time_secs = *offset;
             }
         }
         Ok(())
+    }
+
+    /// Fast existence signal for "did anything get transcribed live": counts
+    /// only `meeting_transcript_segments` rows, not the audio_transcriptions
+    /// window join that [`Self::list_meeting_transcript_segments`] performs.
+    pub async fn count_meeting_transcript_segments(
+        &self,
+        meeting_id: i64,
+    ) -> Result<i64, SqlxError> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM meeting_transcript_segments WHERE meeting_id = ?1",
+        )
+        .bind(meeting_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
     }
 
     pub async fn list_meeting_transcript_segments(
@@ -1183,16 +1290,14 @@ impl DatabaseManager {
                     NULL AS audio_transcription_id,
                     NULL AS audio_chunk_id,
                     NULL AS audio_file_path,
+                    NULL AS audio_start_time_secs,
                     mts.speaker_id AS speaker_id,
-                    -- Prefer the resolved global speaker's name; output rows fall
-                    -- back to the free-text Deepgram label until backfilled / if
-                    -- the speaker is unnamed (NULLIF treats '' as "no name yet").
-                    -- Input (mic) rows get NULL instead of the raw label so the
-                    -- client can render "me" until the user assigns someone.
-                    CASE
-                        WHEN mts.device_type = 'input' THEN NULLIF(s.name, '')
-                        ELSE COALESCE(NULLIF(s.name, ''), mts.speaker_name)
-                    END AS speaker_name,
+                    mts.session_speaker_id AS session_speaker_id,
+                    -- Prefer the resolved global speaker's name, then preserve
+                    -- Deepgram's stream-local label until voice backfill gives it
+                    -- a durable identity. A mic is a capture source, not proof
+                    -- that every voice on it belongs to the local user.
+                    COALESCE(NULLIF(s.name, ''), mts.speaker_name) AS speaker_name,
                     mts.transcript,
                     mts.captured_at,
                     mts.created_at
@@ -1216,7 +1321,9 @@ impl DatabaseManager {
                     at.id AS audio_transcription_id,
                     at.audio_chunk_id AS audio_chunk_id,
                     ac.file_path AS audio_file_path,
+                    at.start_time AS audio_start_time_secs,
                     at.speaker_id AS speaker_id,
+                    NULL AS session_speaker_id,
                     s.name AS speaker_name,
                     at.transcription AS transcript,
                     at.timestamp AS captured_at,
@@ -1569,7 +1676,8 @@ impl DatabaseManager {
     }
 
     /// Find the most recent ended meeting in `app` whose `meeting_end` is
-    /// within `within_secs` and that did NOT end via explicit user stop.
+    /// within `within_secs` and that did NOT end via explicit user stop or a
+    /// detected room change.
     ///
     /// The `end_reason != 'explicit_stop'` filter is the load-bearing piece
     /// of the meeting-merge fix: when a user clicks stop in the meeting note
@@ -1579,6 +1687,10 @@ impl DatabaseManager {
     /// "DUPLICATE: X" sync notifications. The detector loop also tracks
     /// `last_explicit_stop_id` in memory as defense-in-depth, but this SQL
     /// filter is the durable guarantee that survives restarts.
+    ///
+    /// `room_changed` rows are excluded for the same reason: the detector
+    /// closed that row precisely because the user moved to the next call, so
+    /// re-attaching the next call to it would recreate the merge it prevented.
     pub async fn find_recent_meeting_for_app(
         &self,
         app: &str,
@@ -1594,13 +1706,14 @@ impl DatabaseManager {
              WHERE meeting_app = ?1 \
                AND meeting_end IS NOT NULL \
                AND meeting_end >= ?2 \
-               AND (end_reason IS NULL OR end_reason != ?3) \
+               AND (end_reason IS NULL OR end_reason NOT IN (?3, ?4)) \
              ORDER BY meeting_end DESC \
              LIMIT 1",
         )
         .bind(app)
         .bind(&cutoff)
         .bind(MEETING_END_REASON_EXPLICIT_STOP)
+        .bind(MEETING_END_REASON_ROOM_CHANGED)
         .fetch_optional(&self.pool)
         .await?;
         Ok(meeting)

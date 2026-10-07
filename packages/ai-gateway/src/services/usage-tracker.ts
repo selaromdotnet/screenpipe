@@ -131,9 +131,12 @@ const MODEL_WEIGHTS: Record<string, number> = {
   // Auto — smart routing, free
   'auto': 0,
   // OpenAI API
+  // Same Standard token prices as Fable 5; cash caps also track actual usage.
+  'gpt-6-astra': 10,
   'gpt-5.6': 6,
   'gpt-5.6-sol': 6,
   'gpt-5.6-terra': 3,
+  'gpt-6-luna': 1,
   'gpt-5.6-luna': 1,
   'gpt-5.5-pro': 36,
   'gpt-5.5': 6,
@@ -194,6 +197,7 @@ const DEFAULT_TIER_CONFIG: Record<UsageTier, TierLimits> = {
     freeRpm: 60,
     allowedModels: [
       'auto',
+      'gpt-6-luna',
       'gpt-5.6-luna',
     ],
   },
@@ -210,6 +214,7 @@ const DEFAULT_TIER_CONFIG: Record<UsageTier, TierLimits> = {
     freeRpm: 120,
     allowedModels: [
       'auto',
+      'gpt-6-luna',
       'gpt-5.6-luna',
     ],
   },

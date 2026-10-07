@@ -45,6 +45,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use screenpipe_config::{DomainRule, UrlRule};
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::monitor::SafeMonitor;
 
@@ -63,7 +64,19 @@ pub struct HdRecorderConfig {
     pub included_windows: Vec<String>,
     /// Ignored-URL patterns — windows showing a blocked URL are excluded from
     /// HD capture too (URL privacy parity with the event-driven capture loop).
-    pub ignored_urls: Vec<String>,
+    pub ignored_urls: Vec<UrlRule>,
+    /// Strict URL allowlist. HD capture is suppressed while this is active,
+    /// because an encoded stream cannot prove a fresh tab URL for every frame.
+    pub included_urls: Vec<DomainRule>,
+    /// Exclude browser private/incognito windows from HD capture. Without this
+    /// the HD stream keeps recording a private window that the event-driven
+    /// loop excludes, since HD frames bypass the a11y gates entirely.
+    pub ignore_incognito_windows: bool,
+    /// Let the incognito detector use browser-native APIs (macOS Automation).
+    pub enhanced_incognito_detection: bool,
+    /// Stored snapshot width from `videoQuality` (0 = native). Bounds the HD
+    /// stream; independent of the OCR capture width.
+    pub snapshot_max_width: u32,
 }
 
 /// Per-monitor HD recorder loop. Idles until an HD session is active, then
@@ -269,6 +282,7 @@ mod macos {
             match tokio::time::timeout(write_timeout, writer.write_all(jpeg)).await {
                 Ok(result) => result?,
                 Err(_) => {
+                    screenpipe_core::health_diagnostics::media_stall();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "hd ffmpeg stdin write timed out",
@@ -301,6 +315,17 @@ mod macos {
         controller: Arc<crate::high_fps_controller::HighFpsController>,
     ) {
         info!("hd recorder ready for monitor {monitor_id} (device {device_name})");
+
+        let url_policy = screenpipe_a11y::url_filter::UrlPolicy::new(
+            &config.ignored_urls,
+            &config.included_urls,
+        );
+        if url_policy.is_active() {
+            info!(
+                "hd recorder disabled for monitor {monitor_id}: URL filters require per-frame tab verification"
+            );
+            return;
+        }
 
         loop {
             if stop_signal.load(Ordering::Relaxed) {
@@ -344,7 +369,7 @@ mod macos {
         stop_signal: &Arc<AtomicBool>,
     ) -> Result<()> {
         use screenpipe_screen::capture_screenshot_by_window::{
-            get_excluded_sck_window_ids, WindowFilters,
+            get_excluded_sck_window_ids, ExclusionSources, WindowFilters,
         };
 
         // Read the HD rate live from the controller so tray changes (10↔30fps)
@@ -353,12 +378,19 @@ mod macos {
 
         // Privacy: exclude ignored windows and blocked-URL windows at the OS
         // level (parity with capture).
-        let filters = WindowFilters::new(
+        let filters = WindowFilters::with_url_rules(
             &config.ignored_windows,
             &config.included_windows,
             &config.ignored_urls,
+            &config.included_urls,
         );
-        let mut excluded = get_excluded_sck_window_ids(&filters);
+        let mut excluded = get_excluded_sck_window_ids(
+            &filters,
+            ExclusionSources {
+                ignore_incognito_windows: config.ignore_incognito_windows,
+                enhanced_incognito_detection: config.enhanced_incognito_detection,
+            },
+        );
         excluded.sort_unstable();
         excluded.dedup();
 
@@ -366,9 +398,12 @@ mod macos {
         // starts the stream, so run it on a blocking thread.
         let hd = {
             let m = monitor.clone();
-            tokio::task::spawn_blocking(move || m.start_hd_capture(fps, &excluded))
-                .await
-                .context("hd capture spawn_blocking join")??
+            let snapshot_max_width = config.snapshot_max_width;
+            tokio::task::spawn_blocking(move || {
+                m.start_hd_capture(fps, &excluded, snapshot_max_width)
+            })
+            .await
+            .context("hd capture spawn_blocking join")??
         };
         let actual_fps = hd.fps.max(1);
         let (hd_w, hd_h) = (hd.width, hd.height);
@@ -442,7 +477,10 @@ mod macos {
         ));
         let file_str = file.to_string_lossy().to_string();
 
-        let mut ffmpeg = start_hd_ffmpeg(&file, actual_fps)?;
+        let operation = screenpipe_core::health_diagnostics::MediaOperation::start("hd");
+        let mut ffmpeg = start_hd_ffmpeg(&file, actual_fps).inspect_err(|error| {
+            operation.finish::<(), _>(&Err(error));
+        })?;
         let mut stdin = ffmpeg.stdin.take().context("hd ffmpeg stdin missing")?;
         // Queue the chunk row concurrently. Neither SQLite admission nor its
         // completion is awaited by the media writer.
@@ -573,6 +611,7 @@ mod macos {
                 write_failed = true;
             }
             Err(_) => {
+                screenpipe_core::health_diagnostics::media_stall();
                 warn!("hd recorder: ffmpeg finalize timed out on monitor {monitor_id}");
                 write_failed = true;
                 let _ = ffmpeg.kill().await;
@@ -580,6 +619,12 @@ mod macos {
             }
             Ok(Ok(_)) => {}
         }
+        operation.finish(&if write_failed {
+            Err("HD encoder failed; inspect encoder log")
+        } else {
+            Ok(())
+        });
+        drop(operation);
         drop(stream);
 
         spawn_hd_index_persist(

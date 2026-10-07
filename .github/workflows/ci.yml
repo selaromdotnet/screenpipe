@@ -13,6 +13,9 @@ on:
     branches: [main]
     paths:
       - '**.rs'
+      # Core embeds these assets with include_str! and tests their contracts.
+      - 'crates/screenpipe-core/assets/**'
+      - 'apps/screenpipe-app-tauri/scripts/eval-pi-compaction.ts'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -20,6 +23,8 @@ on:
   pull_request:
     paths:
       - '**.rs'
+      - 'crates/screenpipe-core/assets/**'
+      - 'apps/screenpipe-app-tauri/scripts/eval-pi-compaction.ts'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -35,6 +40,21 @@ env:
   GIT_LFS_SKIP_SMUDGE: 1
 
 jobs:
+  test-sqlite-recovery-windows:
+    # This package needs only bundled SQLite. Exercise NTFS links and WAL
+    # recovery independently of the full engine's media dependency build.
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+          rustflags: ""
+      - name: Verify embedded SQLite recovery on Windows
+        run: cargo test --locked -p screenpipe-sqlite-recovery -- --nocapture
+
   test-ubuntu:
     runs-on: ubuntu-latest
     # A hung test otherwise burns the 6-hour GitHub default and blocks the
@@ -88,6 +108,9 @@ jobs:
 
       - name: Install dependencies
         run: .github/scripts/install_dependencies.sh
+
+      - name: Pi context compaction runtime eval (production Rust patcher)
+        run: bun apps/screenpipe-app-tauri/scripts/eval-pi-compaction.ts
 
       - name: Copy test image
         run: |
@@ -163,6 +186,9 @@ jobs:
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Pi context compaction runtime eval (production Rust patcher)
+        run: bun apps/screenpipe-app-tauri/scripts/eval-pi-compaction.ts
 
       - name: Ensure 7-Zip is available
         shell: pwsh
@@ -310,13 +336,25 @@ jobs:
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: cargo test -p screenpipe-engine --test router_contract_test --profile release-dev --target x86_64-pc-windows-msvc
 
-      # Recovery must be part of the shipped binary on Windows; never fall
-      # back to a host-installed sqlite3 executable.
-      - name: Verify embedded SQLite recovery on Windows
+      - name: Verify offline recovery installation on Windows
         env:
           RUSTFLAGS: ""
           AWS_LC_SYS_PREBUILT_NASM: "1"
-        run: cargo test -p screenpipe-sqlite-recovery --profile release-dev --target x86_64-pc-windows-msvc
+        run: cargo test -p screenpipe-engine --lib cli::db::recovery_tests --profile release-dev --target x86_64-pc-windows-msvc
+
+      - name: Verify scroll checkpoints and foreground identity on Windows
+        env:
+          RUSTFLAGS: ""
+          AWS_LC_SYS_PREBUILT_NASM: "1"
+        run: |
+          cargo test --locked -p screenpipe-a11y --lib --profile release-dev --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p screenpipe-engine --lib recording_detail --profile release-dev --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p screenpipe-engine --lib ui_recorder:: --profile release-dev --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p screenpipe-engine --lib event_driven_capture::tests:: --profile release-dev --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run specific Windows OCR cargo test
         env:

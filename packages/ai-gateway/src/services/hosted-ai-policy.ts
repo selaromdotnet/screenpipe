@@ -13,6 +13,7 @@ export type HostedAiCapacityUpgrade = {
 
 const BASIC_HOSTED_MODELS = [
 	'auto',
+	'gpt-6-luna',
 	'gpt-5.6-luna',
 	'gpt-5.4-mini',
 	'gpt-5.4-nano',
@@ -27,6 +28,7 @@ const FREE_HOSTED_MODELS = ['auto'] as const;
 // name from bypassing our cost review through a Business wildcard.
 const BUSINESS_HOSTED_MODELS = [
 	...BASIC_HOSTED_MODELS,
+	'gpt-6-astra',
 	'gpt-5.6',
 	'gpt-5.6-sol',
 	'gpt-5.6-terra',
@@ -37,6 +39,7 @@ const BUSINESS_HOSTED_MODELS = [
 	'claude-sonnet-5',
 	'claude-opus-5',
 	'claude-fable-5',
+	'glm-5.3-flash-reap50-iq3m',
 	'screenpipe-event-classifier',
 ] as const;
 

@@ -14,7 +14,7 @@ import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { AcpConfigSelector } from "./acp-config-selector";
-import { ThinkingLevelSelector } from "@/components/thinking-level-selector";
+import { ThinkingLevelSlider, useThinkingLevel } from "@/components/thinking-level-selector";
 import { useAcpSessionConfig } from "@/lib/stores/acp-session-config";
 
 vi.mock("@/lib/utils/tauri", () => ({
@@ -30,6 +30,12 @@ vi.mock("@/lib/hooks/use-pi-thinking-level", () => ({
 }));
 
 const SESSION = "chat-1";
+
+// Pi's dial as the composer hosts it: the composer owns the level and the
+// model picker shows the slider in its popover.
+function PiDial() {
+  return <ThinkingLevelSlider control={useThinkingLevel({ sessionId: SESSION })} />;
+}
 
 afterEach(() => {
   cleanup();
@@ -58,49 +64,27 @@ function renderAcp() {
 }
 
 describe("composer settings control", () => {
-  it("gives the coding agent and raw Pi the same trigger shape", () => {
+  it("keeps the model readable and collapses the secondary effort axis", () => {
     renderAcp();
     const acp = screen.getByTestId("acp-config-trigger");
-    const acpClass = acp.className;
-    cleanup();
-
-    render(<ThinkingLevelSelector sessionId={SESSION} />);
-    const pi = screen.getByTestId("thinking-level-trigger");
-
-    // Same shell, so identical layout classes: height, padding, the width cap
-    // that keeps a long model name from pushing the send button around.
-    expect(pi.className).toBe(acpClass);
-    expect(acpClass).toContain("max-w-[190px]");
+    expect(acp).toHaveTextContent("Sonnet 4.6");
+    expect(acp.className).toContain("max-w-[190px]");
   });
 
-  // Claude and Codex both name the model in plain text. A glyph in front of a
-  // value that already names itself is a second thing to parse in a row that
-  // already holds four controls.
-  it("names the value with no leading glyph on either trigger", () => {
-    renderAcp();
-    expect(screen.getByTestId("acp-config-trigger").querySelector("svg")).toBeNull();
-    cleanup();
-
-    render(<ThinkingLevelSelector sessionId={SESSION} />);
-    expect(screen.getByTestId("thinking-level-trigger").querySelector("svg")).toBeNull();
-  });
-
-  it("names the active value on both triggers", () => {
-    renderAcp();
-    expect(screen.getByTestId("acp-config-trigger")).toHaveTextContent("Sonnet 4.6");
-    cleanup();
-
-    render(<ThinkingLevelSelector sessionId={SESSION} />);
-    expect(screen.getByTestId("thinking-level-trigger")).toHaveTextContent("Medium");
-  });
-
-  it("gives effort the same dial on both providers", () => {
+  it("keeps ACP effort with its model and gives both providers the same dial", () => {
     // The point of the shared control: an adapter's reasoning effort and Pi's
     // thinking level are the same decision, so they must not look like two.
     useAcpSessionConfig.setState({
       sessions: {
         [SESSION]: {
           options: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              currentValue: "sonnet",
+              values: [{ value: "sonnet", name: "Sonnet 4.6" }],
+            },
             {
               id: "reasoning_effort",
               name: "Reasoning effort",
@@ -119,14 +103,17 @@ describe("composer settings control", () => {
       byAgent: {},
     });
     render(<AcpConfigSelector sessionId={SESSION} agentId="codex-acp" />);
+    expect(screen.getByTestId("acp-config-trigger")).toHaveTextContent(
+      "Sonnet 4.6",
+    );
+    expect(screen.queryByTestId("acp-effort-trigger")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("acp-config-trigger"));
     const acpSlider = screen.getByTestId("acp-effort-slider");
     expect(acpSlider).toHaveAttribute("role", "slider");
     expect(screen.getByTestId("acp-effort-slider-value")).toHaveTextContent("High");
     cleanup();
 
-    render(<ThinkingLevelSelector sessionId={SESSION} />);
-    fireEvent.click(screen.getByTestId("thinking-level-trigger"));
+    render(<PiDial />);
     const piSlider = screen.getByTestId("thinking-level-slider");
     expect(piSlider).toHaveAttribute("role", "slider");
     expect(screen.getByTestId("thinking-level-slider-value")).toHaveTextContent("Medium");

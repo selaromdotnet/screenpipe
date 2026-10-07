@@ -21,6 +21,10 @@ pub mod sync;
 pub(crate) mod trajectory;
 
 use crate::agents::{
+    chat_destination::{
+        ChatDestinationDispatch, ChatDestinationExecutor, CHAT_DESTINATION_EXECUTOR,
+    },
+    cloud::CloudAgentConfig,
     pi::{pi_event_protocol_error, pi_package_enabled, PiExecutor},
     AgentExecutor, ExecutionHandle, SharedPid, STOP_REQUESTED_PID,
 };
@@ -34,7 +38,7 @@ use chrono::{
 use cron::Schedule as CronSchedule;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,8 +50,36 @@ const PIPE_LOG_ACTIVE_KEEP_PER_PIPE: usize = 200;
 const PIPE_LOG_ARCHIVE_AFTER_DAYS: i64 = 14;
 const PIPE_LOG_ARCHIVE_DIR: &str = "archive";
 const PIPE_EXECUTION_KEEP_PER_PIPE: i32 = 500;
-/// Stable prefix returned when an install would exceed the configured pipe cap.
+/// Stable prefix returned when a write or runtime selection exceeds the pipe cap.
 pub const PIPE_LIMIT_ERROR_CODE: &str = "free_pipe_limit_reached";
+
+fn validate_pipe_identifier(name: &str) -> Result<()> {
+    let path = Path::new(name);
+    let mut components = path.components();
+    let is_single_normal_component = matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == std::ffi::OsStr::new(name)
+    ) && components.next().is_none();
+    let has_windows_drive_prefix = name
+        .as_bytes()
+        .get(..2)
+        .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1] == b':');
+
+    if name.trim().is_empty()
+        || name.contains(['/', '\\'])
+        || path.is_absolute()
+        || has_windows_drive_prefix
+        || !is_single_normal_component
+    {
+        return Err(anyhow!(
+            "invalid pipe identifier '{}': expected one portable path component",
+            name
+        ));
+    }
+
+    Ok(())
+}
+
 const AUTOMATE_MY_WORK_LEGACY_PROMPT_HASHES: &[&str] = &[
     // v2.5.52: always created and enabled exactly three hourly pipes.
     "2d4dde284dafc774",
@@ -55,6 +87,46 @@ const AUTOMATE_MY_WORK_LEGACY_PROMPT_HASHES: &[&str] = &[
     "c2c3b9e35495fd5b",
 ];
 const BUNDLED_BUILTIN_PIPES: &[(&str, &str)] = &[
+    (
+        "workflow-discover",
+        include_str!("../../assets/pipes/workflow-discover/pipe.md"),
+    ),
+    (
+        "workflow-deepen",
+        include_str!("../../assets/pipes/workflow-deepen/pipe.md"),
+    ),
+    (
+        "workflow-review",
+        include_str!("../../assets/pipes/workflow-review/pipe.md"),
+    ),
+    (
+        "workflow-maintain",
+        include_str!("../../assets/pipes/workflow-maintain/pipe.md"),
+    ),
+    (
+        "workflow-activity",
+        include_str!("../../assets/pipes/workflow-activity/pipe.md"),
+    ),
+    (
+        "workflow-patterns",
+        include_str!("../../assets/pipes/workflow-patterns/pipe.md"),
+    ),
+    (
+        "workflow-procedures",
+        include_str!("../../assets/pipes/workflow-procedures/pipe.md"),
+    ),
+    (
+        "workflow-timing",
+        include_str!("../../assets/pipes/workflow-timing/pipe.md"),
+    ),
+    (
+        "workflow-discovery",
+        include_str!("../../assets/pipes/workflow-discovery/pipe.md"),
+    ),
+    (
+        "skill-learning",
+        include_str!("../../assets/pipes/skill-learning/pipe.md"),
+    ),
     (
         "automate-my-work",
         include_str!("../../assets/pipes/automate-my-work/pipe.md"),
@@ -86,6 +158,10 @@ const BUNDLED_BUILTIN_PIPES: &[(&str, &str)] = &[
     (
         "meeting-summary",
         include_str!("../../assets/pipes/meeting-summary/pipe.md"),
+    ),
+    (
+        "speaker-reconciliation",
+        include_str!("../../assets/pipes/speaker-reconciliation/pipe.md"),
     ),
     (
         "commitments",
@@ -199,8 +275,34 @@ fn is_empty_str_map(m: &std::collections::HashMap<String, String>) -> bool {
 ///       path: /Users/me/vault/meetings
 /// ```
 ///
-/// The watcher writes the new items to `<pipe-dir>/.trigger-context.json` before
-/// firing, so the pipe prompt can read exactly what changed (cwd is the pipe dir).
+/// Spoken phrases use the same source contract without an external connection:
+/// ```yaml
+/// schedule: manual
+/// trigger:
+///   sources:
+///     - app: audio
+///       kind: phrase
+///       filter:
+///         phrases: |-
+///           start job
+///           stop job
+///         device: input
+/// ```
+/// Voice matching checks newly saved transcript segments every 30 seconds,
+/// ignoring case and punctuation and requiring whole consecutive words. It
+/// does not stitch phrases across segments or identify a particular speaker.
+/// `device: input` (default) watches microphones; `all` includes system audio.
+/// No model runs until a phrase matches. Transcription must already be enabled.
+/// Voice items use the transcription row id for `id` and the cursor `ts`, the
+/// capture timestamp for `title`, and up to 16,384 transcript characters for `preview`.
+/// Matching is limited to this prefix of each segment, without partial words.
+/// Batches carry at most 64 KiB of transcript text; excess rows wait for the next poll.
+/// At most 32 phrases of 256 characters each are accepted per source.
+/// Keep related phrases in one source so one run receives all matching items.
+///
+/// The watcher carries matching items in the existing ConnectionTriggerEvent.
+/// The scheduler writes `<pipe-dir>/.trigger-context.json` only when the pipe
+/// is idle and selected to run, then echoes the delivery id on completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceTrigger {
     /// Connected app id, e.g. "obsidian". Apps the watcher can't poll yet are
@@ -268,6 +370,10 @@ pub struct PipeConfig {
     /// LLM provider override.  Default: none (uses screenpipe cloud).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Run this pipe in a user-owned provider cloud instead of a local Pi
+    /// process. Context leaves the device only when the nested opt-in is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_agent: Option<CloudAgentConfig>,
     /// Reasoning effort used for every run. Background automation defaults to
     /// low so recurring work does not inherit Pi's more expensive chat default.
     #[serde(default, skip_serializing_if = "is_default_effort")]
@@ -275,6 +381,8 @@ pub struct PipeConfig {
     /// AI preset id(s) from `~/.screenpipe/store.bin` → `settings.aiPresets`.
     /// When set, overrides `model` and `provider` at runtime.
     /// Accepts a single string or an array of strings for fallback.
+    /// A final `"*"` appends the user's other configured presets; ACP presets
+    /// expanded this way run with automatic approval because Pipes are unattended.
     /// Example: `preset: "my-preset"` or `preset: ["primary", "fallback"]`
     #[serde(
         default,
@@ -346,6 +454,12 @@ pub struct PipeConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     pub history: bool,
 
+    /// Route every run into one exact existing screenpipe chat. When omitted,
+    /// `history` keeps its legacy meaning: false creates one chat per run and
+    /// true continues the Pipe's own stable chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_in: Option<PipeRunIn>,
+
     /// When true, the pipe's agent has `SCREENPIPE_FILTER_PII=1` in its
     /// env so the BASH_ENV shim rewrites every `curl .../search` call to
     /// append `filter_pii=1` — PII is redacted server-side before the
@@ -382,6 +496,65 @@ pub struct PipeConfig {
     /// Catches any extra fields from front-matter (backwards compat).
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipeRunIn {
+    /// V1 intentionally supports only local screenpipe chats. The explicit
+    /// discriminator leaves the frontmatter forward-compatible with other
+    /// destination types without guessing from an id.
+    pub mode: PipeRunInMode,
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipeRunInMode {
+    ExistingChat,
+}
+
+impl PipeConfig {
+    pub fn existing_chat_id(&self) -> Result<Option<&str>> {
+        let Some(run_in) = self.run_in.as_ref() else {
+            return Ok(None);
+        };
+        let chat_id = run_in.chat_id.trim();
+        if chat_id.is_empty() || chat_id.len() > 200 {
+            return Err(anyhow!("existing chat destination has an invalid chat id"));
+        }
+        Ok(Some(chat_id))
+    }
+}
+
+fn existing_chat_executor_config(config: &PipeConfig) -> Option<serde_json::Value> {
+    config
+        .run_in
+        .as_ref()
+        .map(|destination| serde_json::json!({ "chat_id": destination.chat_id }))
+}
+
+struct CloudAgentRunSettings {
+    model: String,
+    provider: String,
+    executor_config: serde_json::Value,
+}
+
+fn cloud_agent_run_settings(
+    config: &PipeConfig,
+    task_instructions: &str,
+) -> Result<CloudAgentRunSettings> {
+    let cloud = config
+        .cloud_agent
+        .as_ref()
+        .ok_or_else(|| anyhow!("cloud_agent config is missing"))?;
+    Ok(CloudAgentRunSettings {
+        model: cloud
+            .model
+            .clone()
+            .unwrap_or_else(|| "provider-default".into()),
+        provider: cloud.provider.as_str().to_string(),
+        executor_config: cloud.executor_config(task_instructions),
+    })
 }
 
 /// Cross-provider reasoning effort exposed by Pipes.
@@ -673,6 +846,7 @@ const KNOWN_CONFIG_UPDATE_KEYS: &[&str] = &[
     "connections",
     "timeout",
     "history",
+    "run_in",
     "trigger",
     "schedule_config",
 ];
@@ -825,6 +999,7 @@ fn remove_tombstone(pipes_dir: &Path, name: &str) -> Result<()> {
 
 /// File name for the local overrides registry inside the pipes directory.
 const LOCAL_OVERRIDES_FILE: &str = ".local-overrides.json";
+const LOCAL_RUN_DESTINATIONS_FILE: &str = ".local-run-destinations.json";
 
 /// Read local enabled overrides from the pipes directory.
 /// Returns an empty map on any error (missing file, corrupt JSON).
@@ -864,6 +1039,41 @@ fn remove_local_override(pipes_dir: &Path, pipe_name: &str) -> Result<()> {
     let mut overrides = load_local_overrides(pipes_dir);
     if overrides.remove(pipe_name).is_some() {
         save_local_overrides(pipes_dir, &overrides)?;
+    }
+    Ok(())
+}
+
+/// Per-device chat destinations. Values are optional on purpose: an explicit
+/// null locally overrides a `run_in` block authored in synced pipe.md content.
+fn load_local_run_destinations(pipes_dir: &Path) -> HashMap<String, Option<PipeRunIn>> {
+    let path = pipes_dir.join(LOCAL_RUN_DESTINATIONS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|error| {
+            warn!("local run destinations file corrupt, ignoring: {}", error);
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn set_local_run_destination(
+    pipes_dir: &Path,
+    pipe_name: &str,
+    destination: Option<PipeRunIn>,
+) -> Result<()> {
+    let mut destinations = load_local_run_destinations(pipes_dir);
+    destinations.insert(pipe_name.to_string(), destination);
+    let path = pipes_dir.join(LOCAL_RUN_DESTINATIONS_FILE);
+    let json = serde_json::to_string_pretty(&destinations)?;
+    atomic_write(&path, &json)
+}
+
+fn remove_local_run_destination(pipes_dir: &Path, pipe_name: &str) -> Result<()> {
+    let mut destinations = load_local_run_destinations(pipes_dir);
+    if destinations.remove(pipe_name).is_some() {
+        let path = pipes_dir.join(LOCAL_RUN_DESTINATIONS_FILE);
+        let json = serde_json::to_string_pretty(&destinations)?;
+        atomic_write(&path, &json)?;
     }
     Ok(())
 }
@@ -1466,6 +1676,17 @@ pub struct ResolvedPreset {
     pub api_key: Option<String>,
     /// System prompt from the preset (injected before the pipe body).
     pub prompt: Option<String>,
+    /// Optional executor override. ACP presets use the desktop ACP runtime;
+    /// raw presets keep the pipe's configured executor (normally Pi).
+    pub executor: Option<String>,
+    /// Opaque preset data consumed by the selected executor.
+    pub executor_config: Option<serde_json::Value>,
+}
+
+struct ResolvedPresetChoice {
+    id: String,
+    index: usize,
+    preset: ResolvedPreset,
 }
 
 /// Read the ChatGPT OAuth access token, with auto-refresh if expired.
@@ -1501,10 +1722,19 @@ fn read_chatgpt_token_from_legacy_file() -> Option<String> {
         .unwrap_or(0);
 
     if now >= expires_at.saturating_sub(60) {
-        refresh_chatgpt_token(&mut token_data, now);
-        if let Ok(updated) = serde_json::to_string_pretty(&token_data) {
-            let _ = std::fs::write(&path, updated);
+        if refresh_chatgpt_token(&mut token_data, now) {
+            if let Ok(updated) = serde_json::to_string_pretty(&token_data) {
+                let _ = std::fs::write(&path, updated);
+            }
         }
+    }
+
+    if token_data
+        .get("reauth_required")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
     }
 
     token_data
@@ -1533,6 +1763,14 @@ fn read_chatgpt_token_from_secrets() -> Option<String> {
             let bytes = store.get("oauth:chatgpt").await.ok()??;
             let mut token_data: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
 
+            if token_data
+                .get("reauth_required")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1543,12 +1781,69 @@ fn read_chatgpt_token_from_secrets() -> Option<String> {
                 .unwrap_or(0);
 
             if now >= expires_at.saturating_sub(60) {
-                refresh_chatgpt_token(&mut token_data, now);
-                // Write refreshed token back to secrets store
-                if let Ok(updated_bytes) = serde_json::to_vec(&token_data) {
-                    if let Err(e) = store.set("oauth:chatgpt", &updated_bytes).await {
-                        tracing::warn!("failed to write refreshed ChatGPT token to secrets: {}", e);
+                let lease_owner = uuid::Uuid::new_v4().simple().to_string();
+                let mut acquired = false;
+                for _ in 0..140 {
+                    acquired = store
+                        .try_acquire_refresh_lease("oauth:chatgpt", &lease_owner, 45)
+                        .await
+                        .ok()?;
+                    if acquired {
+                        break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                if !acquired {
+                    tracing::warn!("timed out waiting for another ChatGPT token refresh");
+                    return None;
+                }
+
+                // The lease winner may have refreshed while we waited. Always
+                // reread before redeeming a rotating refresh token.
+                let refresh_result = async {
+                    let latest = store.get("oauth:chatgpt").await.ok()??;
+                    token_data = serde_json::from_slice(&latest).ok()?;
+                    if token_data
+                        .get("reauth_required")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    let latest_expires_at = token_data
+                        .get("expires_at")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    if now >= latest_expires_at.saturating_sub(60) {
+                        if !refresh_chatgpt_token(&mut token_data, now) {
+                            return None;
+                        }
+                        let updated_bytes = serde_json::to_vec(&token_data).ok()?;
+                        if let Err(error) = store.set("oauth:chatgpt", &updated_bytes).await {
+                            tracing::warn!(
+                                "failed to write refreshed ChatGPT token to secrets: {error}"
+                            );
+                            return None;
+                        }
+                    }
+                    Some(())
+                }
+                .await;
+
+                if let Err(error) = store
+                    .release_refresh_lease("oauth:chatgpt", &lease_owner)
+                    .await
+                {
+                    tracing::warn!("failed to release ChatGPT refresh lease: {error}");
+                }
+                refresh_result?;
+
+                if token_data
+                    .get("reauth_required")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    return None;
                 }
             }
 
@@ -1568,14 +1863,24 @@ fn read_chatgpt_token_from_secrets() -> Option<String> {
 
 /// Refresh an expired ChatGPT OAuth token using the refresh_token grant.
 /// Mutates `token_data` in place with the new access_token, refresh_token, and expires_at.
-fn refresh_chatgpt_token(token_data: &mut serde_json::Value, now: u64) {
+fn chatgpt_refresh_requires_reauth(body: &str) -> bool {
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.pointer("/error/code")?.as_str().map(str::to_owned));
+    matches!(
+        code.as_deref(),
+        Some("refresh_token_reused" | "invalid_grant")
+    )
+}
+
+fn refresh_chatgpt_token(token_data: &mut serde_json::Value, now: u64) -> bool {
     let refresh_token = match token_data
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
     {
         Some(t) => t,
-        None => return,
+        None => return false,
     };
 
     tracing::info!("ChatGPT OAuth token expired, refreshing...");
@@ -1584,7 +1889,7 @@ fn refresh_chatgpt_token(token_data: &mut serde_json::Value, now: u64) {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let refresh_res = client
@@ -1600,28 +1905,48 @@ fn refresh_chatgpt_token(token_data: &mut serde_json::Value, now: u64) {
 
     match refresh_res {
         Ok(resp) if resp.status().is_success() => {
-            if let Ok(v) = resp.json::<serde_json::Value>() {
-                if let Some(new_token) = v.get("access_token").and_then(|t| t.as_str()) {
-                    let new_refresh = v
-                        .get("refresh_token")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or(refresh_token.as_str());
-                    let new_expires_in =
-                        v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
+            let Ok(v) = resp.json::<serde_json::Value>() else {
+                token_data["reauth_required"] = serde_json::Value::Bool(true);
+                tracing::warn!(
+                    "ChatGPT refresh response could not be read; reauthentication required"
+                );
+                return true;
+            };
+            let Some(new_token) = v.get("access_token").and_then(|t| t.as_str()) else {
+                token_data["reauth_required"] = serde_json::Value::Bool(true);
+                tracing::warn!(
+                    "ChatGPT refresh response omitted the access token; reauthentication required"
+                );
+                return true;
+            };
+            let new_refresh = v
+                .get("refresh_token")
+                .and_then(|t| t.as_str())
+                .unwrap_or(refresh_token.as_str());
+            let new_expires_in = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
 
-                    token_data["access_token"] = serde_json::Value::String(new_token.to_string());
-                    token_data["refresh_token"] =
-                        serde_json::Value::String(new_refresh.to_string());
-                    token_data["expires_at"] = serde_json::json!(now + new_expires_in);
-                    tracing::info!("ChatGPT token refreshed successfully");
-                }
-            }
+            token_data["access_token"] = serde_json::Value::String(new_token.to_string());
+            token_data["refresh_token"] = serde_json::Value::String(new_refresh.to_string());
+            token_data["expires_at"] = serde_json::json!(now + new_expires_in);
+            token_data["reauth_required"] = serde_json::Value::Bool(false);
+            tracing::info!("ChatGPT token refreshed successfully");
+            true
         }
         Ok(resp) => {
-            tracing::error!("ChatGPT token refresh failed ({})", resp.status());
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            if chatgpt_refresh_requires_reauth(&body) {
+                token_data["reauth_required"] = serde_json::Value::Bool(true);
+                tracing::warn!("ChatGPT session requires reauthentication");
+                true
+            } else {
+                tracing::error!("ChatGPT token refresh failed ({status}): {body}");
+                false
+            }
         }
         Err(e) => {
             tracing::error!("ChatGPT token refresh request failed: {}", e);
+            false
         }
     }
 }
@@ -1674,10 +1999,21 @@ fn read_store_bin(path: &Path) -> Option<serde_json::Value> {
 /// Falls back to the default preset if `preset_id` is `"default"`.
 /// Creates store.bin with a default preset if it doesn't exist (CLI mode).
 fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
+    resolve_preset_inner(pipes_dir, preset_id, false)
+}
+
+pub(crate) fn resolve_exact_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
+    resolve_preset_inner(pipes_dir, preset_id, true)
+}
+
+fn resolve_preset_inner(pipes_dir: &Path, preset_id: &str, exact: bool) -> Option<ResolvedPreset> {
     // store.bin lives at ~/.screenpipe/store.bin (sibling of pipes/)
     let store_path = pipes_dir.parent()?.join("store.bin");
 
     if !store_path.exists() {
+        if exact {
+            return None;
+        }
         // Bootstrap for CLI users who don't have the app.
         // Default to screenpipe cloud — user needs SCREENPIPE_API_KEY env var.
         // Mirrors the app's first-install seed (use-settings.tsx makeDefaultPresets):
@@ -1720,6 +2056,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
 
     // Normalize legacy preset IDs to current names
     let normalized_id = match preset_id {
+        id if exact => id,
         "pi-agent" => "screenpipe-cloud",
         "auto" => "default",
         other => other,
@@ -1729,10 +2066,10 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         preset.get("provider").and_then(|value| value.as_str()) != Some("acp")
     };
 
-    let preset = if normalized_id == "default" {
-        // An ACP chat preset cannot run in the headless raw-Pi scheduler. If
-        // it is the user's default, preserve existing pipes by preferring the
-        // dedicated `pipes` preset, then another compatible raw preset.
+    let preset = if !exact && normalized_id == "default" {
+        // Preserve existing scheduled behavior when the user's chat default is
+        // ACP: only an explicit pipe selection opts into the ACP executor.
+        // Otherwise prefer the dedicated `pipes` preset, then another raw one.
         presets
             .iter()
             .filter(|preset| is_pipe_compatible(preset))
@@ -1760,18 +2097,34 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             })
     }?;
 
-    // ACP presets launch an interactive desktop harness through the Tauri
-    // bridge. The headless pipe runtime still uses raw Pi, so treating the ACP
-    // adapter id as a model would silently route to the wrong provider.
-    if preset.get("provider").and_then(|value| value.as_str()) == Some("acp") {
-        warn!(
-            "preset '{}' uses ACP and is not available to the raw Pi pipe runtime",
-            preset_id
-        );
-        return None;
-    }
-
-    let model = preset.get("model")?.as_str()?.to_string();
+    let is_acp = preset.get("provider").and_then(|value| value.as_str()) == Some("acp");
+    let executor_config = if is_acp {
+        preset.get("acpAgent").cloned().or_else(|| {
+            preset
+                .get("model")
+                .and_then(|value| value.as_str())
+                .map(|id| serde_json::json!({ "id": id }))
+        })
+    } else {
+        None
+    };
+    let model = if is_acp {
+        executor_config
+            .as_ref()
+            .and_then(|config| config.get("config"))
+            .and_then(|value| value.get("model"))
+            .and_then(|value| value.as_str())
+            .or_else(|| preset.get("model").and_then(|value| value.as_str()))
+            .or_else(|| {
+                executor_config
+                    .as_ref()
+                    .and_then(|config| config.get("id"))
+                    .and_then(|value| value.as_str())
+            })?
+            .to_string()
+    } else {
+        preset.get("model")?.as_str()?.to_string()
+    };
 
     // Map app provider types to pipe provider strings
     let provider = preset
@@ -1784,6 +2137,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             "openai-chatgpt" => Some("openai-chatgpt"),
             "anthropic" => Some("anthropic"),
             "custom" => Some("custom"), // custom uses openai-compatible API at a user-specified URL
+            "acp" => Some("acp"),
             _ => None,
         })
         .map(|s| s.to_string());
@@ -1818,6 +2172,8 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         url,
         api_key,
         prompt,
+        executor: is_acp.then(|| "acp".to_string()),
+        executor_config,
     })
 }
 
@@ -1837,13 +2193,97 @@ fn list_available_preset_ids(pipes_dir: &Path) -> Vec<String> {
         .and_then(|p| p.as_array())
         .map(|arr| {
             arr.iter()
-                .filter(|preset| {
-                    preset.get("provider").and_then(|value| value.as_str()) != Some("acp")
-                })
                 .filter_map(|p| p.get("id").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+const CONFIGURED_PRESET_WILDCARD: &str = "*";
+
+fn uses_configured_preset_wildcard(config: &PipeConfig) -> bool {
+    config
+        .preset
+        .iter()
+        .any(|preset| preset == CONFIGURED_PRESET_WILDCARD)
+}
+
+/// Expand the existing preset fallback chain when it ends in `"*"`.
+fn effective_preset_ids(pipes_dir: &Path, config: &PipeConfig) -> Vec<String> {
+    let mut preset_ids: Vec<String> = config
+        .preset
+        .iter()
+        .filter(|preset| preset.as_str() != CONFIGURED_PRESET_WILDCARD)
+        .cloned()
+        .collect();
+    if is_enterprise_managed(config) || !uses_configured_preset_wildcard(config) {
+        return preset_ids;
+    }
+
+    for preset_id in list_available_preset_ids(pipes_dir) {
+        if preset_ids.len() >= preset_fallback::MAX_FALLBACK_DEPTH {
+            break;
+        }
+        if !preset_ids.iter().any(|existing| existing == &preset_id) {
+            preset_ids.push(preset_id);
+        }
+    }
+    preset_ids
+}
+
+/// Wildcard ACP fallbacks run unattended, so approve their tool calls for this
+/// run without mutating the saved preset.
+fn prepare_preset_for_run(config: &PipeConfig, preset: &mut ResolvedPreset) {
+    if is_enterprise_managed(config)
+        || !uses_configured_preset_wildcard(config)
+        || preset.executor.as_deref() != Some("acp")
+    {
+        return;
+    }
+    if let Some(agent) = preset
+        .executor_config
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        agent.insert(
+            "approvalMode".to_string(),
+            serde_json::Value::String("allow-all".to_string()),
+        );
+    }
+}
+
+/// Resolve the first usable configured preset at or after `floor`.
+///
+/// Preset IDs can outlive the settings entry they referenced (for example,
+/// after the app renamed the built-in pipes preset). A stale slot must not
+/// silently fall through to the pipe's legacy model/provider, and it must not
+/// block later, valid fallbacks in the same ordered chain.
+fn resolve_configured_preset(
+    pipes_dir: &Path,
+    registry: &preset_fallback::PresetFallbackRegistry,
+    preset_ids: &[String],
+    floor: usize,
+) -> Option<ResolvedPresetChoice> {
+    let max_attempts = preset_ids.len().min(preset_fallback::MAX_FALLBACK_DEPTH);
+    let mut search_floor = floor;
+
+    while search_floor < max_attempts {
+        let (preset_id, index) = registry.pick_preset_with_floor(preset_ids, search_floor)?;
+        if let Some(preset) = resolve_preset(pipes_dir, preset_id) {
+            return Some(ResolvedPresetChoice {
+                id: preset_id.to_string(),
+                index,
+                preset,
+            });
+        }
+        warn!(
+            "configured preset '{}' no longer exists; trying the next fallback slot",
+            preset_id
+        );
+        search_floor = index + 1;
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,6 +2306,57 @@ struct ClassifiedPipeProcessResult {
     stderr: String,
     error_type: Option<String>,
     error_message: Option<String>,
+}
+
+/// Keep failed file reads diagnosable without copying private paths or tool
+/// contents into the support logs. A recovered tool error is not a failed run.
+fn read_tool_failure_summary(stdout: &str) -> String {
+    let mut failures = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event["type"] != "tool_execution_end"
+            || event["toolName"] != "read"
+            || event["isError"] != true
+        {
+            continue;
+        }
+        let text = event["result"]["content"]
+            .as_array()
+            .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
+            .unwrap_or("");
+        let cause = ["ENOENT", "EACCES", "EPERM", "EISDIR", "ENOTDIR"]
+            .into_iter()
+            .find(|code| text.starts_with(&format!("{code}:")))
+            .unwrap_or("unknown");
+        let target = if text.contains("access '/workflows/") {
+            "workflow_api_endpoint"
+        } else {
+            "local_file"
+        };
+        *failures.entry((cause, target)).or_insert(0usize) += 1;
+    }
+    failures
+        .into_iter()
+        .map(|((cause, target), count)| {
+            format!("read cause={cause} target={target} failures={count}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Emit the bounded diagnostic used by both manual and scheduled Pipe runs.
+pub fn log_read_tool_failures(pipe: &str, execution_id: Option<i64>, status: &str, stdout: &str) {
+    let failures = read_tool_failure_summary(stdout);
+    if !failures.is_empty() {
+        warn!(
+            pipe,
+            execution_id,
+            run_status = status,
+            "pipe file read failed: {failures}"
+        );
+    }
 }
 
 fn classify_pipe_process_result(
@@ -1900,6 +2391,37 @@ fn classify_pipe_process_result(
     }
 
     if process_success {
+        if !stdout_has_verified_pipe_result(filtered_stdout) {
+            let compaction_failed = filtered_stdout.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|event| {
+                    event["type"] == "compaction_end"
+                        && event["errorMessage"]
+                            .as_str()
+                            .is_some_and(|error| !error.trim().is_empty())
+                })
+            });
+            let missing_output = if compaction_failed {
+                "context compaction failed before the agent produced a final result"
+            } else {
+                "pipe process exited successfully without a verified result"
+            };
+            let classified_stderr = if stderr.trim().is_empty() {
+                missing_output.to_string()
+            } else {
+                format!("{}\n{}", stderr.trim_end(), missing_output)
+            };
+            return ClassifiedPipeProcessResult {
+                status: "failed",
+                success: false,
+                stderr: classified_stderr,
+                error_type: Some(if compaction_failed { "context_compaction" } else { "missing_output" }.to_string()),
+                error_message: Some(if compaction_failed {
+                    "Could not prepare the next step. Any saved progress is still available. Try again."
+                } else {
+                    "automation finished without producing a verifiable result"
+                }.to_string()),
+            };
+        }
         return ClassifiedPipeProcessResult {
             status: "completed",
             success: true,
@@ -1945,6 +2467,46 @@ fn is_post_completion_continue_error(stderr: &str, stdout: &str) -> bool {
     }
 
     stdout_has_successful_agent_end_before_retry(stdout)
+}
+
+fn stdout_has_verified_pipe_result(stdout: &str) -> bool {
+    let mut saw_agent_protocol_event = false;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let event_type = value.get("type").and_then(|v| v.as_str());
+        if matches!(
+            event_type,
+            Some(
+                "agent_start"
+                    | "agent_end"
+                    | "message_start"
+                    | "message_end"
+                    | "tool_execution_start"
+                    | "tool_execution_end"
+                    | "compaction_start"
+                    | "compaction_end"
+            )
+        ) {
+            saw_agent_protocol_event = true;
+        }
+
+        if event_type == Some("agent_end") && agent_end_has_successful_assistant_text(&value) {
+            return true;
+        }
+    }
+
+    // Legacy command pipes may emit ordinary text instead of agent NDJSON.
+    // Preserve that contract while requiring an explicit successful agent end
+    // whenever the output is from Pi/ACP.
+    !saw_agent_protocol_event && !stdout.trim().is_empty()
 }
 
 fn stdout_has_successful_agent_end_before_retry(stdout: &str) -> bool {
@@ -1995,7 +2557,11 @@ fn agent_end_has_successful_assistant_text(value: &serde_json::Value) -> bool {
         return false;
     };
 
-    if message.get("stopReason").and_then(|v| v.as_str()) == Some("error") {
+    if message
+        .get("stopReason")
+        .and_then(|v| v.as_str())
+        .is_some_and(|reason| reason != "stop")
+    {
         return false;
     }
 
@@ -2041,6 +2607,16 @@ pub(crate) fn has_quota_exhausted_token(text: &str) -> bool {
 /// Parse structured error types from a single output string.
 fn parse_error_type(stderr: &str) -> (Option<String>, Option<String>) {
     let lower = stderr.to_lowercase();
+    for (code, message) in [
+        ("workflow_rollout_disabled", "Workflows is not available for this account yet."),
+        ("workflow_business_required", "Automatic workflow discovery requires Business."),
+        ("workflow_allowance_paused", "Workflow updates paused to preserve AI allowance. Manage usage to check capacity and reset times."),
+        ("workflow_usage_unavailable", "Could not check AI allowance. Reconnect and try again."),
+        ("workflow_sign_in_required", "Sign in again to resume workflow updates."),
+        ("workflow_dependency_paused", "Enable the workflow task dependencies in Scheduled tasks to continue."),
+    ] {
+        if lower.contains(code) { return (Some(code.to_string()), Some(message.to_string())); }
+    }
     if let Some(parsed) = parse_structured_llm_error(stderr) {
         return parsed;
     }
@@ -2178,6 +2754,15 @@ fn classify_llm_error_value(value: &serde_json::Value) -> Option<(Option<String>
     .join(" ")
     .to_lowercase();
 
+    if code.as_deref() == Some("missing_output") {
+        return Some((
+            Some("missing_output".to_string()),
+            Some(
+                message
+                    .unwrap_or_else(|| "automation did not save its required output".to_string()),
+            ),
+        ));
+    }
     if has_safety_refusal_token(&combined) {
         return Some((
             Some("safety_refusal".to_string()),
@@ -2236,18 +2821,10 @@ fn has_safety_refusal_token(text: &str) -> bool {
         || text.contains("flagged for possible cybersecurity risk")
 }
 
+/// A configured fallback should advance after any failed provider attempt.
+/// Safety refusals remain terminal across every provider.
 fn should_try_fallback_preset(error_type: Option<&str>) -> bool {
-    !matches!(
-        error_type,
-        Some(
-            "auth_failed"
-                | "credits_exhausted"
-                | "daily_limit"
-                | "model_not_allowed"
-                | "quota_exhausted"
-                | "safety_refusal"
-        )
-    )
+    error_type != Some("safety_refusal")
 }
 
 // ---------------------------------------------------------------------------
@@ -2261,6 +2838,12 @@ fn should_try_fallback_preset(error_type: Option<&str>) -> bool {
 /// — never contains user data.
 pub type OnPipeRunComplete =
     Arc<dyn Fn(&str, Option<i64>, &str, bool, f64, Option<&str>) + Send + Sync>;
+
+struct PipeRunOutcome {
+    log: PipeRunLog,
+    execution_id: Option<i64>,
+    error_type: Option<String>,
+}
 
 /// Synchronous scheduler launch guard. Returning `Some(reason)` skips the run.
 pub type SchedulerRunGuard = Arc<dyn Fn() -> Option<String> + Send + Sync>;
@@ -2305,19 +2888,6 @@ fn emit_pipe_start(
     callback(pipe_name, execution_id, continues_chat, &event);
 }
 
-/// Async predicate: given a pipe's required connections, return the
-/// subset that is NOT yet configured (`enabled && credentials present`).
-/// Returning an empty vec means "all connections are ready, pipe may run".
-///
-/// Injected from the engine layer (which owns the SecretStore + screenpipe
-/// dir) to keep the scheduler in `screenpipe-core` free of a
-/// `screenpipe-connect` dep — that crate already depends on us.
-pub type ConnectionCheck = Arc<
-    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>
-        + Send
-        + Sync,
->;
-
 /// Default execution timeout: 10 minutes.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
@@ -2334,7 +2904,17 @@ async fn setup_pipe_permissions(
     pipe_dir: &Path,
     config: &PipeConfig,
     token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
+    read_only: bool,
+    api_port: u16,
 ) -> Option<String> {
+    if config.name == "skill-learning" {
+        if let Err(error) = atomic_write(
+            &pipe_dir.join(".screenpipe-learning-config.json"),
+            &serde_json::json!({"port": api_port}).to_string(),
+        ) {
+            warn!("could not configure skill learning: {error}");
+        }
+    }
     if let Err(e) = PiExecutor::ensure_permissions_extension(pipe_dir, config) {
         warn!("failed to install permissions extension: {}", e);
     }
@@ -2350,6 +2930,9 @@ async fn setup_pipe_permissions(
     if let Err(e) = PiExecutor::ensure_register_artifact_extension(pipe_dir) {
         warn!("failed to install register-artifact extension: {}", e);
     }
+    if let Err(e) = PiExecutor::ensure_workflow_workspace_extension(pipe_dir) {
+        warn!("failed to install workflow workspace extension: {}", e);
+    }
     if let Err(e) = PiExecutor::ensure_structured_output_extension(pipe_dir) {
         warn!("failed to install structured-output extension: {}", e);
     }
@@ -2358,6 +2941,9 @@ async fn setup_pipe_permissions(
     }
 
     let mut perms = permissions::PipePermissions::from_config(config);
+    if read_only {
+        restrict_api_permissions_to_read_only(&mut perms);
+    }
     perms.pipe_dir = Some(pipe_dir.to_string_lossy().to_string());
 
     // Always write permissions JSON when filesystem sandbox is active.
@@ -2378,7 +2964,10 @@ async fn setup_pipe_permissions(
 
         // Write permissions JSON for the extension to read
         let perms_path = pipe_dir.join(".screenpipe-permissions.json");
-        match serde_json::to_string(&perms) {
+        match serde_json::to_value(&perms).and_then(|mut value| {
+            value["api_base"] = serde_json::json!(format!("http://127.0.0.1:{api_port}"));
+            serde_json::to_string(&value)
+        }) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&perms_path, &json) {
                     warn!("failed to write permissions file: {}", e);
@@ -2392,6 +2981,23 @@ async fn setup_pipe_permissions(
         // No restrictions — clean up any stale permissions file
         let _ = std::fs::remove_file(pipe_dir.join(".screenpipe-permissions.json"));
         None
+    }
+}
+
+fn event_runs_are_read_only(config: &PipeConfig) -> bool {
+    config
+        .config
+        .get("event_read_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn restrict_api_permissions_to_read_only(perms: &mut permissions::PipePermissions) {
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        perms.deny_rules.push(permissions::PermissionRule::Api {
+            method: method.to_string(),
+            path: "/*".to_string(),
+        });
     }
 }
 
@@ -2450,10 +3056,6 @@ pub struct PipeManager {
     on_run_complete: Option<OnPipeRunComplete>,
     /// Optional callback fired for each stdout line from a running pipe.
     on_output_line: Option<OnPipeOutputLine>,
-    /// Optional async predicate that returns the missing connections for a
-    /// pipe. If set, the scheduler skips any enabled pipe whose required
-    /// connections aren't all configured ("setup mode").
-    connection_check: Option<ConnectionCheck>,
     /// Optional persistence store (None in CLI mode).
     store: Option<Arc<dyn PipeStore>>,
     /// API port for prompt rendering (default 3030).
@@ -2509,7 +3111,6 @@ impl PipeManager {
             scheduler_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             on_run_complete: None,
             on_output_line: None,
-            connection_check: None,
             store,
             api_port,
             max_non_template_pipes: None,
@@ -2526,6 +3127,40 @@ impl PipeManager {
             fallback_registry: registry,
             event_runs_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             event_runs_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Build a scheduler-owned execution delegate that shares runtime state
+    /// without owning (or invalidating) the scheduler lifecycle itself.
+    fn scheduler_execution_delegate(&self) -> Self {
+        Self {
+            pipes_dir: self.pipes_dir.clone(),
+            executors: self.executors.clone(),
+            pipes: self.pipes.clone(),
+            logs: self.logs.clone(),
+            running: self.running.clone(),
+            running_execution_ids: self.running_execution_ids.clone(),
+            shutdown_tx: None,
+            scheduler_handle: None,
+            scheduler_run_guard: None,
+            scheduled_run_context: None,
+            scheduler_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // The scheduler emits the single final callback after all fallback
+            // attempts, so individual delegated attempts must stay silent.
+            on_run_complete: None,
+            on_output_line: self.on_output_line.clone(),
+            store: self.store.clone(),
+            api_port: self.api_port,
+            max_non_template_pipes: self.max_non_template_pipes,
+            last_reload: self.last_reload.clone(),
+            token_registry: self.token_registry.clone(),
+            mcp_session_access: self.mcp_session_access.clone(),
+            extra_context: self.extra_context.clone(),
+            connections_context: self.connections_context.clone(),
+            local_api_key: self.local_api_key.clone(),
+            fallback_registry: self.fallback_registry.clone(),
+            event_runs_active: self.event_runs_active.clone(),
+            event_runs_peak: self.event_runs_peak.clone(),
         }
     }
 
@@ -2623,14 +3258,6 @@ impl PipeManager {
         self.on_run_complete = Some(cb);
     }
 
-    /// Set the async predicate used to gate scheduled runs on connection
-    /// readiness. Without this, pipes "in setup mode" (enabled but missing
-    /// required integrations) would still tick on their cron / event
-    /// trigger and run with broken credentials.
-    pub fn set_connection_check(&mut self, cb: ConnectionCheck) {
-        self.connection_check = Some(cb);
-    }
-
     /// Set a callback to be invoked for each stdout line from a running pipe.
     /// Resolves a named AI preset (provider, model, base url, key) from the
     /// user's own store. Exposed so the local HTTP surface can serve plain chat
@@ -2642,6 +3269,16 @@ impl PipeManager {
 
     pub fn set_on_output_line(&mut self, cb: OnPipeOutputLine) {
         self.on_output_line = Some(cb);
+    }
+
+    /// Register the desktop-owned dispatcher for Pipes that run in an exact
+    /// existing chat. CLI/server builds omit this adapter and return a clear
+    /// "agent not available" error instead of falling back to another chat.
+    pub fn set_chat_destination_dispatch(&mut self, dispatch: ChatDestinationDispatch) {
+        self.executors.insert(
+            CHAT_DESTINATION_EXECUTOR.to_string(),
+            Arc::new(ChatDestinationExecutor::new(dispatch)),
+        );
     }
 
     /// Add an output consumer without replacing an existing desktop or stream
@@ -2726,6 +3363,7 @@ impl PipeManager {
         paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
         let local_overrides = load_local_overrides(&self.pipes_dir);
+        let local_run_destinations = load_local_run_destinations(&self.pipes_dir);
         let mut selected = HashMap::new();
         let mut all_names = HashSet::new();
         let mut suppressed = Vec::new();
@@ -2769,6 +3407,9 @@ impl PipeManager {
             config.name = dir_name.clone();
             if let Some(&enabled) = local_overrides.get(&dir_name) {
                 config.enabled = enabled;
+            }
+            if let Some(destination) = local_run_destinations.get(&dir_name) {
+                config.run_in = destination.clone();
             }
             selected.insert(dir_name, (config, body, content));
         }
@@ -3300,9 +3941,28 @@ impl PipeManager {
             .collect()
     }
 
+    /// Explain a valid task omitted by the same product-cap selection used by
+    /// load/reload. Missing, invalid, and unreadable files are not quota failures.
+    pub fn pipe_suppression_error(&self, name: &str) -> Option<anyhow::Error> {
+        validate_pipe_identifier(name).ok()?;
+        let limit = self.max_non_template_pipes?;
+        self.scan_pipes_from_disk()
+            .ok()?
+            .suppressed
+            .iter()
+            .any(|suppressed| suppressed == name)
+            .then(|| Self::pipe_limit_error(limit))
+    }
+
     /// Build a diagnostic error when a pipe name isn't in the in-memory map.
     /// Checks the filesystem to explain *why* it wasn't loaded.
     fn pipe_not_found_error(&self, name: &str) -> anyhow::Error {
+        if let Err(error) = validate_pipe_identifier(name) {
+            return error;
+        }
+        if let Some(error) = self.pipe_suppression_error(name) {
+            return error;
+        }
         let pipe_dir = self.pipes_dir.join(name);
         if !pipe_dir.exists() {
             return anyhow!(
@@ -3428,6 +4088,7 @@ impl PipeManager {
         run_context: Option<&str>,
         event_context: Option<BackgroundEventContext>,
     ) -> Result<Option<i64>> {
+        validate_pipe_identifier(name)?;
         let (config, body, _raw) = {
             let pipes = self.pipes.lock().await;
             match pipes.get(name).cloned() {
@@ -3435,19 +4096,6 @@ impl PipeManager {
                 None => return Err(self.pipe_not_found_error(name)),
             }
         };
-
-        let executor = self
-            .executors
-            .get(&config.agent)
-            .ok_or_else(|| anyhow!("agent '{}' not available", config.agent))?
-            .clone();
-
-        if !executor.is_available() {
-            return Err(anyhow!(
-                "agent '{}' is not installed — run ensure_installed first",
-                config.agent
-            ));
-        }
 
         // Shared PID — updated synchronously by the executor as soon as the
         // subprocess spawns. The stop API can set an early-stop sentinel on
@@ -3460,6 +4108,9 @@ impl PipeManager {
         // Mark as running
         {
             let mut running = self.running.lock().await;
+            if crate::background_work::is_suspended() {
+                return Err(anyhow!("Screenpipe is serving saved history after Quit"));
+            }
             if running.contains_key(name) {
                 return Err(anyhow!(
                     "pipe '{}' is already running — you may already be executing inside this pipe. \
@@ -3495,12 +4146,38 @@ impl PipeManager {
         // and a self-PID file would make the next startup SIGKILL the app.
         write_pid_file(&self.pipes_dir, name, 0);
 
-        // Resolve preset
-        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) = if let Some(
-            preset_id,
-        ) =
-            config.preset.first()
-        {
+        // Resolve the selected runner and its provider-specific configuration.
+        let (
+            run_model,
+            run_provider,
+            run_provider_url,
+            run_api_key,
+            preset_prompt,
+            run_agent,
+            run_executor_config,
+        ) = if let Some(chat_config) = existing_chat_executor_config(&config) {
+            (
+                "existing chat".to_string(),
+                None,
+                None,
+                None,
+                None,
+                CHAT_DESTINATION_EXECUTOR.to_string(),
+                Some(chat_config),
+            )
+        } else if config.agent == "cloud-agent" {
+            let cloud = cloud_agent_run_settings(&config, &body)
+                .map_err(|error| anyhow!("pipe '{}': {error}", name))?;
+            (
+                cloud.model,
+                Some(cloud.provider),
+                None,
+                None,
+                None,
+                "cloud-agent".to_string(),
+                Some(cloud.executor_config),
+            )
+        } else if let Some(preset_id) = config.preset.first() {
             match resolve_preset(&self.pipes_dir, preset_id) {
                 Some(resolved) => (
                     resolved.model,
@@ -3508,6 +4185,8 @@ impl PipeManager {
                     resolved.url,
                     resolved.api_key,
                     resolved.prompt,
+                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                    resolved.executor_config,
                 ),
                 None if is_enterprise_managed(&config) => {
                     remove_pid_file(&self.pipes_dir, name);
@@ -3525,6 +4204,8 @@ impl PipeManager {
                     None,
                     None,
                     None,
+                    config.agent.clone(),
+                    None,
                 ),
             }
         } else {
@@ -3536,6 +4217,8 @@ impl PipeManager {
                     resolved.url,
                     resolved.api_key,
                     resolved.prompt,
+                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                    resolved.executor_config,
                 ),
                 None => (
                     config.model.clone(),
@@ -3543,7 +4226,26 @@ impl PipeManager {
                     None,
                     None,
                     None,
+                    config.agent.clone(),
+                    None,
                 ),
+            }
+        };
+
+        let executor = match self.executors.get(&run_agent) {
+            Some(executor) if executor.is_available() => executor.clone(),
+            Some(_) => {
+                remove_pid_file(&self.pipes_dir, name);
+                self.running.lock().await.remove(name);
+                return Err(anyhow!(
+                    "agent '{}' is not installed — open the desktop app and retry",
+                    run_agent
+                ));
+            }
+            None => {
+                remove_pid_file(&self.pipes_dir, name);
+                self.running.lock().await.remove(name);
+                return Err(anyhow!("agent '{}' not available", run_agent));
             }
         };
 
@@ -3586,7 +4288,11 @@ impl PipeManager {
             };
             match created {
                 Ok(id) => {
-                    if history_enabled {
+                    if let Some(conversation_id) = config.existing_chat_id().ok().flatten() {
+                        let _ = store
+                            .set_execution_conversation_id(id, conversation_id)
+                            .await;
+                    } else if history_enabled {
                         let conversation_id = pipe_conversation_id(name, id, true);
                         let _ = store
                             .set_execution_conversation_id(id, &conversation_id)
@@ -3612,7 +4318,7 @@ impl PipeManager {
             preset_prompt.as_deref(),
             self.connections_context.as_deref(),
             self.local_api_key.as_deref(),
-            config.agent == "pi" && pi_package_enabled("pi-subagents"),
+            run_agent == "pi" && pi_package_enabled("pi-subagents"),
         );
         let combined_context = match (self.extra_context.as_deref(), run_context) {
             (Some(shared), Some(scoped)) => Some(format!("{shared}\n{scoped}")),
@@ -3634,7 +4340,11 @@ impl PipeManager {
             let _ = store.set_execution_running(id, None).await;
         }
         emit_pipe_start(
-            self.on_output_line.as_ref(),
+            if config.run_in.is_none() {
+                self.on_output_line.as_ref()
+            } else {
+                None
+            },
             &pipe_name,
             exec_id.unwrap_or(0),
             history_enabled,
@@ -3654,7 +4364,7 @@ impl PipeManager {
 
         // Pre-configure pi
         let mut pipe_token: Option<String> = None;
-        if config.agent == "pi" {
+        if run_agent == "pi" {
             let cloud_token = executor.user_token();
             if let Err(e) = PiExecutor::ensure_pi_config(
                 cloud_token.as_deref(),
@@ -3667,9 +4377,16 @@ impl PipeManager {
             {
                 warn!("failed to pre-configure pi provider: {}", e);
             }
-
-            pipe_token =
-                setup_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await;
+        }
+        if matches!(run_agent.as_str(), "pi" | "acp") {
+            pipe_token = setup_pipe_permissions(
+                &pipe_dir,
+                &config,
+                self.token_registry.as_ref(),
+                trigger == "event" && event_runs_are_read_only(&config),
+                self.api_port,
+            )
+            .await;
         }
         let token_registry_ref = self.token_registry.clone();
 
@@ -3680,7 +4397,11 @@ impl PipeManager {
         let store_ref = self.store.clone();
         let on_complete = self.on_run_complete.clone();
         let trigger_for_cb = trigger.to_string();
-        let on_output = self.on_output_line.clone();
+        let on_output = if config.run_in.is_none() {
+            self.on_output_line.clone()
+        } else {
+            None
+        };
         let pipes_dir_for_log = self.pipes_dir.clone();
         let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
         let mcp_session_access = self.mcp_session_access.clone();
@@ -3760,6 +4481,7 @@ impl PipeManager {
                     // sidebar shows navigations when the user is watching this
                     // pipe.
                     Some(session_owner.as_str()),
+                    run_executor_config.as_ref(),
                 ),
             )
             .await;
@@ -3791,6 +4513,12 @@ impl PipeManager {
                         output.success,
                         was_cancelled,
                         &output.stderr,
+                        &filtered_stdout,
+                    );
+                    log_read_tool_failures(
+                        &pipe_name,
+                        exec_id,
+                        classified.status,
                         &filtered_stdout,
                     );
                     let session_path =
@@ -3956,6 +4684,10 @@ impl PipeManager {
             push_run_log_status(entry, log);
             drop(l);
 
+            // Manual/API runs notify the same scheduler after saving output
+            // and clearing the running state, so dependents can safely start.
+            emit_pipe_completed(&name_for_cb, success, duration_secs);
+
             if let Some(ref cb) = on_complete {
                 cb(
                     &name_for_cb,
@@ -3978,7 +4710,17 @@ impl PipeManager {
 
     /// Run a pipe once with an explicit trigger type.
     async fn run_pipe_with_trigger(&self, name: &str, trigger: &str) -> Result<PipeRunLog> {
-        self.run_pipe_with_trigger_inner(name, trigger, 0).await
+        let outcome = self
+            .run_pipe_with_trigger_inner(name, trigger, 0, None, None)
+            .await?;
+        // The inner runner retries presets and is also called by the scheduler.
+        // Emit only the final outcome here, never intermediate attempts.
+        emit_pipe_completed(
+            name,
+            outcome.log.success,
+            (outcome.log.finished_at - outcome.log.started_at).num_milliseconds() as f64 / 1000.0,
+        );
+        Ok(outcome.log)
     }
 
     /// Inner implementation with retry depth tracking for preset fallback.
@@ -3987,8 +4729,12 @@ impl PipeManager {
         name: &'a str,
         trigger: &'a str,
         retry_depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PipeRunLog>> + Send + 'a>> {
+        run_context: Option<&'a str>,
+        event_context: Option<&'a EventTrigger>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PipeRunOutcome>> + Send + 'a>>
+    {
         Box::pin(async move {
+            validate_pipe_identifier(name)?;
             let (config, body, _raw) = {
                 let pipes = self.pipes.lock().await;
                 match pipes.get(name).cloned() {
@@ -3996,20 +4742,7 @@ impl PipeManager {
                     None => return Err(self.pipe_not_found_error(name)),
                 }
             };
-
-            let executor = self
-                .executors
-                .get(&config.agent)
-                .ok_or_else(|| anyhow!("agent '{}' not available", config.agent))?
-                .clone();
-
-            // Check agent is available
-            if !executor.is_available() {
-                return Err(anyhow!(
-                    "agent '{}' is not installed — run ensure_installed first",
-                    config.agent
-                ));
-            }
+            let preset_ids = effective_preset_ids(&self.pipes_dir, &config);
 
             let shared_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let handle = ExecutionHandle::new(shared_pid.clone());
@@ -4019,6 +4752,9 @@ impl PipeManager {
             // Mark as running
             {
                 let mut running = self.running.lock().await;
+                if crate::background_work::is_suspended() {
+                    return Err(anyhow!("Screenpipe is serving saved history after Quit"));
+                }
                 if running.contains_key(name) {
                     return Err(anyhow!(
                         "pipe '{}' is already running — you may already be executing inside this pipe. \
@@ -4065,18 +4801,71 @@ impl PipeManager {
                 preset_prompt,
                 active_preset_id,
                 active_preset_idx,
-            ) = if !config.preset.is_empty() {
+                run_agent,
+                run_executor_config,
+            ) = if let Some(chat_config) = existing_chat_executor_config(&config) {
+                (
+                    "existing chat".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    CHAT_DESTINATION_EXECUTOR.to_string(),
+                    Some(chat_config),
+                )
+            } else if config.agent == "cloud-agent" {
+                let cloud = match cloud_agent_run_settings(&config, &body) {
+                    Ok(cloud) => cloud,
+                    Err(error) => {
+                        remove_pid_file(&self.pipes_dir, name);
+                        self.running.lock().await.remove(name);
+                        return Err(anyhow!("pipe '{}': {error}", name));
+                    }
+                };
+                (
+                    cloud.model,
+                    Some(cloud.provider),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "cloud-agent".to_string(),
+                    Some(cloud.executor_config),
+                )
+            } else if !preset_ids.is_empty() {
                 // Pick the best available preset using the circuit breaker, but
                 // start at `retry_depth` so an in-run fallback retry advances to
                 // the next preset even when the failed one's breaker never
                 // tripped (timeouts/crashes don't trip it) — see #3914.
-                let (preset_id, idx) = self
-                    .fallback_registry
-                    .pick_preset_with_floor(&config.preset, retry_depth)
-                    .ok_or_else(|| anyhow!("pipe '{}': no presets configured", name))?;
+                let choice = if is_enterprise_managed(&config) {
+                    let preset_id = preset_ids
+                        .get(retry_depth)
+                        .ok_or_else(|| anyhow!("pipe '{}': no presets configured", name))?;
+                    resolve_preset(&self.pipes_dir, preset_id).map(|preset| ResolvedPresetChoice {
+                        id: preset_id.clone(),
+                        index: retry_depth,
+                        preset,
+                    })
+                } else {
+                    resolve_configured_preset(
+                        &self.pipes_dir,
+                        &self.fallback_registry,
+                        &preset_ids,
+                        retry_depth,
+                    )
+                };
 
-                match resolve_preset(&self.pipes_dir, preset_id) {
-                    Some(resolved) => {
+                match choice {
+                    Some(choice) => {
+                        let ResolvedPresetChoice {
+                            id: preset_id,
+                            index: idx,
+                            preset: mut resolved,
+                        } = choice;
+                        prepare_preset_for_run(&config, &mut resolved);
                         info!(
                             "pipe '{}': using preset '{}' → model={}, provider={:?}{}",
                             name,
@@ -4095,8 +4884,10 @@ impl PipeManager {
                             resolved.url,
                             resolved.api_key,
                             resolved.prompt,
-                            Some(preset_id.to_string()),
+                            Some(preset_id),
                             Some(idx),
+                            resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                            resolved.executor_config,
                         )
                     }
                     None => {
@@ -4106,16 +4897,16 @@ impl PipeManager {
                         } else {
                             format!("available presets: {}", available.join(", "))
                         };
-                        return Err(anyhow!(
-                            "pipe '{}': preset '{}' not found in settings — {}. \
-                             Set one of those in the pipe's `preset:` field, or \
-                             create a new preset with `screenpipe pipe models create {} --provider … --model …`, \
-                             or remove the `preset:` line to use the default.",
+                        let error = anyhow!(
+                            "pipe '{}': none of the configured presets from fallback slot {} onward exist in settings — {}. \
+                             Set one of those in the pipe's `preset:` field or create the missing preset.",
                             name,
-                            preset_id,
-                            available_hint,
-                            preset_id
-                        ));
+                            retry_depth + 1,
+                            available_hint
+                        );
+                        remove_pid_file(&self.pipes_dir, name);
+                        self.running.lock().await.remove(name);
+                        return Err(error);
                     }
                 }
             } else {
@@ -4136,6 +4927,8 @@ impl PipeManager {
                             resolved.prompt,
                             None,
                             None,
+                            resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                            resolved.executor_config,
                         )
                     }
                     None => {
@@ -4148,8 +4941,27 @@ impl PipeManager {
                             None,
                             None,
                             None,
+                            config.agent.clone(),
+                            None,
                         )
                     }
+                }
+            };
+
+            let executor = match self.executors.get(&run_agent) {
+                Some(executor) if executor.is_available() => executor.clone(),
+                Some(_) => {
+                    remove_pid_file(&self.pipes_dir, name);
+                    self.running.lock().await.remove(name);
+                    return Err(anyhow!(
+                        "agent '{}' is not installed — open the desktop app and retry",
+                        run_agent
+                    ));
+                }
+                None => {
+                    remove_pid_file(&self.pipes_dir, name);
+                    self.running.lock().await.remove(name);
+                    return Err(anyhow!("agent '{}' not available", run_agent));
                 }
             };
 
@@ -4157,12 +4969,32 @@ impl PipeManager {
 
             // Create DB execution row
             let exec_id = if let Some(ref store) = self.store {
-                match store
-                    .create_execution(name, trigger, &run_model, run_provider.as_deref())
-                    .await
-                {
+                let created = match event_context {
+                    Some(event) => {
+                        store
+                            .create_execution_with_trigger(
+                                name,
+                                trigger,
+                                &run_model,
+                                run_provider.as_deref(),
+                                Some(&event.name),
+                                event.key.as_deref(),
+                            )
+                            .await
+                    }
+                    None => {
+                        store
+                            .create_execution(name, trigger, &run_model, run_provider.as_deref())
+                            .await
+                    }
+                };
+                match created {
                     Ok(id) => {
-                        if history_enabled {
+                        if let Some(conversation_id) = config.existing_chat_id().ok().flatten() {
+                            let _ = store
+                                .set_execution_conversation_id(id, conversation_id)
+                                .await;
+                        } else if history_enabled {
                             let conversation_id = pipe_conversation_id(name, id, true);
                             let _ = store
                                 .set_execution_conversation_id(id, &conversation_id)
@@ -4189,10 +5021,21 @@ impl PipeManager {
                 preset_prompt.as_deref(),
                 self.connections_context.as_deref(),
                 self.local_api_key.as_deref(),
-                config.agent == "pi" && pi_package_enabled("pi-subagents"),
+                run_agent == "pi" && pi_package_enabled("pi-subagents"),
             );
-            let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
-
+            let combined_context = match (self.extra_context.as_deref(), run_context) {
+                (Some(shared), Some(scoped)) => Some(format!("{shared}\n{scoped}")),
+                (Some(shared), None) => Some(shared.to_string()),
+                (None, Some(scoped)) => Some(scoped.to_string()),
+                (None, None) => None,
+            };
+            let prompt = render_prompt_with_port(
+                &config,
+                &body,
+                self.api_port,
+                preset_prompt.as_deref(),
+                combined_context.as_deref(),
+            );
             let shared_pid_for_kill = shared_pid.clone();
 
             // Mark as running in DB
@@ -4200,7 +5043,11 @@ impl PipeManager {
                 let _ = store.set_execution_running(id, None).await;
             }
             emit_pipe_start(
-                self.on_output_line.as_ref(),
+                if config.run_in.is_none() {
+                    self.on_output_line.as_ref()
+                } else {
+                    None
+                },
                 name,
                 exec_id.unwrap_or(0),
                 history_enabled,
@@ -4219,7 +5066,7 @@ impl PipeManager {
             // Pre-configure pi with the pipe's provider so models.json has the
             // right entry before the agent subprocess starts.
             let mut pipe_token: Option<String> = None;
-            if config.agent == "pi" {
+            if run_agent == "pi" {
                 if let Err(e) = PiExecutor::ensure_pi_config(
                     None,
                     executor.screenpipe_api_url(),
@@ -4231,11 +5078,14 @@ impl PipeManager {
                 {
                     warn!("failed to pre-configure pi provider: {}", e);
                 }
-
+            }
+            if matches!(run_agent.as_str(), "pi" | "acp") {
                 pipe_token = setup_pipe_permissions(
                     &self.pipes_dir.join(name),
                     &config,
                     self.token_registry.as_ref(),
+                    trigger == "event" && event_runs_are_read_only(&config),
+                    self.api_port,
                 )
                 .await;
             }
@@ -4248,7 +5098,11 @@ impl PipeManager {
             let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let drain_pipe_name = name.to_string();
             let drain_exec_id = exec_id.unwrap_or(0);
-            let drain_on_output = self.on_output_line.clone();
+            let drain_on_output = if config.run_in.is_none() {
+                self.on_output_line.clone()
+            } else {
+                None
+            };
             // Tee the full agent event stream to a per-run trajectory file
             // (model-training/eval export). Best-effort: None on IO failure.
             let mut drain_trajectory = trajectory::TrajectoryWriter::create(
@@ -4312,6 +5166,7 @@ impl PipeManager {
                     // sidebar shows navigations when the user is watching this
                     // pipe.
                     Some(session_owner.as_str()),
+                    run_executor_config.as_ref(),
                 ),
             )
             .await;
@@ -4347,6 +5202,7 @@ impl PipeManager {
                         &output.stderr,
                         &filtered_stdout,
                     );
+                    log_read_tool_failures(name, exec_id, classified.status, &filtered_stdout);
                     let session_path =
                         find_latest_pi_session(&pipe_dir).map(|p| p.to_string_lossy().to_string());
                     if let (Some(ref store), Some(id)) = (&self.store, exec_id) {
@@ -4503,7 +5359,11 @@ impl PipeManager {
             // (`record_failure_from_output`) and never for timeouts or executor
             // crashes — so gating fallback on it meant the next model silently
             // never ran when the main one timed out or errored (#3914).
-            let max_attempts = config.preset.len().min(preset_fallback::MAX_FALLBACK_DEPTH);
+            let max_attempts = if is_enterprise_managed(&config) {
+                1
+            } else {
+                preset_ids.len().min(preset_fallback::MAX_FALLBACK_DEPTH)
+            };
             if let (false, Some(cur_idx), false, true) = (
                 log.success,
                 active_preset_idx,
@@ -4512,7 +5372,7 @@ impl PipeManager {
             ) {
                 let next_idx = cur_idx + 1;
                 if next_idx < max_attempts {
-                    if let Some(next_preset_id) = config.preset.get(next_idx) {
+                    if let Some(next_preset_id) = preset_ids.get(next_idx) {
                         info!(
                             "pipe '{}': preset '{}' failed, immediately retrying with fallback preset '{}' (attempt {}/{})",
                             name,
@@ -4527,7 +5387,13 @@ impl PipeManager {
                         // Re-enter with the selection floor advanced past the
                         // preset that just failed.
                         return self
-                            .run_pipe_with_trigger_inner(name, trigger, next_idx)
+                            .run_pipe_with_trigger_inner(
+                                name,
+                                trigger,
+                                next_idx,
+                                run_context,
+                                event_context,
+                            )
                             .await;
                     }
                 }
@@ -4537,12 +5403,26 @@ impl PipeManager {
             self.append_log(name, &log).await;
             let _ = self.write_log_to_disk(name, &log);
 
-            Ok(log)
+            let error_type = if log.success {
+                None
+            } else {
+                parse_error_type_from_output(&log.stderr, &log.stdout)
+                    .0
+                    .or_else(|| Some("unknown".to_string()))
+            };
+
+            Ok(PipeRunOutcome {
+                log,
+                execution_id: exec_id,
+                error_type,
+            })
         }) // end Box::pin(async move { ... })
     }
 
-    /// Enable or disable a pipe (writes back to pipe.md front-matter).
+    /// Enable or disable a pipe. Pausing an untouched bundled task only changes
+    /// its device-local override, preserving its bundled identity and quota slot.
     pub async fn enable_pipe(&self, name: &str, enabled: bool) -> Result<()> {
+        validate_pipe_identifier(name)?;
         let pipe_md = self.pipes_dir.join(name).join("pipe.md");
         if !pipe_md.exists() {
             return Err(self.pipe_not_found_error(name));
@@ -4563,16 +5443,26 @@ impl PipeManager {
             validate_one_off_freshness(&config.schedule)?;
         }
         config.enabled = enabled;
-        let new_content = serialize_pipe(&config, &body)?;
-        atomic_write(&pipe_md, &new_content)?;
+        let new_content = if !enabled && Self::is_bundled_builtin_pipe(name, &content) {
+            // A pause must work even when all user task slots are occupied.
+            // Do not rewrite the template: that would admit another counted
+            // task and could displace a previously completed setup task.
+            set_local_override(&self.pipes_dir, name, false)?;
+            content
+        } else {
+            let new_content = serialize_pipe(&config, &body)?;
+            self.ensure_pipe_write_allowed(name, Some(&new_content))?;
+            atomic_write(&pipe_md, &new_content)?;
 
-        // Persist to local overrides so reload_pipes() doesn't revert this
-        if let Err(e) = set_local_override(&self.pipes_dir, name, enabled) {
-            warn!(
-                "failed to save local enabled override for '{}': {}",
-                name, e
-            );
-        }
+            // Persist to local overrides so reload_pipes() doesn't revert this.
+            if let Err(e) = set_local_override(&self.pipes_dir, name, enabled) {
+                warn!(
+                    "failed to save local enabled override for '{}': {}",
+                    name, e
+                );
+            }
+            new_content
+        };
 
         // Update in-memory
         let mut pipes = self.pipes.lock().await;
@@ -4596,6 +5486,7 @@ impl PipeManager {
         name: &str,
         updates: HashMap<String, serde_json::Value>,
     ) -> Result<()> {
+        validate_pipe_identifier(name)?;
         let pipe_md = self.pipes_dir.join(name).join("pipe.md");
         if !pipe_md.exists() {
             return Err(anyhow!("pipe '{}' not found", name));
@@ -4622,12 +5513,23 @@ impl PipeManager {
             ));
         }
 
+        // Use the same durable pause path as the dedicated enable endpoint.
+        // Other edits still require admission before changing bundled content.
+        if updates.len() == 1 && updates.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            return self.enable_pipe(name, false).await;
+        }
+
         // If raw_content is provided, write the full file directly and re-parse
         if let Some(raw) = updates.get("raw_content").and_then(|v| v.as_str()) {
             // Validate it parses correctly
             let (mut config, body) = parse_frontmatter(raw)?;
             config.name = name.to_string(); // preserve directory name
+            self.ensure_pipe_write_allowed(name, Some(raw))?;
             atomic_write(&pipe_md, raw)?;
+
+            if let Some(destination) = load_local_run_destinations(&self.pipes_dir).get(name) {
+                config.run_in = destination.clone();
+            }
 
             // Update in-memory
             let mut pipes = self.pipes.lock().await;
@@ -4641,6 +5543,9 @@ impl PipeManager {
 
         let (mut config, body) = parse_frontmatter(&content)?;
         config.name = name.to_string(); // preserve directory name
+        let frontmatter_run_in = config.run_in.clone();
+        let mut local_run_destination_update: Option<Option<PipeRunIn>> = None;
+        let mut local_enabled_update = None;
 
         let mut new_body = body.clone();
         for (k, v) in &updates {
@@ -4658,14 +5563,7 @@ impl PipeManager {
                 "enabled" => {
                     if let Some(b) = v.as_bool() {
                         config.enabled = b;
-                        // Persist enabled state to local overrides so it
-                        // survives cross-device sync (never synced).
-                        if let Err(e) = set_local_override(&self.pipes_dir, name, b) {
-                            warn!(
-                                "failed to save local enabled override for '{}': {}",
-                                name, e
-                            );
-                        }
+                        local_enabled_update = Some(b);
                     }
                 }
                 "agent" => {
@@ -4681,6 +5579,17 @@ impl PipeManager {
                 "provider" => {
                     if let Some(s) = v.as_str() {
                         config.provider = Some(s.to_string());
+                    }
+                }
+                "cloud_agent" => {
+                    if v.is_null() {
+                        config.cloud_agent = None;
+                    } else {
+                        config.cloud_agent = Some(
+                            serde_json::from_value::<CloudAgentConfig>(v.clone()).map_err(|e| {
+                                anyhow!("invalid cloud_agent config for '{}': {}", name, e)
+                            })?,
+                        );
                     }
                 }
                 "effort" => {
@@ -4708,6 +5617,32 @@ impl PipeManager {
                 "history" => {
                     if let Some(value) = v.as_bool() {
                         config.history = value;
+                    }
+                }
+                "run_in" => {
+                    let destination =
+                        if v.is_null() {
+                            None
+                        } else {
+                            Some(serde_json::from_value::<PipeRunIn>(v.clone()).map_err(
+                                |error| anyhow!("invalid run_in config for '{}': {}", name, error),
+                            )?)
+                        };
+                    if let Some(ref destination) = destination {
+                        let chat_id = destination.chat_id.trim();
+                        if chat_id.is_empty() || chat_id.len() > 200 {
+                            return Err(anyhow!(
+                                "invalid run_in config for '{}': invalid chat id",
+                                name
+                            ));
+                        }
+                    }
+                    local_run_destination_update = Some(destination.clone());
+                    config.run_in = destination;
+                    // An existing chat is already a continuing context. Do not
+                    // also materialize the legacy Pipe-owned chat.
+                    if config.run_in.is_some() {
+                        config.history = false;
                     }
                 }
                 "trigger" => {
@@ -4744,8 +5679,29 @@ impl PipeManager {
             }
         }
 
+        // Chat ids belong to this device. Persist the source file exactly as it
+        // was authored and keep UI-selected destinations in the local registry.
+        config.run_in = frontmatter_run_in;
         let new_content = serialize_pipe(&config, &new_body)?;
+        self.ensure_pipe_write_allowed(name, Some(&new_content))?;
         atomic_write(&pipe_md, &new_content)?;
+
+        // Admission and the source write must succeed before any device-local
+        // state changes. A rejected adoption must leave the bundled task intact.
+        if let Some(enabled) = local_enabled_update {
+            if let Err(e) = set_local_override(&self.pipes_dir, name, enabled) {
+                warn!(
+                    "failed to save local enabled override for '{}': {}",
+                    name, e
+                );
+            }
+        }
+        if let Some(destination) = local_run_destination_update {
+            set_local_run_destination(&self.pipes_dir, name, destination)?;
+        }
+        if let Some(destination) = load_local_run_destinations(&self.pipes_dir).get(name) {
+            config.run_in = destination.clone();
+        }
 
         // Update in-memory
         let mut pipes = self.pipes.lock().await;
@@ -4779,11 +5735,15 @@ impl PipeManager {
             .count()
     }
 
-    fn ensure_pipe_install_allowed(
-        &self,
-        name: &str,
-        candidate_content: Option<&str>,
-    ) -> Result<()> {
+    fn pipe_limit_error(limit: usize) -> anyhow::Error {
+        anyhow!(
+            "{}: free plan includes up to {} installed pipes; delete one or upgrade",
+            PIPE_LIMIT_ERROR_CODE,
+            limit
+        )
+    }
+
+    fn ensure_pipe_write_allowed(&self, name: &str, candidate_content: Option<&str>) -> Result<()> {
         let Some(limit) = self.max_non_template_pipes else {
             return Ok(());
         };
@@ -4794,18 +5754,22 @@ impl PipeManager {
             return Ok(());
         }
 
-        // Updating or reinstalling an existing pipe is always safe, including
-        // for accounts that already had more pipes before the cap applied.
-        if self.pipes_dir.join(name).join("pipe.md").exists() {
-            return Ok(());
+        // Replacing an already counted task does not consume a new slot, even
+        // after a downgrade. Adopting an untouched bundled task does.
+        match std::fs::read_to_string(self.pipes_dir.join(name).join("pipe.md")) {
+            Ok(content) => {
+                if parse_frontmatter(&content).is_ok()
+                    && !Self::is_bundled_builtin_pipe(name, &content)
+                {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
         if self.installed_user_pipe_count() >= limit {
-            return Err(anyhow!(
-                "{}: free plan includes up to {} installed pipes; delete one or upgrade",
-                PIPE_LIMIT_ERROR_CODE,
-                limit
-            ));
+            return Err(Self::pipe_limit_error(limit));
         }
 
         Ok(())
@@ -4840,13 +5804,15 @@ impl PipeManager {
                     name
                 };
 
+                validate_pipe_identifier(&name)?;
+
                 let dest_dir = self.pipes_dir.join(&name);
                 let dest_file = dest_dir.join("pipe.md");
                 let dest_canonical = dest_file
                     .canonicalize()
                     .unwrap_or_else(|_| dest_file.clone());
                 let candidate_content = std::fs::read_to_string(source_path).ok();
-                self.ensure_pipe_install_allowed(&name, candidate_content.as_deref())?;
+                self.ensure_pipe_write_allowed(&name, candidate_content.as_deref())?;
 
                 // Skip copy if source and destination are the same file — copying
                 // a file onto itself can truncate it to 0 bytes on some platforms.
@@ -4866,10 +5832,11 @@ impl PipeManager {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
+                validate_pipe_identifier(&name)?;
                 let dest_dir = self.pipes_dir.join(&name);
                 let dest_canonical = dest_dir.canonicalize().unwrap_or_else(|_| dest_dir.clone());
                 let candidate_content = std::fs::read_to_string(source_path.join("pipe.md")).ok();
-                self.ensure_pipe_install_allowed(&name, candidate_content.as_deref())?;
+                self.ensure_pipe_write_allowed(&name, candidate_content.as_deref())?;
 
                 // Skip copy if source and destination are the same directory —
                 // copying a directory onto itself can clobber file contents.
@@ -4891,6 +5858,7 @@ impl PipeManager {
         }
         if source.starts_with("https://") {
             let name = url_to_pipe_name(source);
+            validate_pipe_identifier(&name)?;
             let response = reqwest::get(source).await?;
             if !response.status().is_success() {
                 return Err(anyhow!(
@@ -4899,7 +5867,7 @@ impl PipeManager {
                 ));
             }
             let content = response.text().await?;
-            self.ensure_pipe_install_allowed(&name, Some(&content))?;
+            self.ensure_pipe_write_allowed(&name, Some(&content))?;
 
             let dest_dir = self.pipes_dir.join(&name);
             std::fs::create_dir_all(&dest_dir)?;
@@ -4923,6 +5891,7 @@ impl PipeManager {
         slug: &str,
         version: i64,
     ) -> Result<String> {
+        validate_pipe_identifier(slug)?;
         // Parse the source_md to get config + body
         let (mut config, body) = parse_frontmatter(source_md)?;
 
@@ -4937,7 +5906,7 @@ impl PipeManager {
         let name = slug.to_string();
         // Re-serialize with tracking fields included
         let content = serialize_pipe(&config, &body)?;
-        self.ensure_pipe_install_allowed(&name, Some(&content))?;
+        self.ensure_pipe_write_allowed(&name, Some(&content))?;
         let dest_dir = self.pipes_dir.join(&name);
         std::fs::create_dir_all(&dest_dir)?;
         atomic_write(&dest_dir.join("pipe.md"), &content)?;
@@ -4956,6 +5925,7 @@ impl PipeManager {
         slug: &str,
         version: i64,
     ) -> Result<()> {
+        validate_pipe_identifier(name)?;
         let dest_dir = self.pipes_dir.join(name);
         if !dest_dir.exists() {
             return Err(anyhow!("pipe '{}' not found", name));
@@ -4965,14 +5935,9 @@ impl PipeManager {
 
         // Preserve user's enabled state, schedule, preset, effort, and connections from current config
         let current_path = dest_dir.join("pipe.md");
-        if let Ok(current_content) = std::fs::read_to_string(&current_path) {
-            // Backup existing pipe.md before overwriting
-            let backup_path = dest_dir.join("pipe.md.bak");
-            if let Err(e) = std::fs::copy(&current_path, &backup_path) {
-                warn!("failed to backup pipe.md for '{}': {}", name, e);
-            }
-
-            if let Ok((current_config, _)) = parse_frontmatter(&current_content) {
+        let current_content = std::fs::read_to_string(&current_path).ok();
+        if let Some(current_content) = current_content.as_ref() {
+            if let Ok((current_config, _)) = parse_frontmatter(current_content) {
                 config.enabled = current_config.enabled;
                 config.preset = current_config.preset.clone();
                 config.effort = current_config.effort;
@@ -4988,6 +5953,14 @@ impl PipeManager {
         config.source_hash = Some(simple_hash(&body));
 
         let content = serialize_pipe(&config, &body)?;
+        self.ensure_pipe_write_allowed(name, Some(&content))?;
+        // Rejected adoption must not create or overwrite a backup either.
+        if current_content.is_some() {
+            let backup_path = dest_dir.join("pipe.md.bak");
+            if let Err(e) = std::fs::copy(&current_path, &backup_path) {
+                warn!("failed to backup pipe.md for '{}': {}", name, e);
+            }
+        }
         atomic_write(&current_path, &content)?;
 
         self.load_pipes().await?;
@@ -4999,6 +5972,7 @@ impl PipeManager {
     /// Writes a tombstone so the pipe is not restored by builtin installation
     /// or cloud sync.
     pub async fn delete_pipe(&self, name: &str) -> Result<()> {
+        validate_pipe_identifier(name)?;
         let dir = self.pipes_dir.join(name);
         if !dir.exists() {
             return Err(self.pipe_not_found_error(name));
@@ -5047,6 +6021,12 @@ impl PipeManager {
         if let Err(e) = remove_local_override(&self.pipes_dir, name) {
             warn!("failed to remove local override for '{}': {}", name, e);
         }
+        if let Err(e) = remove_local_run_destination(&self.pipes_dir, name) {
+            warn!(
+                "failed to remove local run destination for '{}': {}",
+                name, e
+            );
+        }
 
         let mut pipes = self.pipes.lock().await;
         pipes.remove(name);
@@ -5060,6 +6040,7 @@ impl PipeManager {
 
     /// Clear a pipe's chat history by deleting its Pi session files.
     pub async fn clear_pipe_history(&self, name: &str) -> Result<()> {
+        validate_pipe_identifier(name)?;
         let pipe_dir = self.pipes_dir.join(name);
         if !pipe_dir.exists() {
             return Err(anyhow!("pipe '{}' not found", name));
@@ -5071,6 +6052,7 @@ impl PipeManager {
             ));
         }
         delete_pi_sessions(&pipe_dir)?;
+        let _ = std::fs::remove_file(pipe_dir.join(".screenpipe-acp-sessions.json"));
         info!("cleared history for pipe '{}'", name);
         Ok(())
     }
@@ -5172,7 +6154,6 @@ impl PipeManager {
         let pipes_dir = self.pipes_dir.clone();
         let on_run_complete = self.on_run_complete.clone();
         let on_output_line = self.on_output_line.clone();
-        let connection_check = self.connection_check.clone();
         let store = self.store.clone();
         let api_port = self.api_port;
         let token_registry = self.token_registry.clone();
@@ -5186,6 +6167,8 @@ impl PipeManager {
         let event_runs_active = self.event_runs_active.clone();
         let event_runs_peak = self.event_runs_peak.clone();
         let scheduler_run_guard = self.scheduler_run_guard.clone();
+        let fallback_registry = self.fallback_registry.clone();
+        let fallback_runner = Arc::new(self.scheduler_execution_delegate());
 
         let handle = tokio::spawn(async move {
             info!("pipe scheduler started (generation {})", generation);
@@ -5318,6 +6301,18 @@ impl PipeManager {
                         pending_events.push(PendingEvent::broadcast(e.name, e.data));
                     }
                     while let Some(e) = meeting_end_rx.next().now_or_never().flatten() {
+                        // The emitter marks trivial meetings (seconds long, no
+                        // transcript). Lifecycle consumers still need the
+                        // event, but spending a multi-minute agent run to
+                        // conclude "nothing to summarize" is pure waste.
+                        if event_skips_pipes(&e.data) {
+                            info!(
+                                "scheduler: skipping '{}' for trivial meeting {:?}",
+                                e.name,
+                                event_identity_key(&e.data)
+                            );
+                            continue;
+                        }
                         pending_events.push(PendingEvent::broadcast(e.name, e.data));
                     }
                     while let Some(e) = meeting_summary_refresh_rx.next().now_or_never().flatten() {
@@ -5347,33 +6342,17 @@ impl PipeManager {
                         }
                     }
 
-                    // connection_trigger events are addressed to a specific pipe
-                    // (the watcher already matched the source and wrote
-                    // .trigger-context.json), so fire that pipe directly — no
-                    // trigger.events string matching needed.
+                    // Source deliveries use the same matching/defer path as
+                    // meeting events. Context travels with the event instead of
+                    // being written by a producer while a prior run is active.
                     while let Some(e) = connection_trigger_rx.next().now_or_never().flatten() {
-                        if let Some(target) = e.data.get("pipe").and_then(|v| v.as_str()) {
-                            for (name, config, _body) in &pipe_snapshot {
-                                if name == target && config.enabled {
-                                    info!("scheduler: connection trigger fired pipe '{}'", name);
-                                    last_run.remove(name);
-                                    // No key: connection triggers already have their
-                                    // own committed-cursor dedupe in
-                                    // connection_triggers.rs, so they must not be
-                                    // suppressed a second time here.
-                                    event_triggered.insert(
-                                        name.clone(),
-                                        EventTrigger {
-                                            name: e.name.clone(),
-                                            key: None,
-                                            dedupe_key: None,
-                                            target_pipe: None,
-                                            data: e.data.clone(),
-                                        },
-                                    );
-                                    connection_triggered.insert(name.clone());
-                                }
-                            }
+                        if let Some(target) = e
+                            .data
+                            .get("pipe")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                        {
+                            pending_events.push(PendingEvent::targeted(e.name, e.data, &target));
                         }
                     }
 
@@ -5391,7 +6370,7 @@ impl PipeManager {
                                 continue;
                             }
                             if let Some(ref trigger) = config.trigger {
-                                if !trigger.events.iter().any(|e| e == event_name) {
+                                if !pending_matches_trigger(pending, name, trigger) {
                                     continue;
                                 }
 
@@ -5419,8 +6398,21 @@ impl PipeManager {
 
                                 let incoming_trigger = EventTrigger {
                                     name: event_name.clone(),
-                                    key: event_identity_key(data),
-                                    dedupe_key: event_dedupe_key(event_name, data),
+                                    key: if event_name == "connection_trigger" {
+                                        data.get("delivery_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_owned)
+                                    } else {
+                                        event_identity_key(data)
+                                    },
+                                    // Source cursors own their acknowledgment/retry
+                                    // protocol; a scheduler DB claim would prevent
+                                    // redelivery after a lost completion event.
+                                    dedupe_key: if event_name == "connection_trigger" {
+                                        None
+                                    } else {
+                                        event_dedupe_key(event_name, data)
+                                    },
                                     target_pipe: pending.target_pipe.clone(),
                                     data: data.clone(),
                                 };
@@ -5482,6 +6474,13 @@ impl PipeManager {
                     }
                 }
 
+                connection_triggered.extend(
+                    event_triggered
+                        .iter()
+                        .filter(|(_, event)| event.name == "connection_trigger")
+                        .map(|(name, _)| name.clone()),
+                );
+
                 for (name, config, body) in &pipe_snapshot {
                     if !config.enabled {
                         continue;
@@ -5539,108 +6538,17 @@ impl PipeManager {
                     // Check not already queued or running
                     {
                         let qr = queued_or_running.lock().await;
-                        if qr.contains(name) {
+                        if qr.contains(name) || running.lock().await.contains_key(name) {
                             // Hold an event trigger back rather than dropping it —
                             // the run in flight may be for a different event.
-                            // Connection triggers are excluded: they are addressed
-                            // to a pipe by name, so replaying them through event
-                            // matching wouldn't fire anything, and their watcher
-                            // already retries uncommitted fires.
-                            if !connection_triggered.contains(name) {
-                                if let Some(t) = event_triggered.get(name) {
-                                    deferred.push(PendingEvent {
-                                        name: t.name.clone(),
-                                        data: t.data.clone(),
-                                        target_pipe: t.target_pipe.clone(),
-                                    });
-                                }
+                            if let Some(t) = event_triggered.get(name) {
+                                deferred.push(PendingEvent {
+                                    name: t.name.clone(),
+                                    data: t.data.clone(),
+                                    target_pipe: t.target_pipe.clone(),
+                                });
                             }
                             continue;
-                        }
-                    }
-
-                    // Setup-mode gate: pipes whose declared `connections` aren't
-                    // all configured (credentials or OAuth token present) must not
-                    // run on schedule or event. Mirrors the manual-run gate in
-                    // pipes_api::run_pipe_now. Placed after the schedule/queue
-                    // checks so we only hit the SecretStore when the pipe would
-                    // otherwise be about to start.
-                    if !config.connections.is_empty() {
-                        if let Some(check) = &connection_check {
-                            let missing = check(config.connections.clone()).await;
-                            if !missing.is_empty() {
-                                let skipped_at = Utc::now();
-                                let message = format!(
-                                    "pipe '{}' skipped: missing required connections: {}",
-                                    name,
-                                    missing.join(", ")
-                                );
-                                warn!(
-                                    "scheduler: pipe '{}' in setup mode (missing connections: {:?}), skipping",
-                                    name, missing
-                                );
-                                last_run.insert(name.clone(), skipped_at);
-                                let mut execution_id = None;
-                                if let Some(ref store) = store {
-                                    match store
-                                        .create_execution(
-                                            name,
-                                            trigger,
-                                            &config.model,
-                                            config.provider.as_deref(),
-                                        )
-                                        .await
-                                    {
-                                        Ok(id) => {
-                                            execution_id = Some(id);
-                                            let _ = store
-                                                .finish_execution(
-                                                    id,
-                                                    "failed",
-                                                    "",
-                                                    &message,
-                                                    None,
-                                                    Some("missing_connections"),
-                                                    Some(&message),
-                                                    None,
-                                                )
-                                                .await;
-                                        }
-                                        Err(e) => {
-                                            warn!("failed to create skipped execution row: {}", e);
-                                        }
-                                    }
-                                    let _ = store.upsert_scheduler_state(name, false).await;
-                                }
-                                {
-                                    let mut logs_guard = logs.lock().await;
-                                    let entry = logs_guard
-                                        .entry(name.clone())
-                                        .or_insert_with(VecDeque::new);
-                                    entry.push_front(PipeRunLog {
-                                        pipe_name: name.clone(),
-                                        started_at: skipped_at,
-                                        finished_at: skipped_at,
-                                        success: false,
-                                        stdout: String::new(),
-                                        stderr: message.clone(),
-                                    });
-                                    if entry.len() > PIPE_LOG_ACTIVE_KEEP_PER_PIPE {
-                                        entry.pop_back();
-                                    }
-                                }
-                                if let Some(ref cb) = on_run_complete {
-                                    cb(
-                                        name,
-                                        execution_id,
-                                        trigger,
-                                        false,
-                                        0.0,
-                                        Some("missing_connections"),
-                                    );
-                                }
-                                continue;
-                            }
                         }
                     }
 
@@ -5659,22 +6567,6 @@ impl PipeManager {
                             );
                             remove_pid_file(&pipes_dir, name);
                         }
-                    }
-
-                    let executor = match executors.get(&config.agent) {
-                        Some(e) => e.clone(),
-                        None => {
-                            warn!("pipe '{}': agent '{}' not registered", name, config.agent);
-                            continue;
-                        }
-                    };
-
-                    if !executor.is_available() {
-                        debug!(
-                            "pipe '{}': agent '{}' not available yet",
-                            name, config.agent
-                        );
-                        continue;
                     }
 
                     info!(
@@ -5741,14 +6633,77 @@ impl PipeManager {
                         qr.insert(name.clone());
                     }
 
-                    // Resolve preset → model/provider overrides (same as run_pipe)
-                    let (model, provider, provider_url, api_key, preset_prompt) = if let Some(
-                        preset_id,
-                    ) =
-                        config.preset.first()
-                    {
-                        match resolve_preset(&pipes_dir, preset_id) {
-                            Some(resolved) => {
+                    // Resolve runner configuration using the same path as manual runs.
+                    let preset_ids = effective_preset_ids(&pipes_dir, config);
+                    let (
+                        model,
+                        provider,
+                        provider_url,
+                        api_key,
+                        preset_prompt,
+                        run_agent,
+                        executor_config,
+                        active_preset_id,
+                        active_preset_idx,
+                    ) = if let Some(chat_config) = existing_chat_executor_config(config) {
+                        (
+                            "existing chat".to_string(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            CHAT_DESTINATION_EXECUTOR.to_string(),
+                            Some(chat_config),
+                            None,
+                            None,
+                        )
+                    } else if config.agent == "cloud-agent" {
+                        let cloud = match cloud_agent_run_settings(config, body) {
+                            Ok(cloud) => cloud,
+                            Err(error) => {
+                                warn!("scheduler: pipe '{}': {error}", name);
+                                let mut qr = queued_or_running.lock().await;
+                                qr.remove(name);
+                                continue;
+                            }
+                        };
+                        (
+                            cloud.model,
+                            Some(cloud.provider),
+                            None,
+                            None,
+                            None,
+                            "cloud-agent".to_string(),
+                            Some(cloud.executor_config),
+                            None,
+                            None,
+                        )
+                    } else if !preset_ids.is_empty() {
+                        let choice = if is_enterprise_managed(config) {
+                            let preset_id = &preset_ids[0];
+                            resolve_preset(&pipes_dir, preset_id).map(|preset| {
+                                ResolvedPresetChoice {
+                                    id: preset_id.clone(),
+                                    index: 0,
+                                    preset,
+                                }
+                            })
+                        } else {
+                            resolve_configured_preset(
+                                &pipes_dir,
+                                &fallback_registry,
+                                &preset_ids,
+                                0,
+                            )
+                        };
+                        match choice {
+                            Some(choice) => {
+                                let ResolvedPresetChoice {
+                                    id: preset_id,
+                                    index: preset_idx,
+                                    preset: mut resolved,
+                                } = choice;
+                                prepare_preset_for_run(config, &mut resolved);
                                 info!("scheduler: pipe '{}' using preset '{}' → model={}, provider={:?}",
                                         name, preset_id, resolved.model, resolved.provider);
                                 (
@@ -5757,13 +6712,29 @@ impl PipeManager {
                                     resolved.url,
                                     resolved.api_key,
                                     resolved.prompt,
+                                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                                    resolved.executor_config,
+                                    Some(preset_id),
+                                    Some(preset_idx),
                                 )
                             }
-                            None if is_enterprise_managed(config) => {
-                                let message = format!(
-                                    "configured preset '{}' is unavailable; refusing to fall back to another AI provider",
-                                    preset_id
-                                );
+                            None => {
+                                let message = if is_enterprise_managed(config) {
+                                    format!(
+                                        "configured preset '{}' is unavailable; refusing to fall back to another AI provider",
+                                        preset_ids[0]
+                                    )
+                                } else {
+                                    let available = list_available_preset_ids(&pipes_dir);
+                                    let available_hint = if available.is_empty() {
+                                        "no presets are configured".to_string()
+                                    } else {
+                                        format!("available presets: {}", available.join(", "))
+                                    };
+                                    format!(
+                                        "none of the configured fallback presets exist in settings ({available_hint})"
+                                    )
+                                };
                                 warn!("scheduler: pipe '{}': {}", name, message);
                                 let failed_at = Utc::now();
                                 let mut execution_id = None;
@@ -5839,13 +6810,6 @@ impl PipeManager {
                                 }
                                 continue;
                             }
-                            None => (
-                                config.model.clone(),
-                                config.provider.clone(),
-                                None,
-                                None,
-                                None,
-                            ),
                         }
                     } else {
                         // No preset in pipe config — use the user's default preset
@@ -5863,6 +6827,10 @@ impl PipeManager {
                                     resolved.url,
                                     resolved.api_key,
                                     resolved.prompt,
+                                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                                    resolved.executor_config,
+                                    None,
+                                    None,
                                 )
                             }
                             None => (
@@ -5871,13 +6839,64 @@ impl PipeManager {
                                 None,
                                 None,
                                 None,
+                                config.agent.clone(),
+                                None,
+                                None,
+                                None,
                             ),
                         }
                     };
 
+                    let executor = match executors.get(&run_agent) {
+                        Some(executor) if executor.is_available() => executor.clone(),
+                        Some(_) => {
+                            warn!("pipe '{}': agent '{}' not available yet", name, run_agent);
+                            queued_or_running.lock().await.remove(name);
+                            continue;
+                        }
+                        None => {
+                            warn!("pipe '{}': agent '{}' not registered", name, run_agent);
+                            queued_or_running.lock().await.remove(name);
+                            continue;
+                        }
+                    };
+
+                    // Manual starts and scheduler starts must reserve the same
+                    // slot before touching per-run files or waiting for a
+                    // semaphore. A PID of zero means startup, not an idle pipe.
+                    // Recheck atomically: a manual start may have won since the
+                    // earlier queue/PID guards.
+                    let shared_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let handle = ExecutionHandle::new(shared_pid.clone());
+                    let claimed = {
+                        let mut active = running.lock().await;
+                        if crate::background_work::is_suspended() || active.contains_key(name) {
+                            false
+                        } else {
+                            active.insert(name.clone(), handle.clone());
+                            true
+                        }
+                    };
+                    if !claimed {
+                        queued_or_running.lock().await.remove(name);
+                        if let (Some((event, key)), Some(store)) = (&event_claim, store.as_ref()) {
+                            let _ = store.release_event_run(name, event, key).await;
+                        }
+                        if let Some(t) = event_triggered.get(name) {
+                            deferred.push(PendingEvent {
+                                name: t.name.clone(),
+                                data: t.data.clone(),
+                                target_pipe: t.target_pipe.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    let run_handle = handle.clone();
+                    let stop_requested = handle.stop_requested.clone();
+
                     // Pre-configure pi with the pipe's provider
                     let mut pipe_token: Option<String> = None;
-                    if config.agent == "pi" {
+                    if run_agent == "pi" {
                         let cloud_token = executor.user_token();
                         if let Err(e) = PiExecutor::ensure_pi_config(
                             cloud_token.as_deref(),
@@ -5890,11 +6909,14 @@ impl PipeManager {
                         {
                             warn!("scheduler: failed to pre-configure pi provider: {}", e);
                         }
-
+                    }
+                    if matches!(run_agent.as_str(), "pi" | "acp") {
                         pipe_token = setup_pipe_permissions(
                             &pipes_dir.join(name),
                             config,
                             token_registry.as_ref(),
+                            triggered_by_event && event_runs_are_read_only(config),
+                            api_port,
                         )
                         .await;
                     }
@@ -5910,7 +6932,7 @@ impl PipeManager {
                         preset_prompt.as_deref(),
                         connections_context.as_deref(),
                         local_api_key.as_deref(),
-                        config.agent == "pi" && pi_package_enabled("pi-subagents"),
+                        run_agent == "pi" && pi_package_enabled("pi-subagents"),
                     );
                     // Resolve this run's own context (Live View targets it owns)
                     // and append it to the shared context, exactly as the
@@ -5933,6 +6955,9 @@ impl PipeManager {
                         combined_context.as_deref(),
                     );
                     let pipe_name = name.clone();
+                    let has_chat_destination = config.run_in.is_some();
+                    let existing_chat_id =
+                        config.existing_chat_id().ok().flatten().map(str::to_string);
                     let is_event_triggered = triggered_by_event;
                     let trigger = trigger.to_string();
                     let logs_ref = logs.clone();
@@ -5940,7 +6965,11 @@ impl PipeManager {
                     let running_exec_ids_ref = running_execution_ids.clone();
                     let pipes_dir_for_log = pipes_dir.clone();
                     let on_complete = on_run_complete.clone();
-                    let on_output = on_output_line.clone();
+                    let on_output = if has_chat_destination {
+                        None
+                    } else {
+                        on_output_line.clone()
+                    };
                     let store_ref = store.clone();
                     let token_registry_ref = token_registry.clone();
                     let mcp_session_access_ref = mcp_session_access.clone();
@@ -5954,17 +6983,41 @@ impl PipeManager {
                     let queued_ref = queued_or_running.clone();
                     let mcp_server_allowlist = selected_mcp_server_ids(config);
 
-                    // Tell the pipe which event fired it, so it acts on that
-                    // meeting instead of guessing at the most recent one.
-                    //
-                    // Skipped for connection triggers: their watcher already wrote
-                    // the same file with the items it detected, and overwriting it
-                    // would take that payload away from the pipe.
-                    if !connection_triggered.contains(name) {
-                        if let Some(t) = event_triggered.get(name) {
-                            write_event_trigger_context(&pipe_dir, t);
+                    // This pipe has passed the busy/queue guards. Only its
+                    // selected delivery can now replace the context file.
+                    if let Some(t) = event_triggered.get(name) {
+                        if !write_event_trigger_context(&pipe_dir, t)
+                            && t.name == "connection_trigger"
+                        {
+                            warn!(
+                                "scheduler: cannot persist source context for '{}'; deferring",
+                                name
+                            );
+                            queued_or_running.lock().await.remove(name);
+                            handle.mark_finished();
+                            running.lock().await.remove(name);
+                            if let Some(ref token) = pipe_token {
+                                cleanup_pipe_token(token, token_registry.as_ref());
+                            }
+                            if let (Some((event, key)), Some(store)) =
+                                (&event_claim, store.as_ref())
+                            {
+                                let _ = store.release_event_run(name, event, key).await;
+                            }
+                            deferred.push(PendingEvent {
+                                name: t.name.clone(),
+                                data: t.data.clone(),
+                                target_pipe: t.target_pipe.clone(),
+                            });
+                            continue;
                         }
                     }
+                    let source_delivery_id = event_triggered
+                        .get(name)
+                        .filter(|t| t.name == "connection_trigger")
+                        .and_then(|t| t.data.get("delivery_id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
 
                     let claim_for_release = event_claim.clone();
                     // Execution metadata and the pipe-facing context keep the
@@ -5972,6 +7025,16 @@ impl PipeManager {
                     // is an internal scheduler claim only.
                     let trigger_event_name = event_triggered.get(name).map(|t| t.name.clone());
                     let trigger_event_key = event_triggered.get(name).and_then(|t| t.key.clone());
+                    let fallback_event_context = event_triggered.get(name).cloned();
+                    let fallback_runner = fallback_runner.clone();
+                    let fallback_registry = fallback_registry.clone();
+                    let max_fallback_attempts = if run_agent == CHAT_DESTINATION_EXECUTOR
+                        || is_enterprise_managed(config)
+                    {
+                        1
+                    } else {
+                        preset_ids.len().min(preset_fallback::MAX_FALLBACK_DEPTH)
+                    };
 
                     tokio::spawn(async move {
                         // Scheduled pipes wait for the previous one to finish
@@ -5979,14 +7042,56 @@ impl PipeManager {
                         // for low latency but still take a permit from a separate,
                         // higher-capacity semaphore so a burst can't spawn
                         // unbounded concurrent agent subprocesses.
-                        let _permit = if !is_event_triggered {
-                            semaphore
-                                .acquire()
-                                .await
-                                .expect("execution semaphore closed")
+                        let capacity = if !is_event_triggered {
+                            &semaphore
                         } else {
-                            event_sem.acquire().await.expect("event semaphore closed")
+                            &event_sem
                         };
+                        let permit = tokio::select! {
+                            biased;
+                            _ = run_handle.wait_for_stop() => None,
+                            permit = capacity.acquire() => Some(permit.expect("execution semaphore closed")),
+                        };
+                        // A queued Stop must not wait for preceding runs, model
+                        // setup, or the rate-limit spacing between scheduled runs.
+                        // No subprocess or execution row exists yet on this path.
+                        if permit.is_none()
+                            || stop_requested.load(std::sync::atomic::Ordering::SeqCst)
+                            || crate::background_work::is_suspended()
+                        {
+                            if let Some(ref token) = pipe_token {
+                                cleanup_pipe_token(token, token_registry_ref.as_ref());
+                            }
+                            if let (Some((event, key)), Some(ref store)) =
+                                (&claim_for_release, &store_ref)
+                            {
+                                if let Err(error) =
+                                    store.release_event_run(&pipe_name, event, key).await
+                                {
+                                    warn!("scheduler: could not release cancelled event claim for '{}': {}", pipe_name, error);
+                                }
+                            }
+                            queued_ref.lock().await.remove(&pipe_name);
+                            run_handle.mark_finished();
+                            running_ref.lock().await.remove(&pipe_name);
+                            // Source watchers need a failed completion to retry
+                            // an unprocessed delivery after recording resumes.
+                            emit_pipe_completed_with_delivery(
+                                &pipe_name,
+                                false,
+                                0.0,
+                                source_delivery_id,
+                            );
+                            if let Some(ref cb) = on_complete {
+                                cb(&pipe_name, None, &trigger, false, 0.0, Some("cancelled"));
+                            }
+                            info!(
+                                "scheduler: cancelled queued pipe '{}' before execution",
+                                pipe_name
+                            );
+                            return;
+                        };
+                        let _permit = permit;
 
                         // Count concurrent event-triggered runs (drops on every
                         // exit path); the peak feeds the pipe_scheduled_run
@@ -5997,17 +7102,8 @@ impl PipeManager {
                             None
                         };
 
-                        let shared_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-                        let handle = ExecutionHandle::new(shared_pid.clone());
-                        let run_handle = handle.clone();
-                        let stop_requested = handle.stop_requested.clone();
-
-                        // Mark running + write PID file only after acquiring the permit,
-                        // so the UI shows accurate state (not "running" while queued).
-                        {
-                            let mut r = running_ref.lock().await;
-                            r.insert(pipe_name.clone(), handle);
-                        }
+                        // The shared slot was reserved before preparation. Keep
+                        // that same handle, including a Stop requested in queue.
                         // Sentinel 0 — see start_pipe_background.
                         write_pid_file(&pipes_dir_for_mark, &pipe_name, 0);
 
@@ -6027,7 +7123,11 @@ impl PipeManager {
                                 .await
                             {
                                 Ok(id) => {
-                                    if history_enabled {
+                                    if let Some(conversation_id) = existing_chat_id.as_deref() {
+                                        let _ = store
+                                            .set_execution_conversation_id(id, conversation_id)
+                                            .await;
+                                    } else if history_enabled {
                                         let conversation_id =
                                             pipe_conversation_id(&pipe_name, id, true);
                                         let _ = store
@@ -6144,6 +7244,7 @@ impl PipeManager {
                                 // Owner tag — must match pipeSessionId() on the
                                 // frontend. See run_pipe_with_trigger.
                                 Some(session_owner.as_str()),
+                                executor_config.as_ref(),
                             ),
                         )
                         .await;
@@ -6171,7 +7272,7 @@ impl PipeManager {
                         }
                         remove_pid_file(&pipes_dir_for_log, &pipe_name);
 
-                        let (log, cb_error_type): (PipeRunLog, Option<String>) = match run_result {
+                        let (mut log, mut cb_error_type) = match run_result {
                             Ok(Ok(output)) => {
                                 let filtered_stdout = filter_ndjson_stdout(&output.stdout);
                                 let cancelled = was_cancelled();
@@ -6179,6 +7280,12 @@ impl PipeManager {
                                     output.success,
                                     cancelled,
                                     &output.stderr,
+                                    &filtered_stdout,
+                                );
+                                log_read_tool_failures(
+                                    &pipe_name,
+                                    exec_id,
+                                    classified.status,
                                     &filtered_stdout,
                                 );
                                 let session_path = find_latest_pi_session(&pipe_dir)
@@ -6321,15 +7428,79 @@ impl PipeManager {
                             }
                         };
 
+                        if let Some(ref preset_id) = active_preset_id {
+                            if log.success {
+                                fallback_registry.record_success(preset_id);
+                            } else if !was_cancelled() {
+                                fallback_registry.record_failure_from_output(
+                                    preset_id,
+                                    &log.stderr,
+                                    &log.stdout,
+                                );
+                            }
+                        }
+
+                        let mut final_exec_id = exec_id;
+                        let mut fallback_managed_logs = false;
+                        let max_attempts = max_fallback_attempts;
+                        if let (false, Some(current_idx), false, true) = (
+                            log.success,
+                            active_preset_idx,
+                            was_cancelled(),
+                            should_try_fallback_preset(cb_error_type.as_deref()),
+                        ) {
+                            let next_idx = current_idx + 1;
+                            if next_idx < max_attempts {
+                                info!(
+                                    "scheduler: pipe '{}' preset '{}' failed; retrying fallback slot {}/{}",
+                                    pipe_name,
+                                    active_preset_id.as_deref().unwrap_or("?"),
+                                    next_idx + 1,
+                                    max_attempts
+                                );
+
+                                // Preserve the primary attempt before the delegated
+                                // runner records each subsequent fallback attempt.
+                                fallback_runner.append_log(&pipe_name, &log).await;
+                                let _ = fallback_runner.write_log_to_disk(&pipe_name, &log);
+
+                                match fallback_runner
+                                    .run_pipe_with_trigger_inner(
+                                        &pipe_name,
+                                        &trigger,
+                                        next_idx,
+                                        run_scoped_context.as_deref(),
+                                        fallback_event_context.as_ref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(outcome) => {
+                                        log = outcome.log;
+                                        cb_error_type = outcome.error_type;
+                                        final_exec_id = outcome.execution_id;
+                                        fallback_managed_logs = true;
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            "scheduler: fallback execution for '{}' could not start: {}",
+                                            pipe_name, error
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         // Write log to disk
-                        let log_dir = pipes_dir_for_log.join(&log.pipe_name).join("logs");
-                        let _ = std::fs::create_dir_all(&log_dir);
-                        let log_file = log_dir
-                            .join(format!("{}.json", log.started_at.format("%Y%m%d_%H%M%S")));
-                        let _ = std::fs::write(
-                            &log_file,
-                            serde_json::to_string_pretty(&log).unwrap_or_default(),
-                        );
+                        if !fallback_managed_logs {
+                            let log_dir = pipes_dir_for_log.join(&log.pipe_name).join("logs");
+                            let _ = std::fs::create_dir_all(&log_dir);
+                            let log_file = log_dir
+                                .join(format!("{}.json", log.started_at.format("%Y%m%d_%H%M%S")));
+                            let _ = std::fs::write(
+                                &log_file,
+                                serde_json::to_string_pretty(&log).unwrap_or_default(),
+                            );
+                        }
 
                         // Auto-clear Pi session on context overflow so the next run starts fresh
                         if cb_error_type.as_deref() == Some("context_overflow") {
@@ -6343,7 +7514,7 @@ impl PipeManager {
 
                         // Append to in-memory logs
                         let duration_secs =
-                            (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+                            (log.finished_at - started_at).num_milliseconds() as f64 / 1000.0;
                         let success = log.success;
 
                         // A failed run shouldn't be remembered as one that happened —
@@ -6364,28 +7535,27 @@ impl PipeManager {
                         }
 
                         let name_for_cb = log.pipe_name.clone();
-                        let mut l = logs_ref.lock().await;
-                        let entry = l.entry(log.pipe_name.clone()).or_insert_with(VecDeque::new);
-                        push_run_log_status(entry, log);
-                        drop(l);
+                        if !fallback_managed_logs {
+                            let mut l = logs_ref.lock().await;
+                            let entry =
+                                l.entry(log.pipe_name.clone()).or_insert_with(VecDeque::new);
+                            push_run_log_status(entry, log);
+                            drop(l);
+                        }
 
                         // Emit pipe_completed event so other pipes can chain
-                        let event_name = format!("pipe_completed:{}", name_for_cb);
-                        let _ = screenpipe_events::send_event(
-                            &event_name,
-                            screenpipe_events::PipeCompletedEvent {
-                                pipe_name: name_for_cb.clone(),
-                                success,
-                                duration_secs,
-                                timestamp: chrono::Utc::now(),
-                            },
+                        emit_pipe_completed_with_delivery(
+                            &name_for_cb,
+                            success,
+                            duration_secs,
+                            source_delivery_id,
                         );
 
                         // Fire run-complete callback (analytics, etc.)
                         if let Some(ref cb) = on_complete {
                             cb(
                                 &name_for_cb,
-                                exec_id,
+                                final_exec_id,
                                 &trigger,
                                 success,
                                 duration_secs,
@@ -6443,8 +7613,15 @@ impl PipeManager {
 
                 // Retry deferred triggers next tick, newest last so the oldest are
                 // the ones dropped if a pipe stays busy indefinitely.
+                //
+                // Dedupe first: one event that matches N busy pipes was pushed
+                // into `deferred` once per pipe, and next tick each copy would
+                // match every busy pipe again — the copies double per tick
+                // until the pipes free up and hundreds of duplicates drain
+                // through the coalesce path at once.
                 if !deferred.is_empty() {
                     carryover.extend(deferred);
+                    carryover = dedupe_pending_events(carryover);
                     if carryover.len() > MAX_CARRYOVER_EVENTS {
                         let dropped = carryover.len() - MAX_CARRYOVER_EVENTS;
                         carryover.drain(..dropped);
@@ -6529,7 +7706,7 @@ impl PipeManager {
                         .collect()
                 };
                 // Drain pipe_completed:* events since the last tick.
-                let mut completions: Vec<(String, bool)> = Vec::new();
+                let mut completions: Vec<(String, bool, Option<String>)> = Vec::new();
                 while let Some(e) = completed_rx.next().now_or_never().flatten() {
                     if e.name.starts_with("pipe_completed:") {
                         let pipe = e
@@ -6543,7 +7720,14 @@ impl PipeManager {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         if let Some(pipe) = pipe {
-                            completions.push((pipe, success));
+                            completions.push((
+                                pipe,
+                                success,
+                                e.data
+                                    .get("source_delivery_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned),
+                            ));
                         }
                     }
                 }
@@ -6604,6 +7788,11 @@ impl PipeManager {
 
     /// Copy built-in pipe templates into pipes_dir if they don't exist.
     pub fn install_builtin_pipes(&self) -> Result<()> {
+        if let Some(data_dir) = self.pipes_dir.parent() {
+            if let Err(error) = crate::starter_skills::install_store(&data_dir.join("skills")) {
+                warn!("could not install starter skills: {error}");
+            }
+        }
         // Manual pipes are bundled as templates. Scheduled pipes (idea-tracker,
         // obsidian-sync) are available from the pipe store instead.
         let tombstones = read_tombstones(&self.pipes_dir);
@@ -6657,22 +7846,6 @@ impl PipeManager {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Build the full prompt by prepending context header to the pipe body.
-    fn render_prompt(
-        &self,
-        config: &PipeConfig,
-        body: &str,
-        system_prompt: Option<&str>,
-    ) -> String {
-        render_prompt_with_port(
-            config,
-            body,
-            self.api_port,
-            system_prompt,
-            self.extra_context.as_deref(),
-        )
-    }
-
     async fn append_log(&self, name: &str, log: &PipeRunLog) {
         let mut logs = self.logs.lock().await;
         let entry = logs.entry(name.to_string()).or_insert_with(VecDeque::new);
@@ -6719,6 +7892,7 @@ pub fn parse_frontmatter(content: &str) -> Result<(PipeConfig, String)> {
     let body = rest[end + 4..].trim().to_string();
 
     let config: PipeConfig = serde_yaml::from_str(yaml_str)?;
+    config.existing_chat_id()?;
 
     Ok((config, body))
 }
@@ -6757,10 +7931,13 @@ pub fn serialize_pipe(config: &PipeConfig, body: &str) -> Result<String> {
         "agent",
         "model",
         "provider",
+        "cloud_agent",
         "preset",
         "connections",
         "permissions",
         "timeout",
+        "history",
+        "run_in",
         "trigger",
         "source_slug",
         "installed_version",
@@ -6864,30 +8041,40 @@ fn render_prompt_with_port(
     let timezone = now.format("%Z").to_string();
     let tz_offset = now.format("%:z").to_string();
 
-    // Compute lookback from schedule interval (capped at 8h)
-    let lookback_duration = parse_duration_str(&config.schedule)
-        .unwrap_or(std::time::Duration::from_secs(3600))
-        .min(std::time::Duration::from_secs(8 * 3600));
-    let start_time = (now
-        - chrono::Duration::from_std(lookback_duration).unwrap_or(chrono::Duration::hours(1)))
-    .to_utc()
-    .format("%Y-%m-%dT%H:%M:%SZ")
-    .to_string();
-    let end_time = now.to_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    let mut prompt = String::new();
-
-    let header = format!(
-        r#"Default run lookback: {start_time} to {end_time}
+    // Workflow batches resume their durable coverage cursor. A schedule-derived
+    // lookback can skip unread history, so only their pipeline supplies a range.
+    let mut prompt = if crate::workflows::workspace::is_task(&config.name) {
+        "Workflow run: use workflow_workspace context; its cycle is the requested window. Investigate with the normal screenpipe-api skill. Save drafts and decisions with workflow_workspace.\n".to_string()
+    } else if crate::workflows::pipeline::stage(&config.name).is_some() {
+        "Workflow run: follow the task instructions and read /workflows/pipeline; pipeline.window is the authoritative window.\n".to_string()
+    } else {
+        let lookback_duration = parse_duration_str(&config.schedule)
+            .unwrap_or(std::time::Duration::from_secs(3600))
+            .min(std::time::Duration::from_secs(8 * 3600));
+        let start_time = (now
+            - chrono::Duration::from_std(lookback_duration).unwrap_or(chrono::Duration::hours(1)))
+        .to_utc()
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+        let end_time = now.to_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        format!(
+            r#"Default run lookback: {start_time} to {end_time}
 Structured output targets may declare an authoritative time range that overrides this default for that target.
-Run date: {date}
+"#
+        )
+    };
+
+    prompt.push_str(&format!(
+        r#"Run date: {date}
+Run context time: {}
+Execution budget: {} seconds. Check the clock and reserve time for required writes and verification.
 Timezone: {timezone} (UTC{tz_offset})
 Pipe name: {}
 "#,
+        now.to_rfc3339(),
+        config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
         config.name
-    );
-
-    prompt.push_str(&header);
+    ));
 
     if let Some(ctx) = extra_context {
         prompt.push_str(ctx);
@@ -6957,19 +8144,27 @@ const EVENT_TRIGGER_CONTEXT_FILE: &str = ".trigger-context.json";
 ///
 /// Without this a `meeting_ended` pipe has to guess which meeting it was woken
 /// for, which goes wrong exactly when two meetings end close together.
-fn write_event_trigger_context(pipe_dir: &Path, trigger: &EventTrigger) {
+fn write_event_trigger_context(pipe_dir: &Path, trigger: &EventTrigger) -> bool {
     if !pipe_dir.is_dir() {
-        return;
+        return false;
     }
-    let ctx = serde_json::json!({
-        "event": trigger.name,
-        "key": trigger.key,
-        "data": trigger.data,
-        "triggered_at": Utc::now().to_rfc3339(),
-    });
-    if let Ok(s) = serde_json::to_string_pretty(&ctx) {
-        let _ = atomic_write(&pipe_dir.join(EVENT_TRIGGER_CONTEXT_FILE), &s);
-    }
+    let ctx = if trigger.name == "connection_trigger" {
+        // Preserve the existing source context shape for installed Pipe prompts.
+        match trigger.data.get("context") {
+            Some(context) if context.is_object() => context.clone(),
+            _ => return trigger.data.get("delivery_id").is_none(), // legacy producers wrote their own context
+        }
+    } else {
+        serde_json::json!({
+            "event": trigger.name,
+            "key": trigger.key,
+            "data": trigger.data,
+            "triggered_at": Utc::now().to_rfc3339(),
+        })
+    };
+    serde_json::to_string_pretty(&ctx)
+        .ok()
+        .is_some_and(|s| atomic_write(&pipe_dir.join(EVENT_TRIGGER_CONTEXT_FILE), &s).is_ok())
 }
 
 /// One event delivery that matched a pipe's `trigger.events`.
@@ -7041,6 +8236,9 @@ fn resolve_same_tick_event(
         return SameTickEventResolution::DeferIncoming;
     }
 
+    if existing.name == "connection_trigger" && existing.key == incoming.key {
+        return SameTickEventResolution::KeepExisting;
+    }
     if existing.dedupe_key.is_some() && existing.dedupe_key == incoming.dedupe_key {
         return SameTickEventResolution::KeepExisting;
     }
@@ -7089,6 +8287,54 @@ impl PendingEvent {
     }
 }
 
+/// Addressed source deliveries share the scheduler's ordinary event queue,
+/// but their subscription must still exist when the delayed event is consumed.
+fn pending_matches_trigger(pending: &PendingEvent, pipe: &str, trigger: &TriggerConfig) -> bool {
+    if pending.name != "connection_trigger" {
+        return trigger.events.iter().any(|event| event == &pending.name);
+    }
+    if pending.target_pipe.as_deref() != Some(pipe) {
+        return false;
+    }
+    match pending
+        .data
+        .get("subscription_key")
+        .and_then(|v| v.as_str())
+    {
+        Some(key) => trigger
+            .sources
+            .iter()
+            .any(|source| connection_triggers::subscription_key(pipe, source) == key),
+        None => !trigger.sources.is_empty(), // legacy source producer
+    }
+}
+
+/// Emitters set `skip_pipes` on events describing something too trivial to be
+/// worth an agent run (a seconds-long meeting with no transcript). Lifecycle
+/// consumers on the same topic ignore the field.
+fn event_skips_pipes(data: &serde_json::Value) -> bool {
+    data.get("skip_pipes")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Drop exact-duplicate pending triggers, keeping first occurrence order.
+///
+/// Deferral pushes one copy of an event per busy matching pipe, so without
+/// this the deferred backlog doubles every tick a pipe stays busy.
+fn dedupe_pending_events(events: Vec<PendingEvent>) -> Vec<PendingEvent> {
+    let mut seen: std::collections::HashSet<(String, Option<String>, String)> =
+        std::collections::HashSet::new();
+    events
+        .into_iter()
+        .filter(|event| {
+            let identity = event_dedupe_key(&event.name, &event.data)
+                .unwrap_or_else(|| event.data.to_string());
+            seen.insert((event.name.clone(), event.target_pipe.clone(), identity))
+        })
+        .collect()
+}
+
 /// Read the identity of an event out of its payload.
 ///
 /// Events that describe a specific thing carry its id (`meeting_ended` carries
@@ -7110,6 +8356,13 @@ fn event_identity_key(data: &serde_json::Value) -> Option<String> {
 /// new transcript generation that needs its own summary. Legacy emitters that
 /// do not include `meeting_end` retain the old meeting-id-only behavior.
 fn event_dedupe_key(event_name: &str, data: &serde_json::Value) -> Option<String> {
+    if event_name == "connection_trigger" {
+        return data
+            .get("delivery_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+    }
     let identity = event_identity_key(data)?;
     if event_name != "meeting_ended" {
         return Some(identity);
@@ -7125,6 +8378,28 @@ fn event_dedupe_key(event_name: &str, data: &serde_json::Value) -> Option<String
         Some(value) => format!("{}@{}", identity, value),
         None => identity,
     })
+}
+
+fn emit_pipe_completed(pipe_name: &str, success: bool, duration_secs: f64) {
+    emit_pipe_completed_with_delivery(pipe_name, success, duration_secs, None);
+}
+
+fn emit_pipe_completed_with_delivery(
+    pipe_name: &str,
+    success: bool,
+    duration_secs: f64,
+    source_delivery_id: Option<String>,
+) {
+    let _ = screenpipe_events::send_event(
+        format!("{PIPE_COMPLETED_EVENT_PREFIX}{pipe_name}"),
+        screenpipe_events::PipeCompletedEvent {
+            pipe_name: pipe_name.to_string(),
+            success,
+            duration_secs,
+            timestamp: Utc::now(),
+            source_delivery_id,
+        },
+    );
 }
 
 fn pipe_completed_source(event_name: &str) -> Option<&str> {
@@ -8082,8 +9357,672 @@ impl Drop for PipeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{AgentOutput, ExecutionHandle, SharedPid};
     use chrono::{TimeZone, Timelike};
+    use futures::{FutureExt, StreamExt};
+    use std::path::Path;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn file_read_failure_diagnostics_exclude_private_tool_content() {
+        let event = |text: &str, is_error: bool| {
+            serde_json::json!({
+                "type": "tool_execution_end", "toolName": "read", "isError": is_error,
+                "result": {"content": [{"type": "text", "text": text}]}
+            })
+            .to_string()
+        };
+        let stdout = [
+            event(
+                "ENOENT: no such file or directory, access '/workflows/context'",
+                true,
+            ),
+            event(
+                "EACCES: permission denied, access '/private/customer.txt'",
+                true,
+            ),
+            event("ENOENT: this is successful file content", false),
+            event("private unknown failure", true),
+        ]
+        .join("\n");
+        let summary = super::read_tool_failure_summary(&stdout);
+        assert!(summary.contains("read cause=ENOENT target=workflow_api_endpoint failures=1"));
+        assert!(summary.contains("read cause=EACCES target=local_file failures=1"));
+        assert!(summary.contains("read cause=unknown target=local_file failures=1"));
+        assert!(!summary.contains("private"));
+        assert!(!summary.contains("customer"));
+        assert!(
+            super::read_tool_failure_summary(&event("private successful file", false)).is_empty()
+        );
+    }
+
+    #[test]
+    fn oversized_agent_history_preserves_terminal_success_and_error() {
+        for reason in ["stop", "error"] {
+            let mut output = crate::agents::pi::BoundedOutput::default();
+            output.push_line(r#"{"type":"agent_start"}"#);
+            let event = serde_json::json!({"type":"agent_end","messages":[
+                {"role":"toolResult","content":[{"type":"text","text":"x".repeat(300_000)}]},
+                {"role":"assistant","stopReason":reason,"content":[{"type":"text","text":"Saved the update."}]}
+            ]});
+            output.push_line(&event.to_string());
+            output.push_line(r#"{"type":"agent_settled"}"#);
+            let stored = filter_ndjson_stdout(&output.into_string());
+            assert!(stored.len() < 10_000);
+            assert_eq!(stdout_has_verified_pipe_result(&stored), reason == "stop");
+        }
+    }
+
+    #[test]
+    fn missing_save_receipt_fails_despite_normal_assistant_text() {
+        let stdout = r#"{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"No changes saved."}]}]}"#;
+        let stderr = r#"{"error":{"code":"missing_output","message":"The agent could not save a supported update."}}"#;
+        let result = classify_pipe_process_result(false, false, stderr, stdout);
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.error_type.as_deref(), Some("missing_output"));
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("The agent could not save a supported update.")
+        );
+        assert_eq!(
+            classify_pipe_process_result(false, true, stderr, stdout).status,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn skill_learning_is_opt_in_and_bounded() {
+        let (config, _) =
+            parse_frontmatter(include_str!("../../assets/pipes/skill-learning/pipe.md")).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.agent, "pi");
+        assert_eq!(config.schedule, "every 6h");
+        assert_eq!(config.timeout, Some(180));
+        assert!(!config.subagent);
+        assert!(!config.history);
+        assert_eq!(config.artifacts[0].path, "output/latest-change.md");
+    }
+
+    #[test]
+    fn rotating_chatgpt_token_errors_require_reauthentication() {
+        assert!(chatgpt_refresh_requires_reauth(
+            r#"{"error":{"code":"refresh_token_reused"}}"#
+        ));
+        assert!(chatgpt_refresh_requires_reauth(
+            r#"{"error":{"code":"invalid_grant"}}"#
+        ));
+        assert!(!chatgpt_refresh_requires_reauth(
+            r#"{"error":{"code":"temporarily_unavailable"}}"#
+        ));
+    }
+
+    struct SequencedExecutor {
+        outputs: std::sync::Mutex<VecDeque<AgentOutput>>,
+        attempts: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentExecutor for SequencedExecutor {
+        async fn run(
+            &self,
+            _prompt: &str,
+            model: &str,
+            _working_dir: &Path,
+            provider: Option<&str>,
+            _provider_url: Option<&str>,
+            _provider_api_key: Option<&str>,
+            _shared_pid: Option<SharedPid>,
+            _continue_session: bool,
+        ) -> Result<AgentOutput> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push((model.to_string(), provider.map(str::to_string)));
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow!("unexpected extra executor attempt"))
+        }
+
+        fn kill(&self, _handle: &ExecutionHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn ensure_installed(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "sequenced-test"
+        }
+    }
+
+    struct SourceContextExecutor {
+        contexts: std::sync::Mutex<Vec<serde_json::Value>>,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentExecutor for SourceContextExecutor {
+        async fn run(
+            &self,
+            _prompt: &str,
+            _model: &str,
+            working_dir: &Path,
+            _provider: Option<&str>,
+            _provider_url: Option<&str>,
+            _provider_api_key: Option<&str>,
+            _shared_pid: Option<SharedPid>,
+            _continue_session: bool,
+        ) -> Result<AgentOutput> {
+            let path = working_dir.join(EVENT_TRIGGER_CONTEXT_FILE);
+            let before = std::fs::read_to_string(&path)?;
+            self.contexts
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(&before)?);
+            self.release.acquire().await?.forget();
+            assert_eq!(
+                std::fs::read_to_string(&path)?,
+                before,
+                "queued source overwrote active context"
+            );
+            Ok(AgentOutput {
+                stdout: "saved".into(),
+                stderr: String::new(),
+                success: true,
+                pid: None,
+            })
+        }
+        fn kill(&self, _handle: &ExecutionHandle) -> Result<()> {
+            Ok(())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_installed(&self) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "source-context-test"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_events_serialize_context_and_acknowledge_their_own_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        let name = "source-context-serialization";
+        let dir = pipes_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pipe.md"), "---\nschedule: manual\nagent: mock\nmodel: test\ntrigger:\n  sources:\n    - app: audio\n      kind: phrase\n      filter:\n        phrases: start job\n---\nSave the matched transcript.\n").unwrap();
+        let src: SourceTrigger = serde_json::from_value(serde_json::json!({"app": "audio", "kind": "phrase", "filter": {"phrases": "start job"}})).unwrap();
+        let key = connection_triggers::subscription_key(name, &src);
+        let executor = Arc::new(SourceContextExecutor {
+            contexts: std::sync::Mutex::new(Vec::new()),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".into(), executor.clone());
+        let mut manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        let mut completed = screenpipe_events::subscribe_to_event::<serde_json::Value>(&format!(
+            "pipe_completed:{name}"
+        ));
+        manager.start_scheduler().await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let send = |id: &str| {
+            screenpipe_events::send_event(
+                "connection_trigger",
+                screenpipe_events::ConnectionTriggerEvent {
+                    pipe: name.into(),
+                    app: "audio".into(),
+                    kind: "phrase".into(),
+                    path: None,
+                    count: 1,
+                    timestamp: Utc::now(),
+                    delivery_id: Some(id.into()),
+                    subscription_key: Some(key.clone()),
+                    context: Some(serde_json::json!({"app": "audio", "items": [{"preview": id}]})),
+                },
+            )
+            .unwrap();
+        };
+        send("first");
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..100 {
+            if executor.contexts.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(executor.contexts.lock().unwrap().len(), 1);
+        send("second");
+        send("second"); // repeated bus delivery must remain one queued run
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(executor.contexts.lock().unwrap().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(dir.join(EVENT_TRIGGER_CONTEXT_FILE)).unwrap()
+            )
+            .unwrap()["items"][0]["preview"],
+            "first"
+        );
+        executor.release.add_permits(1);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), completed.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.data["source_delivery_id"], "first");
+        assert_eq!(first.data["success"], true);
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..100 {
+            if executor.contexts.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(executor.contexts.lock().unwrap().len(), 2);
+        executor.release.add_permits(1);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), completed.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.data["source_delivery_id"], "second");
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        manager.stop_scheduler().await;
+        assert_eq!(executor.contexts.lock().unwrap().len(), 2);
+        assert_eq!(
+            executor.contexts.lock().unwrap()[1]["items"][0]["preview"],
+            "second"
+        );
+    }
+
+    #[test]
+    fn source_events_validate_subscription_and_fail_closed_without_context() {
+        let src: SourceTrigger = serde_json::from_value(
+            serde_json::json!({"app": "audio", "filter": {"phrases": "start"}}),
+        )
+        .unwrap();
+        let trigger: TriggerConfig =
+            serde_json::from_value(serde_json::json!({"sources": [src]})).unwrap();
+        let data = serde_json::json!({"subscription_key": connection_triggers::subscription_key("jobs", &src), "delivery_id": "one"});
+        let pending = PendingEvent::targeted("connection_trigger".into(), data.clone(), "jobs");
+        assert!(pending_matches_trigger(&pending, "jobs", &trigger));
+        assert!(!pending_matches_trigger(&pending, "another-task", &trigger));
+        assert!(!pending_matches_trigger(
+            &pending,
+            "jobs",
+            &serde_json::from_value(serde_json::json!({})).unwrap()
+        ));
+        let event = EventTrigger {
+            name: "connection_trigger".into(),
+            key: Some("one".into()),
+            dedupe_key: None,
+            target_pipe: Some("jobs".into()),
+            data,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!write_event_trigger_context(dir.path(), &event));
+        assert!(!dir.path().join(EVENT_TRIGGER_CONTEXT_FILE).exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_event_cannot_replace_a_manual_start_or_its_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        let name = "manual-scheduled-admission";
+        let dir = pipes_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pipe.md"), "---\nschedule: manual\nagent: mock\nmodel: test\ntrigger:\n  sources:\n    - app: audio\n      kind: phrase\n      filter:\n        phrases: start job\n---\nSave the matched transcript.\n").unwrap();
+        let src: SourceTrigger = serde_json::from_value(serde_json::json!({"app": "audio", "kind": "phrase", "filter": {"phrases": "start job"}})).unwrap();
+        let key = connection_triggers::subscription_key(name, &src);
+        let initial_context = r#"{"items":[{"preview":"manual"}]}"#;
+        std::fs::write(dir.join(EVENT_TRIGGER_CONTEXT_FILE), initial_context).unwrap();
+        let executor = Arc::new(SourceContextExecutor {
+            contexts: std::sync::Mutex::new(Vec::new()),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".into(), executor.clone());
+        let mut manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        manager.start_scheduler().await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        manager.start_pipe_background(name).await.unwrap();
+        for _ in 0..100 {
+            if executor.contexts.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(executor.contexts.lock().unwrap().len(), 1);
+        // No child PID yet. This is the native startup window that the old
+        // scheduler mistook for a stale PID file and an available task.
+        let manual_stop = manager.running.lock().await[name].stop_requested.clone();
+        screenpipe_events::send_event(
+            "connection_trigger",
+            screenpipe_events::ConnectionTriggerEvent {
+                pipe: name.into(),
+                app: "audio".into(),
+                kind: "phrase".into(),
+                path: None,
+                count: 1,
+                timestamp: Utc::now(),
+                delivery_id: Some("deferred".into()),
+                subscription_key: Some(key),
+                context: Some(serde_json::json!({"app":"audio","items":[{"preview":"scheduled"}]})),
+            },
+        )
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            executor.contexts.lock().unwrap().len(),
+            1,
+            "scheduler launched a duplicate agent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(EVENT_TRIGGER_CONTEXT_FILE)).unwrap(),
+            initial_context
+        );
+        assert!(Arc::ptr_eq(
+            &manager.running.lock().await[name].stop_requested,
+            &manual_stop
+        ));
+        assert_eq!(
+            manager.stop_pipe(name).await.unwrap(),
+            PipeStopStatus::StopPending
+        );
+        assert!(manual_stop.load(Ordering::SeqCst));
+        executor.release.add_permits(1);
+        for _ in 0..100 {
+            if !manager.running.lock().await.contains_key(name) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..100 {
+            if executor.contexts.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            executor.contexts.lock().unwrap().len(),
+            2,
+            "deferred event was lost"
+        );
+        executor.release.add_permits(1);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        manager.stop_scheduler().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_scheduler_reservation_blocks_a_racing_manual_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        let event = "test_queued_manual_admission";
+        // Fill all event permits, leaving the last task queued with no PID.
+        // The old scheduler reserved only after acquiring a permit, so a
+        // manual run could start and later have its handle overwritten.
+        for i in 0..=EVENT_TRIGGERED_CONCURRENCY_LIMIT {
+            let dir = pipes_dir.join(format!("queued-admission-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pipe.md"), format!("---\nschedule: manual\nagent: mock\nmodel: test\ntrigger:\n  events:\n    - {event}\n---\nCheck the source.\n")).unwrap();
+            std::fs::write(
+                dir.join(EVENT_TRIGGER_CONTEXT_FILE),
+                r#"{"items":[{"preview":"original"}]}"#,
+            )
+            .unwrap();
+        }
+        let executor = Arc::new(SourceContextExecutor {
+            contexts: std::sync::Mutex::new(Vec::new()),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".into(), executor.clone());
+        let mut manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        manager.start_scheduler().await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        screenpipe_events::send_event("workflow_event", serde_json::json!({"event_type":event}))
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            executor.contexts.lock().unwrap().len(),
+            EVENT_TRIGGERED_CONCURRENCY_LIMIT
+        );
+        let queued = format!("queued-admission-{}", EVENT_TRIGGERED_CONCURRENCY_LIMIT);
+        assert!(
+            manager.start_pipe_background(&queued).await.is_err(),
+            "manual run stole the scheduled task's reserved slot"
+        );
+        executor
+            .release
+            .add_permits(EVENT_TRIGGERED_CONCURRENCY_LIMIT + 1);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            executor.contexts.lock().unwrap().len(),
+            EVENT_TRIGGERED_CONCURRENCY_LIMIT + 1
+        );
+        manager.stop_scheduler().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_completion_starts_dependent_task_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        for (name, trigger) in [
+            ("manual-chain-source", ""),
+            (
+                "manual-chain-dependent",
+                "trigger:\n  events:\n    - pipe_completed:manual-chain-source\n",
+            ),
+            (
+                "manual-chain-disabled",
+                "enabled: false\ntrigger:\n  events:\n    - pipe_completed:manual-chain-source\n",
+            ),
+        ] {
+            let dir = pipes_dir.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("pipe.md"),
+                format!(
+                "---\nschedule: manual\nagent: mock\nmodel: test\n{trigger}---\nSave the result.\n"
+            ),
+            )
+            .unwrap();
+        }
+        let executor = Arc::new(SequencedExecutor {
+            outputs: std::sync::Mutex::new(VecDeque::from([
+                AgentOutput {
+                    stdout: "source saved".into(),
+                    stderr: String::new(),
+                    success: true,
+                    pid: None,
+                },
+                AgentOutput {
+                    stdout: "dependent saved".into(),
+                    stderr: String::new(),
+                    success: true,
+                    pid: None,
+                },
+            ])),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".into(), executor.clone());
+        let mut manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        let mut events = screenpipe_events::subscribe_to_event::<serde_json::Value>(
+            "pipe_completed:manual-chain-source",
+        );
+        manager.start_scheduler().await.unwrap();
+        // Let the scheduler subscribe before the manual API entry point runs.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        manager
+            .start_pipe_background("manual-chain-source")
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+            .await
+            .expect("manual completion event missing")
+            .unwrap();
+        assert_eq!(event.data["success"], true);
+        assert!(
+            manager.logs.lock().await["manual-chain-source"]
+                .back()
+                .unwrap()
+                .success
+        );
+        assert!(!manager
+            .running
+            .lock()
+            .await
+            .contains_key("manual-chain-source"));
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..100 {
+            if manager
+                .logs
+                .lock()
+                .await
+                .get("manual-chain-dependent")
+                .and_then(|logs| logs.back())
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.stop_scheduler().await;
+        assert!(
+            manager.logs.lock().await["manual-chain-dependent"]
+                .back()
+                .unwrap()
+                .success
+        );
+        assert_eq!(executor.attempts.lock().unwrap().len(), 2);
+        assert!(
+            events.next().now_or_never().is_none(),
+            "duplicate source completion"
+        );
+        assert!(!manager
+            .logs
+            .lock()
+            .await
+            .contains_key("manual-chain-disabled"));
+    }
+
+    #[tokio::test]
+    async fn manual_completion_reports_failure_after_persisting_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        let dir = pipes_dir.join("manual-failed-event");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pipe.md"),
+            "---\nschedule: manual\nagent: mock\nmodel: test\n---\nDo work.\n",
+        )
+        .unwrap();
+        let executor = Arc::new(SequencedExecutor {
+            outputs: std::sync::Mutex::new(VecDeque::from([AgentOutput {
+                stdout: String::new(),
+                stderr: "missing output".into(),
+                success: false,
+                pid: None,
+            }])),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".into(), executor);
+        let manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        let mut events = screenpipe_events::subscribe_to_event::<serde_json::Value>(
+            "pipe_completed:manual-failed-event",
+        );
+        manager
+            .start_pipe_background("manual-failed-event")
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.data["success"], false);
+        assert!(
+            !manager.logs.lock().await["manual-failed-event"]
+                .back()
+                .unwrap()
+                .success
+        );
+    }
+
+    #[test]
+    fn cloud_scheduler_settings_preserve_task_and_provider_for_every_runner() {
+        for provider in ["codex", "claude", "cursor"] {
+            let source = format!(
+                "---\nschedule: daily\ncloud_agent:\n  provider: {provider}\n  send_screenpipe_context: false\n---\nSummarize my day"
+            );
+            let (config, task) = parse_frontmatter(&source).unwrap();
+            let settings = cloud_agent_run_settings(&config, &task).unwrap();
+
+            assert_eq!(settings.provider, provider);
+            assert_eq!(settings.model, "provider-default");
+            assert_eq!(settings.executor_config["task_instructions"], task);
+            assert_eq!(
+                settings.executor_config["cloud_agent"]["provider"],
+                provider
+            );
+            assert_eq!(
+                settings.executor_config["cloud_agent"]["send_screenpipe_context"],
+                false
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_scheduler_rejects_missing_runner_configuration() {
+        let (config, task) =
+            parse_frontmatter("---\nschedule: daily\n---\nSummarize my day").unwrap();
+
+        assert_eq!(
+            cloud_agent_run_settings(&config, &task)
+                .err()
+                .unwrap()
+                .to_string(),
+            "cloud_agent config is missing"
+        );
+    }
 
     // -- scheduler lifecycle tests ------------------------------------------
 
@@ -8153,6 +10092,61 @@ mod tests {
             event_dedupe_key("workflow_event", &data).as_deref(),
             Some("abc-123")
         );
+    }
+
+    /// One event matching N busy pipes is deferred once per pipe; without
+    /// deduping, the copies double every scheduler tick until the pipes free
+    /// up and hundreds of duplicates drain through coalescing at once.
+    #[test]
+    fn deferred_duplicates_collapse_to_one_per_target() {
+        let data = serde_json::json!({
+            "meeting_id": 42,
+            "meeting_end": "2026-08-05T16:51:37.000Z"
+        });
+        let broadcast = || PendingEvent::broadcast("meeting_ended".to_string(), data.clone());
+        let targeted =
+            || PendingEvent::targeted("meeting_ended".to_string(), data.clone(), "meeting-summary");
+        let new_generation = PendingEvent::broadcast(
+            "meeting_ended".to_string(),
+            serde_json::json!({
+                "meeting_id": 42,
+                "meeting_end": "2026-08-05T17:00:00.000Z"
+            }),
+        );
+
+        let deduped = dedupe_pending_events(vec![
+            broadcast(),
+            broadcast(),
+            broadcast(),
+            targeted(),
+            targeted(),
+            new_generation,
+        ]);
+
+        // one broadcast, one targeted, one distinct newer generation.
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].target_pipe, None);
+        assert_eq!(deduped[1].target_pipe.as_deref(), Some("meeting-summary"));
+        assert_eq!(
+            deduped[2].data.get("meeting_end").and_then(|v| v.as_str()),
+            Some("2026-08-05T17:00:00.000Z")
+        );
+    }
+
+    /// Trivial meetings (marked by the emitter) skip event-triggered pipes;
+    /// an absent or non-boolean flag never suppresses anything.
+    #[test]
+    fn skip_pipes_flag_gates_only_when_explicitly_true() {
+        assert!(event_skips_pipes(&serde_json::json!({
+            "meeting_id": 42, "skip_pipes": true
+        })));
+        assert!(!event_skips_pipes(&serde_json::json!({
+            "meeting_id": 42, "skip_pipes": false
+        })));
+        assert!(!event_skips_pipes(&serde_json::json!({ "meeting_id": 42 })));
+        assert!(!event_skips_pipes(&serde_json::json!({
+            "meeting_id": 42, "skip_pipes": "yes"
+        })));
     }
 
     #[test]
@@ -8339,12 +10333,375 @@ mod tests {
     }
 
     #[test]
+    fn portable_pipe_identifier_is_exactly_one_safe_component() {
+        for invalid in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../victim",
+            "nested/pipe",
+            "nested\\pipe",
+            "C:relative",
+        ] {
+            assert!(
+                validate_pipe_identifier(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+
+        for valid in ["daily-recap", "release..notes", "pipe.v2"] {
+            assert!(
+                validate_pipe_identifier(valid).is_ok(),
+                "{valid:?} should be accepted"
+            );
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PipeMutation {
+        Delete,
+        StoreInstall,
+        StoreUpdate,
+        ClearHistory,
+        Enable,
+        UpdateConfig,
+        Run,
+        StartBackground,
+    }
+
+    async fn invoke_pipe_mutation(
+        manager: &PipeManager,
+        mutation: PipeMutation,
+        identifier: &str,
+    ) -> Result<()> {
+        let source = pipe_source(false, "updated prompt");
+        match mutation {
+            PipeMutation::Delete => manager.delete_pipe(identifier).await,
+            PipeMutation::StoreInstall => manager
+                .install_pipe_from_store(&source, identifier, 1)
+                .await
+                .map(|_| ()),
+            PipeMutation::StoreUpdate => {
+                manager
+                    .update_pipe_from_store(identifier, &source, "store-slug", 2)
+                    .await
+            }
+            PipeMutation::ClearHistory => manager.clear_pipe_history(identifier).await,
+            PipeMutation::Enable => manager.enable_pipe(identifier, false).await,
+            PipeMutation::UpdateConfig => {
+                manager
+                    .update_config(
+                        identifier,
+                        HashMap::from([("prompt_body".to_string(), serde_json::json!("changed"))]),
+                    )
+                    .await
+            }
+            PipeMutation::Run => manager.run_pipe(identifier).await.map(|_| ()),
+            PipeMutation::StartBackground => manager.start_pipe_background(identifier).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_mutations_reject_non_component_identifiers_before_touching_disk() {
+        let mutations = [
+            PipeMutation::Delete,
+            PipeMutation::StoreInstall,
+            PipeMutation::StoreUpdate,
+            PipeMutation::ClearHistory,
+            PipeMutation::Enable,
+            PipeMutation::UpdateConfig,
+            PipeMutation::Run,
+            PipeMutation::StartBackground,
+        ];
+
+        for mutation in mutations {
+            for identifier_kind in [
+                "empty",
+                "whitespace",
+                "dot",
+                "dotdot",
+                "traversal",
+                "forward-separator",
+                "back-separator",
+                "drive-prefix",
+                "absolute",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let pipes_dir = root.path().join("pipes");
+                let victim_dir = root.path().join("victim");
+                std::fs::create_dir_all(&pipes_dir).unwrap();
+                std::fs::create_dir_all(&victim_dir).unwrap();
+                std::fs::write(victim_dir.join("pipe.md"), pipe_source(false, "sentinel")).unwrap();
+                std::fs::write(
+                    victim_dir.join(".screenpipe-acp-sessions.json"),
+                    "history sentinel",
+                )
+                .unwrap();
+
+                let identifier = match identifier_kind {
+                    "empty" => String::new(),
+                    "whitespace" => "   ".to_string(),
+                    "dot" => ".".to_string(),
+                    "dotdot" => "..".to_string(),
+                    "traversal" => "../victim".to_string(),
+                    "forward-separator" => "nested/pipe".to_string(),
+                    "back-separator" => "nested\\pipe".to_string(),
+                    "drive-prefix" => "C:relative".to_string(),
+                    "absolute" => victim_dir.to_string_lossy().into_owned(),
+                    _ => unreachable!(),
+                };
+                let manager = PipeManager::new(pipes_dir, HashMap::new(), None, 0);
+
+                let error = invoke_pipe_mutation(&manager, mutation, &identifier)
+                    .await
+                    .expect_err("non-component pipe identifier must be rejected")
+                    .to_string();
+                assert!(
+                    error.contains("invalid pipe identifier"),
+                    "{mutation:?} returned an untruthful error for {identifier_kind}: {error}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(victim_dir.join("pipe.md")).unwrap(),
+                    pipe_source(false, "sentinel"),
+                    "{mutation:?} changed the outside pipe for {identifier_kind}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(victim_dir.join(".screenpipe-acp-sessions.json"))
+                        .unwrap(),
+                    "history sentinel",
+                    "{mutation:?} changed outside history for {identifier_kind}"
+                );
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = root.path().join("pipes");
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+        let manager = PipeManager::new(pipes_dir.clone(), HashMap::new(), None, 0);
+        let name = "release..notes";
+
+        manager
+            .install_pipe_from_store(&pipe_source(false, "installed"), name, 1)
+            .await
+            .unwrap();
+        manager
+            .update_pipe_from_store(name, &pipe_source(false, "updated"), "store-slug", 2)
+            .await
+            .unwrap();
+        manager.enable_pipe(name, false).await.unwrap();
+        manager
+            .update_config(
+                name,
+                HashMap::from([("prompt_body".to_string(), serde_json::json!("configured"))]),
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            pipes_dir.join(name).join(".screenpipe-acp-sessions.json"),
+            "history",
+        )
+        .unwrap();
+        manager.clear_pipe_history(name).await.unwrap();
+        assert!(!pipes_dir
+            .join(name)
+            .join(".screenpipe-acp-sessions.json")
+            .exists());
+        assert!(
+            std::fs::read_to_string(pipes_dir.join(name).join("pipe.md"))
+                .unwrap()
+                .contains("configured")
+        );
+        manager.delete_pipe(name).await.unwrap();
+        assert!(!pipes_dir.join(name).exists());
+
+        let error = manager
+            .delete_pipe("missing-pipe")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not found"));
+        assert!(!error.contains("invalid pipe identifier"));
+    }
+
+    #[tokio::test]
+    async fn install_pipe_rejects_unportable_derived_identifiers_before_io() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = root.path().join("pipes");
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+        let manager = PipeManager::new(pipes_dir.clone(), HashMap::new(), None, 0);
+
+        for source in [
+            "https://example.invalid/",
+            "https://example.invalid/C:relative.md",
+        ] {
+            let error = manager.install_pipe(source).await.unwrap_err().to_string();
+            assert!(
+                error.contains("invalid pipe identifier"),
+                "{source} returned an untruthful error: {error}"
+            );
+        }
+
+        #[cfg(unix)]
+        for filename in ["C:relative.md", "nested\\pipe.md"] {
+            let source = root.path().join(filename);
+            std::fs::write(&source, pipe_source(false, "source")).unwrap();
+            let error = manager
+                .install_pipe(source.to_str().unwrap())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("invalid pipe identifier"),
+                "{filename} returned an untruthful error: {error}"
+            );
+        }
+
+        assert!(std::fs::read_dir(pipes_dir).unwrap().next().is_none());
+    }
+
+    #[test]
     fn explicitly_installs_only_known_bundled_pipes() {
         let dir = tempfile::tempdir().unwrap();
         assert!(install_bundled_pipe(dir.path(), "time-breakdown").unwrap());
         assert!(dir.path().join("time-breakdown/pipe.md").exists());
         assert!(!install_bundled_pipe(dir.path(), "time-breakdown").unwrap());
         assert!(install_bundled_pipe(dir.path(), "not-a-builtin").is_err());
+    }
+
+    #[test]
+    fn explicit_install_migrates_existing_meeting_speaker_rules_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipe_dir = dir.path().join("meeting-summary");
+        std::fs::create_dir_all(&pipe_dir).unwrap();
+        let bundled = BUNDLED_BUILTIN_PIPES
+            .iter()
+            .find_map(|(name, source)| (*name == "meeting-summary").then_some(*source))
+            .expect("meeting-summary should be bundled");
+        let naming_start = bundled
+            .find("step 2d — give every distinct speaker")
+            .expect("bundled naming step should start");
+        let naming_end = naming_start
+            + bundled[naming_start..]
+                .find("step 3 — write the summary")
+                .expect("bundled naming step should end");
+        let audio_shape = bundled
+            .lines()
+            .find(|line| line.starts_with("  - audio `content`:"))
+            .expect("bundled audio shape should exist");
+        let audio_render = bundled
+            .lines()
+            .find(|line| line.starts_with("  bun -e 'const d=await Bun.file(\"/tmp/audio.json\")"))
+            .expect("bundled audio renderer should exist");
+        let stale = format!(
+            "{}{}{}",
+            &bundled[..naming_start],
+            builtin_migrations::LEGACY_ACTIVE_SPEAKER_ONLY_MEETING_NAMING,
+            &bundled[naming_end..]
+        )
+        .replace(
+            audio_shape,
+            builtin_migrations::LEGACY_DEVICELESS_MEETING_AUDIO_SHAPE,
+        )
+        .replace(
+            audio_render,
+            builtin_migrations::LEGACY_DEVICELESS_MEETING_AUDIO_RENDER,
+        );
+        std::fs::write(pipe_dir.join("pipe.md"), stale).unwrap();
+        std::fs::write(
+            pipe_dir.join("memory.md"),
+            "# memory\n\n## Lessons\n- user note\n",
+        )
+        .unwrap();
+
+        assert!(!install_bundled_pipe(dir.path(), "meeting-summary").unwrap());
+
+        let installed = std::fs::read_to_string(pipe_dir.join("pipe.md")).unwrap();
+        assert!(installed.contains("`device_type` (`Input` or `Output`)"));
+        assert!(installed.contains(r#"id=${c.speaker?.id??"?"}"#));
+        assert!(installed.contains("deterministic call topology"));
+        assert!(installed.contains("`device_type=Input` rows as the local participant"));
+        assert!(installed.contains("never emit an unnamed, blank, `unknown`"));
+        assert!(!installed.contains("leave the speaker unnamed"));
+        assert!(!installed.contains("\n  jq "));
+        assert_eq!(
+            std::fs::read_to_string(pipe_dir.join("memory.md")).unwrap(),
+            "# memory\n\n## Lessons\n- user note\n"
+        );
+
+        // A second install is a no-op, proving startup-safe idempotence.
+        let once = installed.clone();
+        assert!(!install_bundled_pipe(dir.path(), "meeting-summary").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(pipe_dir.join("pipe.md")).unwrap(),
+            once
+        );
+    }
+
+    #[test]
+    fn speaker_reconciliation_bundle_is_preview_only_by_default() {
+        let source = BUNDLED_BUILTIN_PIPES
+            .iter()
+            .find_map(|(name, source)| (*name == "speaker-reconciliation").then_some(*source))
+            .expect("speaker reconciliation should be bundled");
+        let (config, body) = parse_frontmatter(source).expect("pipe frontmatter should parse");
+
+        assert!(!config.enabled);
+        assert_eq!(
+            config.config.get("template"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            config.preset,
+            vec!["screenpipe-cloud".to_string(), "*".to_string()]
+        );
+        assert!(event_runs_are_read_only(&config));
+        assert!(config
+            .trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.events.iter().any(|event| event == "meeting_ended")));
+        assert!(body.contains("Automatic event runs are always preview-only"));
+        assert!(body.contains("APPROVE SPEAKER <numeric_id> AS <display name> FROM <proposal_id>"));
+        assert!(body.contains("GET /meetings/<id>/transcript"));
+        assert!(body.contains("no more than 5 minutes before this run began"));
+        assert!(body.contains("duration of at least 2\n   minutes"));
+        assert!(body.contains("Meeting-local mappings"));
+        assert!(body.contains("must never\nemit an `APPROVE SPEAKER` command"));
+        assert!(body.contains("Never call `/feedback`, send a\nnotification, or call port 11435"));
+        assert!(body.contains("content_type=accessibility&on_screen=true"));
+        assert!(body.contains("content_type=parsed"));
+        assert!(body.contains("Never call `content_type=ocr`"));
+        let permissions = permissions::PipePermissions::from_config(&config);
+        assert!(permissions.is_endpoint_allowed("GET", "/meetings/42"));
+        assert!(permissions.is_endpoint_allowed("GET", "/meetings/42/transcript"));
+        assert!(permissions.is_endpoint_allowed("GET", "/search"));
+        assert!(permissions.is_endpoint_allowed("POST", "/speakers/update"));
+        assert!(permissions.is_content_type_allowed("audio"));
+        assert!(permissions.is_content_type_allowed("accessibility"));
+        assert!(permissions.is_content_type_allowed("parsed"));
+        assert!(!permissions.is_content_type_allowed("ocr"));
+        assert!(!permissions.is_content_type_allowed("input"));
+        assert!(!permissions.is_endpoint_allowed("POST", "/speakers/reassign"));
+        assert!(!permissions.is_endpoint_allowed("POST", "/speakers/merge"));
+        assert!(!permissions.is_endpoint_allowed("POST", "/raw_sql"));
+        assert!(!permissions.is_endpoint_allowed("PUT", "/meetings/42"));
+        let mut event_permissions = permissions.clone();
+        restrict_api_permissions_to_read_only(&mut event_permissions);
+        assert!(event_permissions.is_endpoint_allowed("GET", "/search"));
+        assert!(!event_permissions.is_endpoint_allowed("POST", "/speakers/update"));
+        assert!(source.contains("Api(POST /speakers/update)"));
+        for forbidden in [
+            "Api(POST /speakers/reassign)",
+            "Api(POST /speakers/undo-reassign)",
+            "Api(POST /speakers/merge)",
+            "Api(POST /speakers/delete)",
+            "Api(POST /raw_sql)",
+            "Api(GET /feedback)",
+            "Api(POST /notify)",
+            "Content(input, ocr)",
+        ] {
+            assert!(source.contains(forbidden), "missing deny rule: {forbidden}");
+        }
     }
 
     #[test]
@@ -8426,6 +10783,283 @@ mod tests {
         assert!(std::fs::read_to_string(pipes_dir.join("first/pipe.md"))
             .unwrap()
             .contains("updated first"));
+    }
+
+    #[tokio::test]
+    async fn bundled_admission_preserves_completed_tasks_across_reload_and_restart() {
+        let installed = tempfile::tempdir().unwrap();
+        let pipes_dir = installed.path().join("pipes");
+        let mut manager = PipeManager::new(pipes_dir.clone(), HashMap::new(), None, 0);
+        manager.set_max_non_template_pipes(Some(2));
+        manager.install_builtin_pipes().unwrap();
+        manager
+            .install_pipe_from_store(&pipe_source(false, "remember work"), "digital-clone", 1)
+            .await
+            .unwrap();
+        manager
+            .update_config(
+                "speaker-reconciliation",
+                HashMap::from([
+                    ("agent".into(), serde_json::json!("pi")),
+                    ("preset".into(), serde_json::json!(["chosen-model"])),
+                ]),
+            )
+            .await
+            .unwrap();
+        manager
+            .enable_pipe("speaker-reconciliation", true)
+            .await
+            .unwrap();
+
+        let snapshot = || {
+            [
+                "digital-clone/pipe.md",
+                "speaker-reconciliation/pipe.md",
+                "skill-learning/pipe.md",
+                "skill-learning/pipe.md.bak",
+                LOCAL_OVERRIDES_FILE,
+                LOCAL_RUN_DESTINATIONS_FILE,
+            ]
+            .map(|path| std::fs::read(pipes_dir.join(path)).ok())
+        };
+        let before = snapshot();
+        for updates in [
+            HashMap::from([
+                ("enabled".into(), serde_json::json!(true)),
+                ("preset".into(), serde_json::json!(["chosen-model"])),
+                (
+                    "run_in".into(),
+                    serde_json::json!({ "mode": "existing_chat", "chat_id": "local-chat" }),
+                ),
+            ]),
+            HashMap::from([(
+                "raw_content".into(),
+                serde_json::json!(pipe_source(false, "edited skill")),
+            )]),
+        ] {
+            let error = manager
+                .update_config("skill-learning", updates)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().starts_with(PIPE_LIMIT_ERROR_CODE));
+            assert_eq!(snapshot(), before);
+        }
+        let error = manager
+            .enable_pipe("skill-learning", true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with(PIPE_LIMIT_ERROR_CODE));
+        assert_eq!(snapshot(), before);
+
+        let error = manager
+            .update_pipe_from_store(
+                "skill-learning",
+                &pipe_source(false, "updated skill"),
+                "skill-learning",
+                2,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with(PIPE_LIMIT_ERROR_CODE));
+        assert_eq!(snapshot(), before);
+        // Reinstalling under a bundled name cannot bypass adoption admission.
+        let error = manager
+            .install_pipe_from_store(&pipe_source(false, "edited skill"), "skill-learning", 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with(PIPE_LIMIT_ERROR_CODE));
+        assert_eq!(snapshot(), before);
+
+        manager.reload_pipes().await.unwrap();
+        assert!(
+            manager
+                .get_pipe("speaker-reconciliation")
+                .await
+                .unwrap()
+                .config
+                .enabled
+        );
+        let mut restarted = PipeManager::new(pipes_dir.clone(), HashMap::new(), None, 0);
+        restarted.set_max_non_template_pipes(Some(2));
+        restarted.load_pipes().await.unwrap();
+        assert!(
+            restarted
+                .get_pipe("digital-clone")
+                .await
+                .unwrap()
+                .config
+                .enabled
+        );
+        let speaker = restarted.get_pipe("speaker-reconciliation").await.unwrap();
+        assert!(speaker.config.enabled);
+        assert_eq!(speaker.config.preset, vec!["chosen-model"]);
+        assert!(
+            restarted
+                .get_pipe("skill-learning")
+                .await
+                .unwrap()
+                .is_bundled_builtin
+        );
+        assert_eq!(snapshot(), before);
+
+        // Existing counted tasks remain editable, including while disabled.
+        restarted
+            .enable_pipe("speaker-reconciliation", false)
+            .await
+            .unwrap();
+        restarted
+            .update_config(
+                "speaker-reconciliation",
+                HashMap::from([("preset".into(), serde_json::json!(["replacement-model"]))]),
+            )
+            .await
+            .unwrap();
+        let error = restarted
+            .enable_pipe("skill-learning", true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with(PIPE_LIMIT_ERROR_CODE));
+        restarted
+            .enable_pipe("speaker-reconciliation", true)
+            .await
+            .unwrap();
+        restarted
+            .update_config(
+                "speaker-reconciliation",
+                HashMap::from([(
+                    "raw_content".into(),
+                    serde_json::json!(pipe_source(false, "edited counted task")),
+                )]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restarted.installed_user_pipe_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn bundled_admission_keeps_pause_durable_without_consuming_a_slot() {
+        for use_config in [false, true] {
+            let installed = tempfile::tempdir().unwrap();
+            let pipes_dir = installed.path().join("pipes");
+            let mut manager = PipeManager::new(pipes_dir.clone(), HashMap::new(), None, 0);
+            manager.set_max_non_template_pipes(Some(2));
+            manager.install_builtin_pipes().unwrap();
+            for name in ["digital-clone", "speaker-reconciliation"] {
+                manager
+                    .install_pipe_from_store(&pipe_source(false, "completed task"), name, 1)
+                    .await
+                    .unwrap();
+            }
+            let paths = ["digital-clone", "speaker-reconciliation", "meeting-summary"];
+            let snapshot =
+                || paths.map(|name| std::fs::read(pipes_dir.join(name).join("pipe.md")).unwrap());
+            let before = snapshot();
+            assert!(
+                manager
+                    .get_pipe("meeting-summary")
+                    .await
+                    .unwrap()
+                    .config
+                    .enabled
+            );
+
+            // A failed override write must not report a successful pause.
+            let override_tmp = pipes_dir.join(".local-overrides.json.tmp");
+            std::fs::create_dir(&override_tmp).unwrap();
+            assert!(manager.enable_pipe("meeting-summary", false).await.is_err());
+            assert!(
+                manager
+                    .get_pipe("meeting-summary")
+                    .await
+                    .unwrap()
+                    .config
+                    .enabled
+            );
+            assert_eq!(snapshot(), before);
+            std::fs::remove_dir(override_tmp).unwrap();
+
+            if use_config {
+                manager
+                    .update_config(
+                        "meeting-summary",
+                        HashMap::from([("enabled".into(), serde_json::json!(false))]),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                manager.enable_pipe("meeting-summary", false).await.unwrap();
+            }
+            assert!(
+                !manager
+                    .get_pipe("meeting-summary")
+                    .await
+                    .unwrap()
+                    .config
+                    .enabled
+            );
+            assert_eq!(
+                load_local_overrides(&pipes_dir).get("meeting-summary"),
+                Some(&false)
+            );
+            manager.reload_pipes().await.unwrap();
+            assert!(
+                !manager
+                    .get_pipe("meeting-summary")
+                    .await
+                    .unwrap()
+                    .config
+                    .enabled
+            );
+            let mut restarted = PipeManager::new(pipes_dir.clone(), HashMap::new(), None, 0);
+            restarted.set_max_non_template_pipes(Some(2));
+            restarted.load_pipes().await.unwrap();
+            assert!(
+                !restarted
+                    .get_pipe("meeting-summary")
+                    .await
+                    .unwrap()
+                    .config
+                    .enabled
+            );
+            for name in ["digital-clone", "speaker-reconciliation"] {
+                assert!(restarted.get_pipe(name).await.unwrap().config.enabled);
+            }
+            assert_eq!(restarted.installed_user_pipe_count(), 2);
+            assert_eq!(snapshot(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_admission_keeps_exact_assets_exempt_and_paid_tasks_unlimited() {
+        let installed = tempfile::tempdir().unwrap();
+        let pipes_dir = installed.path().join("pipes");
+        let mut manager = PipeManager::new(pipes_dir, HashMap::new(), None, 0);
+        manager.set_max_non_template_pipes(Some(0));
+        manager.install_builtin_pipes().unwrap();
+        manager.load_pipes().await.unwrap();
+        let pristine = manager
+            .get_pipe("skill-learning")
+            .await
+            .unwrap()
+            .raw_content;
+        manager
+            .update_config(
+                "skill-learning",
+                HashMap::from([("raw_content".into(), serde_json::json!(pristine))]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.installed_user_pipe_count(), 0);
+
+        manager.set_max_non_template_pipes(None);
+        for name in ["speaker-reconciliation", "skill-learning", "day-recap"] {
+            manager.enable_pipe(name, true).await.unwrap();
+        }
+        manager.load_pipes().await.unwrap();
+        assert_eq!(manager.installed_user_pipe_count(), 3);
+        for name in ["speaker-reconciliation", "skill-learning", "day-recap"] {
+            assert!(manager.get_pipe(name).await.unwrap().config.enabled);
+        }
     }
 
     #[tokio::test]
@@ -8880,6 +11514,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_notification_covers_pending_and_waiting_stops() {
+        for stop_first in [true, false] {
+            let handle = ExecutionHandle::new(Arc::new(std::sync::atomic::AtomicU32::new(0)));
+            if stop_first {
+                handle.request_stop();
+            }
+            let waiter = handle.clone();
+            let waiting = tokio::spawn(async move { waiter.wait_for_stop().await });
+            tokio::task::yield_now().await;
+            if !stop_first {
+                assert!(!waiting.is_finished());
+                handle.request_stop();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("stop notification was lost")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_scheduled_queue_drains_without_launching_or_waiting_for_active_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        for index in 0..7 {
+            let dir = pipes_dir.join(format!("queued-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("pipe.md"),
+                "---\nschedule: every 1h\nagent: mock\nmodel: test\n---\nTest queued cancellation.\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join(EVENT_TRIGGER_CONTEXT_FILE), "{\"items\":[]}").unwrap();
+        }
+        let executor = Arc::new(SourceContextExecutor {
+            contexts: std::sync::Mutex::new(Vec::new()),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".into(), executor.clone());
+        let mut manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        manager.start_scheduler().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while manager.running.lock().await.len() != 7
+                || executor.contexts.lock().unwrap().len() != 1
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("one active run and six queued runs");
+        let queued: Vec<_> = manager
+            .running
+            .lock()
+            .await
+            .iter()
+            .filter(|(name, _)| name.as_str() != "queued-0")
+            .map(|(name, handle)| (name.clone(), handle.clone()))
+            .collect();
+        let mut completed =
+            screenpipe_events::subscribe_to_event::<serde_json::Value>("pipe_completed:queued-1");
+        for (name, _) in &queued {
+            assert_eq!(
+                manager.stop_pipe(name).await.unwrap(),
+                PipeStopStatus::StopPending
+            );
+        }
+        // The first executor deliberately retains its permit. All cancelled
+        // followers must disappear without entering that executor at all.
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while manager.running.lock().await.len() != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        manager.stop_scheduler().await;
+        executor.release.add_permits(1);
+        assert!(
+            drained.is_ok(),
+            "cancelled queue still waits for the active run"
+        );
+        assert!(queued.iter().all(|(_, handle)| handle.is_finished()));
+        let cancellation =
+            tokio::time::timeout(std::time::Duration::from_secs(1), completed.next())
+                .await
+                .expect("queued cancellation must notify completion consumers")
+                .unwrap();
+        assert_eq!(cancellation.data["success"], false);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !manager.running.lock().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(executor.contexts.lock().unwrap().len(), 1);
+        // Cancellation must release the shared admission slot for a later,
+        // explicitly requested run after reopening Screenpipe.
+        manager.start_pipe_background("queued-1").await.unwrap();
+        executor.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !manager.running.lock().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(executor.contexts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn stop_pipe_returns_not_running_once_handle_finished() {
         let pm = test_pipe_manager();
         let shared_pid = Arc::new(std::sync::atomic::AtomicU32::new(4242));
@@ -9056,7 +11802,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_presets_are_not_exposed_to_raw_pi_pipes() {
+    fn explicit_acp_presets_resolve_without_changing_the_legacy_default() {
         let temp = tempfile::tempdir().unwrap();
         let pipes_dir = temp.path().join("pipes");
         std::fs::create_dir_all(&pipes_dir).unwrap();
@@ -9069,6 +11815,10 @@ mod tests {
                             "id": "coding-agent",
                             "provider": "acp",
                             "model": "codex-acp",
+                            "acpAgent": {
+                                "id": "codex-acp",
+                                "config": { "model": "gpt-5.6-codex" }
+                            },
                             "defaultPreset": true
                         },
                         {
@@ -9087,10 +11837,17 @@ mod tests {
         let default = resolve_preset(&pipes_dir, "default").expect("raw Pi default fallback");
         assert_eq!(default.provider.as_deref(), Some("screenpipe"));
         assert_eq!(default.model, "auto");
-        assert!(resolve_preset(&pipes_dir, "coding-agent").is_none());
+        let acp = resolve_preset(&pipes_dir, "coding-agent").expect("explicit ACP preset");
+        assert_eq!(acp.provider.as_deref(), Some("acp"));
+        assert_eq!(acp.executor.as_deref(), Some("acp"));
+        assert_eq!(acp.model, "gpt-5.6-codex");
+        assert_eq!(acp.executor_config.as_ref().unwrap()["id"], "codex-acp");
         let raw = resolve_preset(&pipes_dir, "raw-pi").expect("raw Pi preset");
         assert_eq!(raw.provider.as_deref(), Some("screenpipe"));
-        assert_eq!(list_available_preset_ids(&pipes_dir), vec!["raw-pi"]);
+        assert_eq!(
+            list_available_preset_ids(&pipes_dir),
+            vec!["coding-agent", "raw-pi"]
+        );
     }
 
     #[test]
@@ -9218,12 +11975,238 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_limit_does_not_try_fallback_preset() {
-        assert!(!should_try_fallback_preset(Some("daily_limit")));
-        assert!(!should_try_fallback_preset(Some("credits_exhausted")));
-        assert!(!should_try_fallback_preset(Some("quota_exhausted")));
-        assert!(should_try_fallback_preset(Some("rate_limited")));
-        assert!(should_try_fallback_preset(Some("timeout")));
+    fn fallback_advances_after_any_non_safety_failure() {
+        for error in [
+            "daily_limit",
+            "auth_failed",
+            "model_not_allowed",
+            "credits_exhausted",
+            "rate_limited",
+            "timeout",
+        ] {
+            assert!(should_try_fallback_preset(Some(error)));
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_wildcard_falls_back_to_agent_after_daily_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        let pipe_dir = pipes_dir.join("resilient-pipe");
+        std::fs::create_dir_all(&pipe_dir).unwrap();
+        std::fs::write(
+            temp.path().join("store.bin"),
+            serde_json::to_vec(&serde_json::json!({
+                "settings": {
+                    "aiPresets": [
+                        {
+                            "id": "hosted-primary",
+                            "provider": "screenpipe-cloud",
+                            "model": "hosted-auto",
+                            "defaultPreset": true
+                        },
+                        {
+                            "id": "coding-agent",
+                            "provider": "acp",
+                            "model": "codex-acp",
+                            "acpAgent": {
+                                "id": "codex-acp",
+                                "approvalMode": "ask"
+                            }
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            pipe_dir.join("pipe.md"),
+            r#"---
+schedule: manual
+enabled: true
+agent: mock
+preset:
+  - hosted-primary
+  - "*"
+---
+Do resilient work.
+"#,
+        )
+        .unwrap();
+
+        let pipe_md = std::fs::read_to_string(pipe_dir.join("pipe.md")).unwrap();
+        let (config, _) = parse_frontmatter(&pipe_md).unwrap();
+        assert_eq!(
+            effective_preset_ids(&pipes_dir, &config),
+            ["hosted-primary", "coding-agent"]
+        );
+        let mut agent = resolve_preset(&pipes_dir, "coding-agent").unwrap();
+        prepare_preset_for_run(&config, &mut agent);
+        assert_eq!(
+            agent.executor_config.as_ref().unwrap()["approvalMode"],
+            "allow-all"
+        );
+        assert_eq!(
+            resolve_preset(&pipes_dir, "coding-agent")
+                .unwrap()
+                .executor_config
+                .as_ref()
+                .unwrap()["approvalMode"],
+            "ask"
+        );
+        let mut managed = config.clone();
+        managed
+            .config
+            .insert("enterprise_managed".into(), serde_json::json!(true));
+        assert_eq!(
+            effective_preset_ids(&pipes_dir, &managed),
+            ["hosted-primary"]
+        );
+
+        let executor = Arc::new(SequencedExecutor {
+            outputs: std::sync::Mutex::new(VecDeque::from([
+                AgentOutput {
+                    stdout: String::new(),
+                    stderr: "daily_limit_exceeded".to_string(),
+                    success: false,
+                    pid: None,
+                },
+                AgentOutput {
+                    stdout: "fallback completed".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                    pid: None,
+                },
+            ])),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".to_string(), executor.clone());
+        executors.insert("acp".to_string(), executor.clone());
+
+        let manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        let mut events = screenpipe_events::subscribe_to_event::<serde_json::Value>(
+            "pipe_completed:resilient-pipe",
+        );
+        let log = manager
+            .run_pipe_with_trigger("resilient-pipe", "manual")
+            .await
+            .unwrap();
+
+        assert!(log.success);
+        assert_eq!(log.stdout, "fallback completed");
+        let event = events.next().await.unwrap();
+        assert_eq!(event.data["success"], true);
+        assert!(
+            events.next().now_or_never().is_none(),
+            "fallback attempts emitted extra completion events"
+        );
+        assert_eq!(
+            executor.attempts.lock().unwrap().as_slice(),
+            [
+                ("hosted-auto".to_string(), Some("screenpipe".to_string())),
+                ("codex-acp".to_string(), Some("acp".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_skips_stale_preset_and_falls_back_after_hosted_quota() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipes_dir = temp.path().join("pipes");
+        let pipe_dir = pipes_dir.join("fallback-e2e");
+        std::fs::create_dir_all(&pipe_dir).unwrap();
+        std::fs::write(
+            temp.path().join("store.bin"),
+            serde_json::to_vec(&serde_json::json!({
+                "settings": {
+                    "aiPresets": [
+                        {
+                            "id": "hosted-primary",
+                            "provider": "screenpipe-cloud",
+                            "model": "hosted-auto"
+                        },
+                        {
+                            "id": "byok-fallback",
+                            "provider": "openai",
+                            "model": "fallback-model",
+                            "apiKey": "test-only"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let raw = r#"---
+schedule: every 1m
+enabled: true
+agent: mock
+history: false
+preset:
+  - removed-pipes-preset
+  - hosted-primary
+  - byok-fallback
+---
+Run the scheduled task.
+"#;
+        std::fs::write(pipe_dir.join("pipe.md"), raw).unwrap();
+
+        let executor = Arc::new(SequencedExecutor {
+            outputs: std::sync::Mutex::new(VecDeque::from([
+                AgentOutput {
+                    stdout: String::new(),
+                    stderr: r#"429 {"error":{"type":"insufficient_quota","code":"hosted_ai_allowance_exceeded","message":"provider quota or billing limit reached"}}"#.to_string(),
+                    success: false,
+                    pid: None,
+                },
+                AgentOutput {
+                    stdout: "fallback completed".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                    pid: None,
+                },
+            ])),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("mock".to_string(), executor.clone());
+
+        let mut manager = PipeManager::new(pipes_dir, executors, None, 0);
+        manager.load_pipes().await.unwrap();
+        manager.start_scheduler().await.unwrap();
+
+        for _ in 0..100 {
+            let completed = {
+                let logs = manager.logs.lock().await;
+                logs.get("fallback-e2e")
+                    .and_then(|pipe_logs| pipe_logs.back())
+                    .map(|log| log.success)
+                    .unwrap_or(false)
+            };
+            if completed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.stop_scheduler().await;
+
+        let attempts = executor.attempts.lock().unwrap().clone();
+        assert_eq!(
+            attempts,
+            vec![
+                ("hosted-auto".to_string(), Some("screenpipe".to_string())),
+                ("fallback-model".to_string(), Some("openai".to_string())),
+            ]
+        );
+        let logs = manager.logs.lock().await;
+        let pipe_logs = logs.get("fallback-e2e").unwrap();
+        assert_eq!(pipe_logs.len(), 2);
+        assert!(!pipe_logs.front().unwrap().success);
+        assert!(pipe_logs.back().unwrap().success);
     }
 
     #[test]
@@ -9284,6 +12267,76 @@ mod tests {
         assert!(!classified.success);
         assert_eq!(classified.error_type.as_deref(), Some("provider_protocol"));
         assert!(classified.stderr.contains("provider_protocol_error"));
+    }
+
+    #[test]
+    fn successful_exit_without_output_is_not_completed() {
+        let classified = classify_pipe_process_result(true, false, "", "");
+
+        assert_eq!(classified.status, "failed");
+        assert!(!classified.success);
+        assert_eq!(classified.error_type.as_deref(), Some("missing_output"));
+        assert!(classified.stderr.contains("without a verified result"));
+    }
+
+    #[test]
+    fn agent_protocol_requires_a_successful_final_result() {
+        let stdout = [
+            r#"{"type":"agent_start"}"#,
+            r#"{"type":"agent_end","messages":[{"role":"assistant","content":[],"stopReason":"stop"}]}"#,
+        ]
+        .join("\n");
+        let classified = classify_pipe_process_result(true, false, "", &stdout);
+
+        assert_eq!(classified.status, "failed");
+        assert_eq!(classified.error_type.as_deref(), Some("missing_output"));
+    }
+
+    #[test]
+    fn unfinished_agent_text_after_compaction_failure_is_not_success() {
+        for reason in ["toolUse", "aborted", "length", "error"] {
+            let stdout = [
+                serde_json::json!({"type":"compaction_end","errorMessage":"Auto-compaction failed: 502","aborted":false,"willRetry":false}),
+                serde_json::json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":reason,"content":[
+                    {"type":"text","text":"I will check the next source."},
+                    {"type":"toolCall","id":"t1","name":"lookup","arguments":{}}
+                ]}]})
+            ].iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n");
+            let result = classify_pipe_process_result(true, false, "", &stdout);
+            assert_eq!(result.status, "failed", "{reason}");
+            assert_eq!(result.error_type.as_deref(), Some("context_compaction"));
+            assert!(result.error_message.unwrap().contains("saved progress"));
+            let cancelled = classify_pipe_process_result(true, true, "", &stdout);
+            assert_eq!(cancelled.status, "cancelled");
+        }
+    }
+
+    #[test]
+    fn recovered_compaction_failure_does_not_override_final_success() {
+        let stdout = [
+            r#"{"type":"compaction_end","errorMessage":"Auto-compaction failed: 502"}"#,
+            r#"{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Saved the reviewed result."}]}]}"#
+        ].join("\n");
+        let result = classify_pipe_process_result(true, false, "", &stdout);
+        assert!(result.success);
+        assert_eq!(result.status, "completed");
+    }
+
+    #[test]
+    fn successful_agent_result_can_be_completed() {
+        let stdout = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"activity updated"}],"stopReason":"stop"}]}"#;
+        let classified = classify_pipe_process_result(true, false, "", stdout);
+
+        assert_eq!(classified.status, "completed");
+        assert!(classified.success);
+    }
+
+    #[test]
+    fn legacy_text_output_can_still_be_completed() {
+        let classified = classify_pipe_process_result(true, false, "", "output saved");
+
+        assert_eq!(classified.status, "completed");
+        assert!(classified.success);
     }
 
     fn successful_agent_then_compaction_retry_stdout() -> String {
@@ -9425,6 +12478,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn chat_destination_update_stays_local_and_can_be_cleared() {
+        let installed = tempfile::tempdir().unwrap();
+        let pipes_dir = installed.path().join("pipes");
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+
+        let manager = PipeManager::new(pipes_dir.clone(), HashMap::new(), None, 0);
+        manager.install_builtin_pipes().unwrap();
+        manager.load_pipes().await.unwrap();
+        manager
+            .update_config(
+                "day-recap",
+                HashMap::from([(
+                    "run_in".to_string(),
+                    serde_json::json!({
+                        "mode": "existing_chat",
+                        "chat_id": "chat-on-this-device"
+                    }),
+                )]),
+            )
+            .await
+            .unwrap();
+
+        let selected = manager.get_pipe("day-recap").await.unwrap();
+        assert_eq!(
+            selected.config.existing_chat_id().unwrap(),
+            Some("chat-on-this-device")
+        );
+        assert!(!selected.config.history);
+        let synced_source = std::fs::read_to_string(pipes_dir.join("day-recap/pipe.md")).unwrap();
+        assert!(!synced_source.contains("chat-on-this-device"));
+
+        manager
+            .update_config(
+                "day-recap",
+                HashMap::from([("run_in".to_string(), serde_json::Value::Null)]),
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .get_pipe("day-recap")
+            .await
+            .unwrap()
+            .config
+            .run_in
+            .is_none());
+        assert_eq!(load_local_run_destinations(&pipes_dir)["day-recap"], None);
+    }
+
     #[test]
     fn test_parse_frontmatter_trims_preset_ids() {
         let content = "---\nschedule: every 1h\nenabled: true\npreset:\n  - \" primary \"\n  - \"   \"\n  - \"fallback  \"\n---\n\nBody";
@@ -9501,6 +12603,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec!["default".to_string()],
             permissions: PipePermissionsConfig::default(),
@@ -9513,6 +12616,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
@@ -10237,6 +13341,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec!["default".to_string()],
             permissions: PipePermissionsConfig::default(),
@@ -10249,6 +13354,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
@@ -10397,6 +13503,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10409,11 +13516,32 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
         };
         let prompt = render_prompt_with_port(&config, "body text", 3031, None, None);
+        assert!(prompt.contains("Execution budget: 600 seconds."));
+        let timestamp = prompt
+            .lines()
+            .find_map(|line| line.strip_prefix("Run context time: "))
+            .unwrap();
+        let rendered = chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+        assert!(
+            (Utc::now() - rendered.with_timezone(&Utc))
+                .num_seconds()
+                .abs()
+                < 5
+        );
+        let shorter = PipeConfig {
+            timeout: Some(90),
+            ..config.clone()
+        };
+        assert!(
+            render_prompt_with_port(&shorter, "body text", 3031, None, None)
+                .contains("Execution budget: 90 seconds.")
+        );
         // User prompt contains a default lookback and the "Execute" instruction.
         assert!(prompt.contains("Default run lookback:"));
         assert!(prompt.contains("authoritative time range"));
@@ -10425,6 +13553,28 @@ mod tests {
         assert!(sys.contains("http://localhost:3031"));
         assert!(!sys.contains("http://localhost:3030"));
         assert!(sys.contains("body text"));
+
+        // Every workflow stage must resume its pipeline window, including
+        // manual retries after more than the default eight-hour lookback.
+        for task in crate::workflows::pipeline::TASKS {
+            for schedule in ["every 24h", "manual"] {
+                let config = PipeConfig {
+                    name: task.to_string(),
+                    schedule: schedule.to_string(),
+                    ..config.clone()
+                };
+                let prompt = render_prompt_with_port(&config, "body text", 3031, None, None);
+                assert!(prompt.contains("/workflows/pipeline"));
+                assert!(
+                    !prompt.contains("screenpipe-api"),
+                    "task prompt chooses its relevant skill"
+                );
+                assert!(prompt.contains("pipeline.window"));
+                assert!(!prompt.contains("Default run lookback:"));
+                assert!(prompt.contains(&format!("Pipe name: {task}")));
+                assert!(prompt.contains("Timezone:"));
+            }
+        }
     }
 
     #[test]
@@ -10436,6 +13586,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10448,6 +13599,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
@@ -10465,6 +13617,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10477,6 +13630,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
@@ -10503,6 +13657,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10515,6 +13670,7 @@ mod tests {
             source_hash: None,
             subagent: false,
             history: false,
+            run_in: None,
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
@@ -10629,6 +13785,7 @@ mod tests {
                 agent: "pi".to_string(),
                 model: "test".to_string(),
                 provider: None,
+                cloud_agent: None,
                 effort: PipeEffort::Low,
                 preset: vec![],
                 permissions: PipePermissionsConfig::default(),
@@ -10641,6 +13798,7 @@ mod tests {
                 source_hash: None,
                 subagent: false,
                 history: false,
+                run_in: None,
                 privacy_filter: false,
                 artifacts: vec![],
                 trigger: None,
@@ -10807,6 +13965,45 @@ mod tests {
         let content = "---\nschedule: every 1h\n---\n\nPrompt";
         let (config, _) = parse_frontmatter(content).unwrap();
         assert!(!config.history, "history should default to false");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_existing_chat_destination() {
+        let content = "---\nschedule: every 4h\nrun_in:\n  mode: existing_chat\n  chat_id: chat-42\n---\n\nPrompt";
+        let (config, _) = parse_frontmatter(content).unwrap();
+        assert_eq!(config.existing_chat_id().unwrap(), Some("chat-42"));
+        assert!(existing_chat_executor_config(&config).is_some());
+    }
+
+    #[test]
+    fn test_parse_frontmatter_rejects_empty_existing_chat_id() {
+        let content =
+            "---\nschedule: every 4h\nrun_in:\n  mode: existing_chat\n  chat_id: ''\n---\n\nPrompt";
+        assert!(parse_frontmatter(content).is_err());
+    }
+
+    #[test]
+    fn local_chat_destination_can_override_and_clear_synced_config() {
+        let dir = tempfile::tempdir().unwrap();
+        set_local_run_destination(
+            dir.path(),
+            "daily-recap",
+            Some(PipeRunIn {
+                mode: PipeRunInMode::ExistingChat,
+                chat_id: "chat-on-this-device".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            load_local_run_destinations(dir.path())["daily-recap"]
+                .as_ref()
+                .unwrap()
+                .chat_id,
+            "chat-on-this-device"
+        );
+
+        set_local_run_destination(dir.path(), "daily-recap", None).unwrap();
+        assert_eq!(load_local_run_destinations(dir.path())["daily-recap"], None);
     }
 
     #[test]

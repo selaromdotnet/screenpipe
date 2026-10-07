@@ -12,7 +12,12 @@ import { IntegrationIcon } from "@/components/settings/connections-section";
 import { PipeScheduleBuilder } from "./pipe-schedule-builder";
 import type { ScheduleConfig } from "@/lib/utils/schedule-builder";
 import type { AvailableConnection } from "@/lib/pipe-connections";
-import { Plus, Search, Clock, CalendarClock, Workflow, Loader2, Check } from "lucide-react";
+import { Plus, Search, Clock, CalendarClock, Workflow, Loader2, Check, Mic } from "lucide-react";
+import { useGT } from "gt-react";
+import { msg, useMessages } from "gt-react";
+import { localizeDefinitions } from "@/lib/i18n/definitions";
+import { useUiLocale as useLocale } from "@/lib/i18n/provider";
+
 
 export interface TriggerSource {
   app: string;
@@ -41,42 +46,87 @@ interface PickerProps {
   onSaveSchedule: (cfg: ScheduleConfig | null) => void;
 }
 
-// ── shared brand-aligned classes (DESIGN.md: sharp corners, grayscale only) ───
+// ── shared brand-aligned classes (DESIGN.md: compact controls, grayscale only) ───
 
-const INPUT = "w-full h-9 text-xs font-mono bg-background border rounded-none px-2 outline-none focus:border-foreground transition-colors";
+const INPUT = "w-full h-9 text-xs font-mono bg-background border rounded-md px-2 outline-none focus:border-foreground transition-colors";
 const BTN_PRIMARY =
-  "h-9 px-4 text-[11px] font-medium uppercase tracking-wide border border-foreground bg-foreground text-background hover:bg-background hover:text-foreground disabled:opacity-40 disabled:hover:bg-foreground disabled:hover:text-background rounded-none transition-colors";
+  "h-9 px-4 text-[11px] font-medium normal-case tracking-wide border border-foreground bg-foreground text-background hover:bg-background hover:text-foreground disabled:opacity-40 disabled:hover:bg-foreground disabled:hover:text-background rounded-md transition-colors";
 const BTN_SECONDARY =
-  "h-9 px-3 text-[11px] font-medium uppercase tracking-wide border border-foreground bg-background text-foreground hover:bg-foreground hover:text-background rounded-none transition-colors inline-flex items-center gap-1.5";
-const LABEL = "text-[10px] uppercase tracking-wide text-muted-foreground font-medium";
+  "h-9 px-3 text-[11px] font-medium normal-case tracking-wide border border-foreground bg-background text-foreground hover:bg-foreground hover:text-background rounded-md transition-colors inline-flex items-center gap-1.5";
+const LABEL = "text-[10px] normal-case tracking-wide text-muted-foreground font-medium";
 
 // ── left-rail catalog ────────────────────────────────────────────────────────
 
-type OptionId = "schedule" | "meeting_started" | "meeting_ended" | "slack" | "notion" | "obsidian" | "pipe";
+type SourceApp =
+  | "slack"
+  | "notion"
+  | "obsidian"
+  | "imap"
+  | "google-calendar"
+  | "outlook-email"
+  | "github"
+  | "linear"
+  | "todoist";
+
+type OptionId =
+  | "voice_phrase"
+  | "schedule"
+  | "meeting_started"
+  | "meeting_ended"
+  | "email_received"
+  | "email_sent"
+  | "outlook_received"
+  | "outlook_sent"
+  | "google_calendar_started"
+  | "slack"
+  | "notion"
+  | "github_issue"
+  | "github_pull_request"
+  | "linear_issue_created"
+  | "linear_issue_assigned"
+  | "linear_issue_status_changed"
+  | "todoist_task"
+  | "obsidian"
+  | "pipe";
 
 interface Option {
   id: OptionId;
   group: string;
   label: string;
   sub: string;
-  app?: "slack" | "notion" | "obsidian";
+  app?: SourceApp;
+  icon?: string;
+  kind?: string;
 }
 
 const OPTIONS: Option[] = [
   // "cron" is implementation vocabulary, not the user's — the picker offers
   // plain cadences and keeps the raw expression as an advanced escape hatch.
-  { id: "schedule", group: "recurring", label: "on a schedule", sub: "hourly, daily, every N minutes" },
-  { id: "meeting_started", group: "meetings", label: "meeting starts", sub: "a call is detected" },
-  { id: "meeting_ended", group: "meetings", label: "meeting ends", sub: "a call wraps up" },
-  { id: "slack", group: "slack", label: "new message", sub: "in a channel you pick", app: "slack" },
-  { id: "notion", group: "notion", label: "page created or edited", sub: "workspace or a database", app: "notion" },
-  { id: "obsidian", group: "obsidian", label: "new note", sub: "in a vault folder", app: "obsidian" },
-  { id: "pipe", group: "pipes", label: "after a scheduled task finishes", sub: "chain off another scheduled task" },
+  { id: "schedule", group: "recurring", label: msg("On a schedule", {}), sub: msg("hourly, daily, every N minutes", {}) },
+  { id: "voice_phrase", group: "voice", label: msg("Spoken phrase", {}), sub: msg("when you say a word or phrase", {}) },
+  { id: "meeting_started", group: "meetings", label: msg("Meeting starts", {}), sub: msg("a call is detected", {}) },
+  { id: "meeting_ended", group: "meetings", label: msg("Meeting ends", {}), sub: msg("a call wraps up", {}) },
+  { id: "email_received", group: "email", label: msg("New email", {}), sub: msg("Gmail or any IMAP inbox", {}), app: "imap", icon: "gmail", kind: "message" },
+  { id: "email_sent", group: "email", label: msg("Email sent", {}), sub: msg("Gmail or any IMAP sent folder", {}), app: "imap", icon: "gmail", kind: "sent_message" },
+  { id: "outlook_received", group: "email", label: msg("New Outlook email", {}), sub: msg("in your inbox", {}), app: "outlook-email", kind: "message" },
+  { id: "outlook_sent", group: "email", label: msg("Outlook email sent", {}), sub: msg("from your sent items", {}), app: "outlook-email", kind: "sent_message" },
+  { id: "google_calendar_started", group: "calendar", label: msg("Calendar event starts", {}), sub: msg("a timed Google Calendar event", {}), app: "google-calendar", kind: "event_started" },
+  { id: "slack", group: "slack", label: msg("New message", {}), sub: msg("in a channel you pick", {}), app: "slack" },
+  { id: "notion", group: "notion", label: msg("Page created or edited", {}), sub: msg("workspace or a database", {}), app: "notion" },
+  { id: "github_issue", group: "github", label: msg("New issue", {}), sub: msg("in a repository you pick", {}), app: "github", kind: "issue" },
+  { id: "github_pull_request", group: "github", label: msg("New pull request", {}), sub: msg("in a repository you pick", {}), app: "github", kind: "pull_request" },
+  { id: "linear_issue_created", group: "linear", label: msg("New Linear issue", {}), sub: msg("in a team you pick", {}), app: "linear", kind: "issue_created" },
+  { id: "linear_issue_assigned", group: "linear", label: msg("Linear issue assigned to me", {}), sub: msg("in a team you pick", {}), app: "linear", kind: "issue_assigned" },
+  { id: "linear_issue_status_changed", group: "linear", label: msg("Linear issue status changed", {}), sub: msg("in a team you pick", {}), app: "linear", kind: "issue_status_changed" },
+  { id: "todoist_task", group: "todoist", label: msg("New task", {}), sub: msg("added to Todoist", {}), app: "todoist", kind: "task" },
+  { id: "obsidian", group: "obsidian", label: msg("New note", {}), sub: msg("in a vault folder", {}), app: "obsidian" },
+  { id: "pipe", group: "pipes", label: msg("After a scheduled task finishes", {}), sub: msg("chain off another scheduled task", {}) },
 ];
-const GROUP_ORDER = ["recurring", "meetings", "slack", "notion", "obsidian", "pipes"];
+const GROUP_ORDER = ["recurring", "voice", "meetings", "email", "calendar", "slack", "notion", "github", "linear", "todoist", "obsidian", "pipes"];
 
 function optionIcon(o: Option) {
-  if (o.app) return <IntegrationIcon icon={o.app} className="w-4 h-4 flex items-center justify-center" fallbackClassName="h-4 w-4 text-muted-foreground" />;
+  if (o.app) return <IntegrationIcon icon={o.icon || o.app} className="w-4 h-4 flex items-center justify-center" fallbackClassName="h-4 w-4 text-muted-foreground" />;
+  if (o.id === "voice_phrase") return <Mic className="h-4 w-4 text-muted-foreground" />;
   if (o.id === "schedule") return <Clock className="h-4 w-4 text-muted-foreground" />;
   if (o.id === "pipe") return <Workflow className="h-4 w-4 text-muted-foreground" />;
   return <CalendarClock className="h-4 w-4 text-muted-foreground" />;
@@ -85,22 +135,38 @@ function optionIcon(o: Option) {
 // ── chip labels ──────────────────────────────────────────────────────────────
 
 function eventLabel(e: string): string {
-  if (e === "meeting_started") return "when a meeting starts";
-  if (e === "meeting_ended") return "when a meeting ends";
-  if (e.startsWith("pipe_completed:")) return `after ${e.slice(15)} finishes`;
+  if (e === "meeting_started") return "When a meeting starts";
+  if (e === "meeting_ended") return "When a meeting ends";
+  if (e.startsWith("pipe_completed:")) return `After ${e.slice(15)} finishes`;
   return e.replace(/_/g, " ");
 }
 function sourceLabel(s: TriggerSource): string {
+  if (s.app === "audio") return `When ${s.filter?.device === "all" ? "audio contains" : "you say"} ${(s.filter?.phrases || "").split("\n").filter(Boolean).map((p) => `“${p}”`).join(" or ")}`;
   const acct = s.instance ? ` (${s.instance})` : "";
   if (s.app === "slack") return `slack${acct} · ${s.filter?.channel_name || s.filter?.channel || "a channel"}`;
   if (s.app === "notion") return `notion${acct} · ${s.filter?.database_name || "any page edited"}`;
-  if (s.app === "obsidian") return `obsidian · ${s.path || "vault"}`;
+  if (s.app === "obsidian") return `Obsidian · ${s.path || "vault"}`;
+  if (s.app === "imap") return `Email · ${s.kind === "sent_message" ? "sent in" : "new in"} ${s.filter?.mailbox || "INBOX"}`;
+  if (s.app === "google-calendar") return `Google calendar${acct} · event starts`;
+  if (s.app === "outlook-email") return `outlook${acct} · ${s.kind === "sent_message" ? "email sent" : "new email"}`;
+  if (s.app === "github") return `github${acct} · new ${s.kind === "pull_request" ? "pull request" : "issue"} in ${s.filter?.repository || "repository"}`;
+  if (s.app === "linear") {
+    const action = s.kind === "issue_assigned"
+      ? "issue assigned to me"
+      : s.kind === "issue_status_changed"
+        ? "issue status changed"
+        : "new issue";
+    return `Linear · ${action} in ${s.filter?.team_name || "team"}`;
+  }
+  if (s.app === "todoist") return "Todoist · new task";
   return `${s.app} · ${s.kind || "new item"}`;
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
 export function PipeTriggerPicker(props: PickerProps) {
+
+  const ui = useGT();
   const { pipeName, trigger, fetchPipes, applyOptimistic } = props;
   const [open, setOpen] = useState(false);
 
@@ -124,44 +190,44 @@ export function PipeTriggerPicker(props: PickerProps) {
   const remove = (kind: "events" | "custom" | "sources", i: number) =>
     persistTrigger({ ...trigger, [kind]: (trigger?.[kind] ?? []).filter((_, j) => j !== i) });
 
-  const chip = "text-xs bg-muted/50 border rounded-none px-3 py-1.5 flex-1 font-mono truncate";
+  const chip = "text-xs bg-muted/50 border rounded-sm px-3 py-1.5 flex-1 font-mono truncate";
   const xBtn = "text-muted-foreground/0 group-hover/item:text-muted-foreground hover:!text-foreground transition-all text-sm leading-none px-1";
 
   return (
     <div>
       <div className="mb-2.5">
-        <div className="text-sm font-medium lowercase">when to run</div>
-        <div className="text-[11px] text-muted-foreground">on a schedule, after a meeting, on a new message…</div>
+        <div className="text-sm font-medium normal-case">When to run</div>
+        <div className="text-[11px] text-muted-foreground">On a schedule, after a meeting, on a new message…</div>
       </div>
       <div className="space-y-1.5">
         {events.map((e, i) => (
           <div key={`e${i}`} className="flex items-center gap-1.5 group/item">
             <span className={chip}>› {eventLabel(e)}</span>
-            <button className={xBtn} aria-label="remove" onClick={() => remove("events", i)}>×</button>
+            <button className={xBtn} aria-label={ui("Remove")} onClick={() => remove("events", i)}>×</button>
           </div>
         ))}
         {sources.map((s, i) => (
           <div key={`s${i}`} className="flex items-center gap-1.5 group/item">
             <span className={chip} title={s.path || s.filter?.channel || ""}>› {sourceLabel(s)}</span>
-            <button className={xBtn} aria-label="remove" onClick={() => remove("sources", i)}>×</button>
+            <button className={xBtn} aria-label={ui("Remove")} onClick={() => remove("sources", i)}>×</button>
           </div>
         ))}
         {custom.map((c, i) => (
           <div key={`c${i}`} className="flex items-center gap-1.5 group/item">
             <span className={chip}>› {c}</span>
-            <button className={xBtn} aria-label="remove" onClick={() => remove("custom", i)}>×</button>
+            <button className={xBtn} aria-label={ui("Remove")} onClick={() => remove("custom", i)}>×</button>
           </div>
         ))}
         <button
           onClick={() => setOpen(true)}
-          className="w-full h-8 text-[11px] uppercase tracking-wide border rounded-none px-2 flex items-center gap-1.5 text-muted-foreground hover:bg-foreground hover:text-background hover:border-foreground transition-colors"
+          className="w-full h-8 text-[11px] normal-case tracking-wide border rounded-md px-2 flex items-center gap-1.5 text-muted-foreground hover:bg-foreground hover:text-background hover:border-foreground transition-colors"
         >
-          <Plus className="h-3.5 w-3.5" /> add trigger
+          <Plus className="h-3.5 w-3.5" /> Add trigger
         </button>
       </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-3xl p-0 overflow-hidden gap-0 rounded-none">
+        <DialogContent className="max-w-3xl p-0 overflow-hidden gap-0 rounded-lg">
           <TriggerModal
             {...props}
             onClose={() => setOpen(false)}
@@ -198,34 +264,38 @@ function TriggerModal({
   onAddSource: (s: TriggerSource) => void;
   onAddEvent: (e: string) => void;
 }) {
+  const uiLanguage = useLocale();
+
+  const uiMessages = useMessages();
+  const ui = useGT();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<OptionId>("schedule");
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return OPTIONS.filter((o) => !q || o.label.includes(q) || o.group.includes(q) || o.sub.includes(q));
-  }, [query]);
+    return localizeDefinitions(OPTIONS, uiMessages).filter((o) => !q || o.label.includes(q) || o.group.includes(q) || o.sub.includes(q));
+  }, [query, uiLanguage]);
 
   useEffect(() => {
     if (filtered.length && !filtered.some((o) => o.id === selected)) setSelected(filtered[0].id);
   }, [filtered, selected]);
 
-  const active = OPTIONS.find((o) => o.id === selected) ?? OPTIONS[0];
+  const active = localizeDefinitions(OPTIONS, uiMessages).find((o) => o.id === selected) ?? localizeDefinitions(OPTIONS, uiMessages)[0];
 
   return (
     <div className="flex h-[460px]">
       {/* left rail */}
       <div className="w-[270px] border-r flex flex-col">
         <div className="p-3 pb-2">
-          <div className="text-sm font-medium mb-2 lowercase">add trigger</div>
+          <div className="text-sm font-medium mb-2 normal-case">Add trigger</div>
           <div className="relative">
             <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
             <input
               autoFocus
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="search triggers…"
-              className="w-full h-8 text-xs font-mono bg-muted/40 border rounded-none pl-8 pr-2 outline-none focus:border-foreground transition-colors"
+              placeholder={ui("Search triggers…")}
+              className="w-full h-8 text-xs font-mono bg-muted/40 border rounded-md pl-8 pr-2 outline-none focus:border-foreground transition-colors"
             />
           </div>
         </div>
@@ -235,12 +305,12 @@ function TriggerModal({
             if (!rows.length) return null;
             return (
               <div key={g} className="mb-1">
-                <div className="px-2 pt-2 pb-1 text-[10px] uppercase tracking-wide text-muted-foreground font-medium">{g}</div>
+                <div className="px-2 pt-2 pb-1 text-[10px] normal-case tracking-wide text-muted-foreground font-medium">{g}</div>
                 {rows.map((o) => (
                   <button
                     key={o.id}
                     onClick={() => setSelected(o.id)}
-                    className={`w-full flex items-center gap-2.5 px-2 py-1.5 rounded-none text-left transition-colors ${
+                    className={`w-full flex items-center gap-2.5 px-2 py-1.5 rounded-sm text-left transition-colors ${
                       selected === o.id ? "bg-accent" : "hover:bg-accent/60"
                     }`}
                   >
@@ -254,7 +324,7 @@ function TriggerModal({
               </div>
             );
           })}
-          {filtered.length === 0 && <div className="px-3 py-6 text-xs text-muted-foreground text-center">no triggers match.</div>}
+          {filtered.length === 0 && <div className="px-3 py-6 text-xs text-muted-foreground text-center">No triggers match.</div>}
         </div>
       </div>
 
@@ -328,10 +398,12 @@ function Detail({
             onAdd={() => onAddEvent(option.id)}
           />
         )}
+        {option.id === "voice_phrase" && <VoicePhraseDetail onAdd={onAddSource} />}
         {option.id === "pipe" && <PipeDetail pipes={otherPipes} onAdd={(name) => onAddEvent(`pipe_completed:${name}`)} />}
         {option.app && (
           <SourceDetail
             app={option.app}
+            kind={option.kind}
             availableConnections={availableConnections}
             refreshConnections={refreshConnections}
             onAdd={onAddSource}
@@ -345,17 +417,29 @@ function Detail({
 
 function detailTitle(id: OptionId): string {
   switch (id) {
-    case "schedule": return "on a schedule";
-    case "meeting_started": return "when a meeting starts";
-    case "meeting_ended": return "when a meeting ends";
-    case "slack": return "new Slack message in…";
+    case "voice_phrase": return "When a phrase is spoken";
+    case "schedule": return "On a schedule";
+    case "meeting_started": return "When a meeting starts";
+    case "meeting_ended": return "When a meeting ends";
+    case "email_received": return "When a new email arrives";
+    case "email_sent": return "When an email is sent";
+    case "outlook_received": return "When a new Outlook email arrives";
+    case "outlook_sent": return "When an Outlook email is sent";
+    case "google_calendar_started": return "When a calendar event starts";
+    case "slack": return "New Slack message in…";
     case "notion": return "Notion page created or edited";
-    case "obsidian": return "new Obsidian note in…";
-    case "pipe": return "after a scheduled task finishes";
+    case "github_issue": return "New GitHub issue in…";
+    case "github_pull_request": return "New GitHub pull request in…";
+    case "linear_issue_created": return "New Linear issue in…";
+    case "linear_issue_assigned": return "Linear issue assigned to me in…";
+    case "linear_issue_status_changed": return "Linear issue status changed in…";
+    case "todoist_task": return "New Todoist task";
+    case "obsidian": return "New Obsidian note in…";
+    case "pipe": return "After a scheduled task finishes";
   }
 }
 
-function PrimaryAdd({ disabled, onClick, label = "add trigger" }: { disabled?: boolean; onClick: () => void; label?: string }) {
+function PrimaryAdd({ disabled, onClick, label = "Add trigger" }: { disabled?: boolean; onClick: () => void; label?: string }) {
   return (
     <div className="mt-5 flex justify-end">
       <button disabled={disabled} onClick={onClick} className={BTN_PRIMARY}>{label}</button>
@@ -372,14 +456,48 @@ function SimpleDetail({ text, onAdd }: { text: string; onAdd: () => void }) {
   );
 }
 
+function VoicePhraseDetail({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
+
+  const ui = useGT();
+  const [phrases, setPhrases] = useState("");
+  const [device, setDevice] = useState("input");
+  const cleaned = phrases.split("\n").map((p) => p.trim()).filter(Boolean);
+  const valid = cleaned.length > 0 && cleaned.length <= 32
+    && cleaned.every((p) => [...p].length <= 256 && /[\p{L}\p{N}]/u.test(p));
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground mb-3">
+        Run when a new transcript contains any phrase below. Matching ignores case and punctuation.
+        The task receives the matching words and their timestamp.
+      </p>
+      <label htmlFor="voice-trigger-phrases" className={LABEL}>Words or phrases, one per line</label>
+      <textarea id="voice-trigger-phrases" value={phrases} onChange={(e) => setPhrases(e.target.value)}
+        maxLength={32768} placeholder={ui("Start job\nstop job")} className={`${INPUT.replace("h-9", "h-20")} py-2 mt-1`} />
+      <p className="text-[11px] text-muted-foreground mt-1">Up to 32 phrases, 256 characters each. Each phrase must fit in one transcript segment.</p>
+      <label htmlFor="voice-trigger-device" className={`${LABEL} block mt-3`}>Listen to</label>
+      <select id="voice-trigger-device" value={device} onChange={(e) => setDevice(e.target.value)} className={`${INPUT} mt-1`}>
+        <option value="input">Microphone</option>
+        <option value="all">Microphone and system audio</option>
+      </select>
+      <p className="text-[11px] text-muted-foreground mt-3">
+        Audio recording and transcription must be on. Checks new transcripts every 30 seconds;
+        transcription may add a delay. Phrase matching uses no AI credits. Task runs use your selected model.
+        Existing schedules still run separately. Use manual scheduling to run only on triggers.
+      </p>
+      <PrimaryAdd disabled={!valid} onClick={() => onAdd({ app: "audio", kind: "phrase", filter: { phrases: cleaned.join("\n"), device } })} />
+    </div>
+  );
+}
+
 function PipeDetail({ pipes, onAdd }: { pipes: { name: string }[]; onAdd: (name: string) => void }) {
+
   const [name, setName] = useState("");
   if (!pipes.length) return <p className="text-xs text-muted-foreground">No other enabled scheduled tasks yet — create one first.</p>;
   return (
     <div>
       <p className="text-xs text-muted-foreground mb-3">Run this scheduled task right after another finishes (chaining).</p>
       <select value={name} onChange={(e) => setName(e.target.value)} className={INPUT}>
-        <option value="">choose a scheduled task…</option>
+        <option value="">Choose a scheduled task…</option>
         {pipes.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
       </select>
       <PrimaryAdd disabled={!name} onClick={() => onAdd(name)} />
@@ -391,6 +509,8 @@ function PipeDetail({ pipes, onAdd }: { pipes: { name: string }[]; onAdd: (name:
 
 interface SlackChannel { id: string; name: string; is_private?: boolean }
 interface NotionDb { id: string; name: string }
+interface GithubRepo { id: number; full_name: string; private?: boolean }
+interface LinearTeam { id: string; name: string; key?: string }
 
 /** Accounts for an app: [] = single/default, else one per connected workspace. */
 function accountsFor(conns: AvailableConnection[], app: string): { value: string; label: string }[] {
@@ -418,17 +538,21 @@ function openConnectionSetupForTrigger(connectionId: string) {
 
 function SourceDetail({
   app,
+  kind,
   availableConnections,
   refreshConnections,
   onAdd,
   onClose,
 }: {
-  app: "slack" | "notion" | "obsidian";
+  app: SourceApp;
+  kind?: string;
   availableConnections: AvailableConnection[];
   refreshConnections: () => Promise<AvailableConnection[]>;
   onAdd: (s: TriggerSource) => void;
   onClose: () => void;
 }) {
+
+  const ui = useGT();
   const [conns, setConns] = useState(availableConnections);
   const connected = !!conns.find((c) => c.id === app)?.connected;
   const [connecting, setConnecting] = useState(false);
@@ -442,7 +566,7 @@ function SourceDetail({
     if (app === "obsidian") {
       setConnecting(true);
       try {
-        const picked = await openDialog({ directory: true, multiple: false, title: "Select Obsidian vault folder" });
+        const picked = await openDialog({ directory: true, multiple: false, title: ui("Select Obsidian vault folder") });
         if (typeof picked !== "string") return;
         await localFetch("/connections/obsidian", {
           method: "PUT",
@@ -471,7 +595,7 @@ function SourceDetail({
     <div>
       {accounts.length > 1 && (
         <div className="mb-3">
-          <label className={LABEL}>account</label>
+          <label className={LABEL}>Account</label>
           <select value={instance} onChange={(e) => setInstance(e.target.value)} className={`${INPUT} mt-1`}>
             {accounts.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
           </select>
@@ -480,6 +604,27 @@ function SourceDetail({
       {app === "slack" && <SlackPicker key={inst ?? ""} instance={inst} onAdd={onAdd} />}
       {app === "notion" && <NotionPicker key={inst ?? ""} instance={inst} onAdd={onAdd} />}
       {app === "obsidian" && <ObsidianPicker onAdd={onAdd} />}
+      {app === "imap" && <MailboxPicker kind={kind || "message"} onAdd={onAdd} />}
+      {app === "google-calendar" && (
+        <SimpleSourceDetail
+          text="Runs when a timed event reaches its start time. All-day events are excluded."
+          onAdd={() => onAdd({ app, kind: "event_started", instance: inst })}
+        />
+      )}
+      {app === "outlook-email" && (
+        <SimpleSourceDetail
+          text={kind === "sent_message" ? "Runs when a message appears in Outlook Sent Items." : "Runs when a message arrives in your Outlook inbox."}
+          onAdd={() => onAdd({ app, kind: kind || "message", instance: inst })}
+        />
+      )}
+      {app === "github" && <GithubPicker key={`${inst ?? ""}:${kind}`} instance={inst} kind={kind || "issue"} onAdd={onAdd} />}
+      {app === "linear" && <LinearPicker kind={kind || "issue_created"} onAdd={onAdd} />}
+      {app === "todoist" && (
+        <SimpleSourceDetail
+          text="Runs when a new active task is added to Todoist."
+          onAdd={() => onAdd({ app, kind: "task" })}
+        />
+      )}
     </div>
   );
 }
@@ -488,38 +633,48 @@ const APP_META: Record<string, { name: string; blurb: string; examples: string[]
   slack: { name: "Slack", blurb: "Give this scheduled task access to read messages in your channels.", examples: ["#general", "#support", "#eng"] },
   notion: { name: "Notion", blurb: "Let this scheduled task watch pages and databases in your workspace.", examples: ["CRM", "Meetings", "Docs"] },
   obsidian: { name: "Obsidian", blurb: "Point this scheduled task at a vault folder to watch for new notes.", examples: [] },
+  imap: { name: "Gmail or email", blurb: "Connect a read-only IMAP inbox. Gmail uses an app password; Screenpipe never stores your Google password.", examples: ["Inbox", "Sent Mail"] },
+  "google-calendar": { name: "Google Calendar", blurb: "Connect Google Calendar with read-only access to run tasks when timed events start.", examples: ["customer call", "focus block"] },
+  "outlook-email": { name: "Outlook", blurb: "Connect Outlook to watch your Inbox or Sent Items.", examples: ["Inbox", "Sent Items"] },
+  github: { name: "GitHub", blurb: "Connect GitHub and choose a repository to watch for issues or pull requests.", examples: ["issues", "pull requests"] },
+  linear: { name: "Linear", blurb: "Connect Linear and choose a team to watch for issue activity.", examples: ["created", "assigned", "status"] },
+  todoist: { name: "Todoist", blurb: "Connect Todoist to run a task whenever a new active task is added.", examples: ["new task"] },
 };
 
 function ConnectCard({ app, connecting, onConnect }: { app: string; connecting: boolean; onConnect: () => void }) {
+
+  const ui = useGT();
   const m = APP_META[app];
   return (
-    <div className="border rounded-none p-4">
+    <div className="border rounded-lg p-4">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <IntegrationIcon icon={app} className="w-5 h-5 flex items-center justify-center" fallbackClassName="h-5 w-5 text-muted-foreground" />
-            <div className="text-sm font-medium">connect {m.name}</div>
+            <div className="text-sm font-medium">Connect {m.name}</div>
           </div>
           <p className="text-xs text-muted-foreground mt-2">{m.blurb}</p>
           <button onClick={onConnect} disabled={connecting} className={`mt-3 ${BTN_SECONDARY}`}>
             {connecting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {app === "obsidian" ? "choose vault folder" : `connect ${m.name}`}
+            {app === "obsidian" ? ui("choose vault folder") : ui("connect {value1}", { value1: m.name })}
           </button>
         </div>
         {m.examples.length > 0 && (
           <div className="flex flex-col items-end gap-1.5 shrink-0">
             {m.examples.map((e) => (
-              <span key={e} className="text-[11px] border rounded-none px-2.5 py-1 text-muted-foreground font-mono">{e}</span>
+              <span key={e} className="text-[11px] border rounded-sm px-2.5 py-1 text-muted-foreground font-mono">{e}</span>
             ))}
           </div>
         )}
       </div>
-      <p className="text-[10px] text-muted-foreground mt-3">you can change what this scheduled task can access at any time.</p>
+      <p className="text-[10px] text-muted-foreground mt-3">You can change what this scheduled task can access at any time.</p>
     </div>
   );
 }
 
 function SlackPicker({ instance, onAdd }: { instance?: string; onAdd: (s: TriggerSource) => void }) {
+
+  const ui = useGT();
   const [channels, setChannels] = useState<SlackChannel[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [q, setQ] = useState("");
@@ -547,15 +702,15 @@ function SlackPicker({ instance, onAdd }: { instance?: string; onAdd: (s: Trigge
   const shown = (channels ?? []).filter((c) => !q || c.name.toLowerCase().includes(q.toLowerCase()));
   return (
     <div>
-      <label className={LABEL}>select a channel</label>
-      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search channels…" className={`${INPUT} mt-1 mb-2`} />
-      <div className="border rounded-none max-h-[220px] overflow-y-auto">
+      <label className={LABEL}>Select a channel</label>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={ui("Search channels…")} className={`${INPUT} mt-1 mb-2`} />
+      <div className="border rounded-lg max-h-[220px] overflow-y-auto">
         {channels === null ? (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> loading channels…</div>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading channels…</div>
         ) : err ? (
           <div className="text-xs text-muted-foreground px-3 py-3">{err}</div>
         ) : shown.length === 0 ? (
-          <div className="text-xs text-muted-foreground px-3 py-3">no match.</div>
+          <div className="text-xs text-muted-foreground px-3 py-3">No match.</div>
         ) : (
           shown.map((c) => (
             <button
@@ -579,6 +734,8 @@ function SlackPicker({ instance, onAdd }: { instance?: string; onAdd: (s: Trigge
 }
 
 function NotionPicker({ instance, onAdd }: { instance?: string; onAdd: (s: TriggerSource) => void }) {
+
+  const ui = useGT();
   const [dbs, setDbs] = useState<NotionDb[] | null>(null);
   const [q, setQ] = useState("");
   const [picked, setPicked] = useState<NotionDb | null>(null); // null = any page
@@ -608,16 +765,16 @@ function NotionPicker({ instance, onAdd }: { instance?: string; onAdd: (s: Trigg
   const row = "w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors";
   return (
     <div>
-      <label className={LABEL}>select a data source</label>
-      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search databases…" className={`${INPUT} mt-1 mb-2`} />
-      <div className="border rounded-none max-h-[220px] overflow-y-auto">
+      <label className={LABEL}>Select a data source</label>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={ui("Search databases…")} className={`${INPUT} mt-1 mb-2`} />
+      <div className="border rounded-lg max-h-[220px] overflow-y-auto">
         <button onClick={() => setPicked(null)} className={`${row} border-b ${picked === null ? "bg-accent" : "hover:bg-accent/60"}`}>
           <IntegrationIcon icon="notion" className="w-3.5 h-3.5 flex items-center justify-center" fallbackClassName="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="flex-1">any page in your workspace</span>
+          <span className="flex-1">Any page in your workspace</span>
           {picked === null && <Check className="h-3.5 w-3.5" />}
         </button>
         {dbs === null ? (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> loading databases…</div>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading databases…</div>
         ) : (
           shown.map((d) => (
             <button key={d.id} onClick={() => setPicked(d)} className={`${row} ${picked?.id === d.id ? "bg-accent" : "hover:bg-accent/60"}`}>
@@ -641,7 +798,225 @@ function NotionPicker({ instance, onAdd }: { instance?: string; onAdd: (s: Trigg
   );
 }
 
+function SimpleSourceDetail({ text, onAdd }: { text: string; onAdd: () => void }) {
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground">{text}</p>
+      <PrimaryAdd onClick={onAdd} />
+    </div>
+  );
+}
+
+function preferredMailbox(mailboxes: string[], kind: string): string {
+  if (kind === "sent_message") {
+    return mailboxes.find((name) => name.toLowerCase().includes("sent")) || "";
+  }
+  return mailboxes.find((name) => name.toLowerCase() === "inbox") || mailboxes[0] || "";
+}
+
+function MailboxPicker({ kind, onAdd }: { kind: string; onAdd: (s: TriggerSource) => void }) {
+
+  const ui = useGT();
+  const [mailboxes, setMailboxes] = useState<string[] | null>(null);
+  const [picked, setPicked] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await localFetch("/connections/imap/mailboxes");
+        const j = await r.json();
+        const rawMailboxes: unknown = j?.mailboxes;
+        const list: string[] = Array.isArray(rawMailboxes)
+          ? rawMailboxes.filter((name: unknown): name is string => typeof name === "string" && !!name)
+          : [];
+        setMailboxes(list);
+        setPicked(preferredMailbox(list, kind));
+        if (!list.length) setErr("no mailboxes found — reconnect your email inbox.");
+        else if (kind === "sent_message" && !list.some((name) => name.toLowerCase().includes("sent"))) {
+          setErr("choose the folder your provider uses for sent mail.");
+        }
+      } catch {
+        setMailboxes([]);
+        setErr("couldn't read email folders.");
+      }
+    })();
+  }, [kind]);
+
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground mb-3">
+        {kind === "sent_message"
+          ? ui("Runs when a message appears in the sent-mail folder you choose.")
+          : ui("Runs when a message arrives in the mailbox you choose.")}
+      </p>
+      <label className={LABEL}>Mailbox</label>
+      {mailboxes === null ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground mt-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading mailboxes…</div>
+      ) : (
+        <select value={picked} onChange={(e) => setPicked(e.target.value)} className={`${INPUT} mt-1`}>
+          <option value="">Choose a mailbox…</option>
+          {mailboxes.map((mailbox) => <option key={mailbox} value={mailbox}>{mailbox}</option>)}
+        </select>
+      )}
+      {err && <p className="text-[10px] text-muted-foreground mt-1.5">{err}</p>}
+      <PrimaryAdd
+        disabled={!picked}
+        onClick={() => onAdd({ app: "imap", kind, filter: { mailbox: picked } })}
+      />
+    </div>
+  );
+}
+
+function GithubPicker({ instance, kind, onAdd }: { instance?: string; kind: string; onAdd: (s: TriggerSource) => void }) {
+
+  const ui = useGT();
+  const [repos, setRepos] = useState<GithubRepo[] | null>(null);
+  const [picked, setPicked] = useState<GithubRepo | null>(null);
+  const [q, setQ] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const inst = instance ? `&instance=${encodeURIComponent(instance)}` : "";
+        const r = await localFetch(`/connections/github/proxy/user/repos?per_page=100&sort=updated&direction=desc${inst}`);
+        const j = await r.json();
+        const list: GithubRepo[] = Array.isArray(j)
+          ? j.filter((repo: GithubRepo) => repo.id && repo.full_name)
+          : [];
+        setRepos(list);
+        if (!list.length) setErr("no repositories found for this account.");
+      } catch {
+        setRepos([]);
+        setErr("couldn't reach GitHub.");
+      }
+    })();
+  }, [instance]);
+
+  const shown = (repos ?? []).filter((repo) => !q || repo.full_name.toLowerCase().includes(q.toLowerCase()));
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground mb-3">
+        Runs when a new {kind === "pull_request" ? ui("pull request") : ui("issue")} is opened in one repository.
+      </p>
+      <label className={LABEL}>Repository</label>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={ui("Search repositories…")} className={`${INPUT} mt-1 mb-2`} />
+      <div className="border rounded-lg max-h-[220px] overflow-y-auto">
+        {repos === null ? (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading repositories…</div>
+        ) : err ? (
+          <div className="text-xs text-muted-foreground px-3 py-3">{err}</div>
+        ) : shown.length === 0 ? (
+          <div className="text-xs text-muted-foreground px-3 py-3">No match.</div>
+        ) : (
+          shown.map((repo) => (
+            <button
+              key={repo.id}
+              onClick={() => setPicked(repo)}
+              className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors ${picked?.id === repo.id ? "bg-accent" : "hover:bg-accent/60"}`}
+            >
+              <IntegrationIcon icon="github" className="w-3.5 h-3.5 flex items-center justify-center" fallbackClassName="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="flex-1 truncate font-mono">{repo.full_name}</span>
+              {repo.private && <span className="text-[10px] text-muted-foreground">Private</span>}
+              {picked?.id === repo.id && <Check className="h-3.5 w-3.5" />}
+            </button>
+          ))
+        )}
+      </div>
+      <PrimaryAdd
+        disabled={!picked}
+        onClick={() => picked && onAdd({ app: "github", kind, instance, filter: { repository: picked.full_name } })}
+      />
+    </div>
+  );
+}
+
+function LinearPicker({ kind, onAdd }: { kind: string; onAdd: (s: TriggerSource) => void }) {
+
+  const ui = useGT();
+  const [teams, setTeams] = useState<LinearTeam[] | null>(null);
+  const [picked, setPicked] = useState<LinearTeam | null>(null);
+  const [q, setQ] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const list: LinearTeam[] = [];
+        let after: string | null = null;
+        for (let page = 0; page < 5; page += 1) {
+          const r = await localFetch("/connections/linear/proxy/graphql", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: "query PipeLinearTeams($after: String) { teams(first: 100, after: $after) { nodes { id name key } pageInfo { hasNextPage endCursor } } }",
+              variables: { after },
+            }),
+          });
+          const j = await r.json();
+          if (Array.isArray(j?.errors) && j.errors.length > 0) throw new Error("Linear GraphQL error");
+          if (!Array.isArray(j?.data?.teams?.nodes)) throw new Error("Invalid Linear response");
+          list.push(...j.data.teams.nodes.filter((team: LinearTeam) => team.id && team.name));
+          const pageInfo = j.data.teams.pageInfo;
+          if (!pageInfo?.hasNextPage || !pageInfo?.endCursor) break;
+          after = pageInfo.endCursor;
+        }
+        list.sort((a, b) => a.name.localeCompare(b.name));
+        setTeams(list);
+        if (!list.length) setErr("no Linear teams found for this account.");
+      } catch {
+        setTeams([]);
+        setErr("couldn't reach Linear.");
+      }
+    })();
+  }, []);
+
+  const shown = (teams ?? []).filter((team) => !q || team.name.toLowerCase().includes(q.toLowerCase()) || team.key?.toLowerCase().includes(q.toLowerCase()));
+  const description = kind === "issue_assigned"
+    ? "Runs when an issue in this team is assigned to you."
+    : kind === "issue_status_changed"
+      ? "Runs only when an issue in this team moves between workflow statuses."
+      : "Runs when a new issue is created in this team.";
+
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground mb-3">{description}</p>
+      <label className={LABEL}>Team</label>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={ui("Search teams…")} className={`${INPUT} mt-1 mb-2`} />
+      <div className="border rounded-lg max-h-[220px] overflow-y-auto">
+        {teams === null ? (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading teams…</div>
+        ) : err ? (
+          <div className="text-xs text-muted-foreground px-3 py-3">{err}</div>
+        ) : shown.length === 0 ? (
+          <div className="text-xs text-muted-foreground px-3 py-3">No match.</div>
+        ) : (
+          shown.map((team) => (
+            <button
+              key={team.id}
+              onClick={() => setPicked(team)}
+              className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors ${picked?.id === team.id ? "bg-accent" : "hover:bg-accent/60"}`}
+            >
+              <IntegrationIcon icon="linear" className="w-3.5 h-3.5 flex items-center justify-center" fallbackClassName="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="flex-1 truncate">{team.name}</span>
+              {team.key && <span className="text-[10px] text-muted-foreground font-mono">{team.key}</span>}
+              {picked?.id === team.id && <Check className="h-3.5 w-3.5" />}
+            </button>
+          ))
+        )}
+      </div>
+      <PrimaryAdd
+        disabled={!picked}
+        onClick={() => picked && onAdd({ app: "linear", kind, filter: { team_id: picked.id, team_name: picked.name } })}
+      />
+    </div>
+  );
+}
+
 function ObsidianPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
+
+  const ui = useGT();
   const [vault, setVault] = useState<string | null>(null);
   const [folder, setFolder] = useState<string>("");
 
@@ -660,19 +1035,19 @@ function ObsidianPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
   }, []);
 
   async function choose() {
-    const picked = await openDialog({ directory: true, multiple: false, defaultPath: vault || undefined, title: "Choose folder to watch" });
+    const picked = await openDialog({ directory: true, multiple: false, defaultPath: vault || undefined, title: ui("Choose folder to watch") });
     if (typeof picked === "string") setFolder(picked);
   }
 
   return (
     <div>
       <p className="text-xs text-muted-foreground mb-3">Fires when a new note appears in the folder you watch.</p>
-      <label className={LABEL}>folder to watch</label>
+      <label className={LABEL}>Folder to watch</label>
       <div className="flex items-center gap-2 mt-1">
         <input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder={vault || "/path/to/vault/folder"} className={INPUT} />
-        <button onClick={choose} className={BTN_SECONDARY}>browse</button>
+        <button onClick={choose} className={BTN_SECONDARY}>Browse</button>
       </div>
-      <p className="text-[10px] text-muted-foreground mt-1.5">tip: point at a subfolder (e.g. meetings/) for less noise.</p>
+      <p className="text-[10px] text-muted-foreground mt-1.5">Tip: point at a subfolder (e.g. meetings/) for less noise.</p>
       <PrimaryAdd disabled={!folder.trim()} onClick={() => onAdd({ app: "obsidian", kind: "note", path: folder.trim() })} />
     </div>
   );

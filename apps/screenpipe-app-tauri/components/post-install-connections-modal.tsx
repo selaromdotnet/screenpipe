@@ -4,7 +4,7 @@
 
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -21,13 +21,24 @@ import {
   IntegrationIcon,
   IntegrationInfo,
 } from "@/components/settings/connections-section";
+import { ComposioCard } from "@/components/settings/composio-card";
 import { localFetch } from "@/lib/api";
+import {
+  COMPOSIO_CONNECTIONS,
+  composioStatusToMap,
+  fetchComposioStatus,
+  type ComposioStatusMap,
+  type ComposioToolkit,
+} from "@/lib/composio";
+import { useSettings } from "@/lib/hooks/use-settings";
 import {
   isMcpConnectionKey,
   mcpServerIdFromConnection,
   pipeConnectionInstanceName,
   pipeConnectionLookupKey,
 } from "@/lib/pipe-connections";
+import { useGT } from "gt-react";
+
 
 interface PostInstallConnectionsModalProps {
   open: boolean;
@@ -41,9 +52,11 @@ interface ConnectionStatus {
   integration: IntegrationInfo | null;
   configured: boolean;
   loading: boolean;
-  kind: "connection" | "mcp";
+  kind: "connection" | "mcp" | "composio";
   displayName: string;
   instanceName: string | null;
+  icon?: string;
+  composioToolkit?: ComposioToolkit;
   serverId?: string;
   missingReason?: "deleted_mcp" | "disabled_mcp" | "unknown_mcp";
 }
@@ -54,6 +67,35 @@ interface McpServerSummary {
   enabled: boolean;
 }
 
+function PostInstallComposioConnection({
+  connId,
+  toolkit,
+  configured,
+  onChanged,
+}: {
+  connId: string;
+  toolkit: ComposioToolkit;
+  configured: boolean;
+  onChanged: (
+    connId: string,
+    toolkit: ComposioToolkit,
+    status: ComposioStatusMap
+  ) => void;
+}) {
+  const handleChanged = useCallback(
+    (status: ComposioStatusMap) => onChanged(connId, toolkit, status),
+    [connId, onChanged, toolkit]
+  );
+
+  return (
+    <ComposioCard
+      toolkit={toolkit}
+      initialConnected={configured}
+      onChanged={handleChanged}
+    />
+  );
+}
+
 export function PostInstallConnectionsModal({
   open,
   onOpenChange,
@@ -61,6 +103,10 @@ export function PostInstallConnectionsModal({
   connections,
   onConnectionRemoved,
 }: PostInstallConnectionsModalProps) {
+
+  const ui = useGT();
+  const { settings } = useSettings();
+  const composioToken = settings.user?.token;
   const [statuses, setStatuses] = useState<Record<string, ConnectionStatus>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -73,9 +119,18 @@ export function PostInstallConnectionsModal({
       setLoading(true);
       try {
         // Fetch all available integrations
-        const [res, mcpRes] = await Promise.all([
+        const needsComposio = connections.some((connId) => {
+          const baseId = pipeConnectionLookupKey(connId);
+          return COMPOSIO_CONNECTIONS.some(
+            (connection) => connection.id === baseId
+          );
+        });
+        const [res, mcpRes, composioStatus] = await Promise.all([
           localFetch("/connections"),
           localFetch("/mcp-servers").catch(() => null),
+          needsComposio && composioToken
+            ? fetchComposioStatus(composioToken)
+            : Promise.resolve(null),
         ]);
         const data = await res.json();
         const integrations: IntegrationInfo[] = data.data || [];
@@ -85,6 +140,9 @@ export function PostInstallConnectionsModal({
             : { data: [] };
         const mcpStatusUnavailable = !mcpRes || !mcpRes.ok;
         const mcpServers: McpServerSummary[] = mcpData.data || [];
+        const composioStatusMap = composioStatus
+          ? composioStatusToMap(composioStatus)
+          : null;
 
         const newStatuses: Record<string, ConnectionStatus> = {};
 
@@ -92,6 +150,24 @@ export function PostInstallConnectionsModal({
           // support instance keys like "notion:crm" — match on base id
           const baseId = pipeConnectionLookupKey(connId);
           const instanceName = pipeConnectionInstanceName(connId);
+          const composioConnection = COMPOSIO_CONNECTIONS.find(
+            (connection) => connection.id === baseId
+          );
+
+          if (composioConnection) {
+            newStatuses[connId] = {
+              integration: null,
+              configured:
+                composioStatusMap?.[composioConnection.toolkit] ?? false,
+              loading: false,
+              kind: "composio",
+              displayName: composioConnection.name,
+              icon: composioConnection.icon,
+              composioToolkit: composioConnection.toolkit,
+              instanceName: null,
+            };
+            continue;
+          }
 
           if (isMcpConnectionKey(connId)) {
             const serverId = mcpServerIdFromConnection(connId) || undefined;
@@ -165,7 +241,7 @@ export function PostInstallConnectionsModal({
     };
 
     init();
-  }, [open, connections]);
+  }, [open, connections, composioToken]);
 
   const handleSaved = (connId: string) => {
     setStatuses((prev) => ({
@@ -202,6 +278,24 @@ export function PostInstallConnectionsModal({
       }));
     }
   };
+
+  const handleComposioChanged = useCallback(
+    (
+      connId: string,
+      toolkit: ComposioToolkit,
+      status: ComposioStatusMap
+    ) => {
+      setStatuses((prev) => ({
+        ...prev,
+        [connId]: {
+          ...prev[connId],
+          configured: status[toolkit],
+          loading: false,
+        },
+      }));
+    },
+    []
+  );
 
   const openCustomMcpSettings = () => {
     window.dispatchEvent(new CustomEvent("open-settings", {
@@ -246,18 +340,18 @@ export function PostInstallConnectionsModal({
       <DialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-sm">
-            set up connections for &quot;{pipeName}&quot;
+            Set up connections for &quot;{pipeName}&quot;
           </DialogTitle>
           <DialogDescription className="text-xs">
-            this scheduled task requires the following connections to work properly.
-            configure them now or skip and set them up later in settings.
+            This scheduled task requires the following connections to work properly.
+            Configure them now or skip and set them up later in settings.
           </DialogDescription>
         </DialogHeader>
 
         {loading ? (
           <div className="flex items-center gap-2 py-6 justify-center text-xs text-muted-foreground">
             <Loader2 className="h-3 w-3 animate-spin" />
-            loading connections...
+            Loading connections...
           </div>
         ) : (
           <div className="space-y-2 my-2">
@@ -266,6 +360,8 @@ export function PostInstallConnectionsModal({
               const isExpanded = expanded === connId;
               const integration = status?.integration;
               const isMcp = status?.kind === "mcp";
+              const isComposio = status?.kind === "composio";
+              const composioToolkit = status?.composioToolkit;
               const statusLabel = status?.configured
                 ? "configured"
                 : status?.missingReason === "deleted_mcp"
@@ -288,8 +384,10 @@ export function PostInstallConnectionsModal({
                     className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-accent/50 transition-colors"
                   >
                     <div className="relative flex-shrink-0">
-                      {integration ? (
-                        <IntegrationIcon icon={integration.icon} />
+                      {integration || status?.icon ? (
+                        <IntegrationIcon
+                          icon={integration?.icon || status?.icon || ""}
+                        />
                       ) : isMcp ? (
                         <div className="w-5 h-5 border border-border flex items-center justify-center text-[8px] font-mono">
                           MCP
@@ -337,28 +435,28 @@ export function PostInstallConnectionsModal({
                       {status?.missingReason === "deleted_mcp" ? (
                         <>
                           <p className="text-xs text-muted-foreground">
-                            this MCP server was deleted or is no longer available.
-                            remove it from this scheduled task or add a new MCP server from the dropdown.
+                            This MCP server was deleted or is no longer available.
+                            Remove it from this scheduled task or add a new MCP server from the dropdown.
                           </p>
                           {status.serverId && (
                             <p className="text-[10px] text-muted-foreground font-mono">
-                              id: {status.serverId}
+                              ID: {status.serverId}
                             </p>
                           )}
                         </>
                       ) : status?.missingReason === "disabled_mcp" ? (
                         <p className="text-xs text-muted-foreground">
-                          this MCP server is disabled. enable it in custom MCP
+                          This MCP server is disabled. Enable it in custom MCP
                           settings or remove it from this scheduled task.
                         </p>
                       ) : status?.missingReason === "unknown_mcp" ? (
                         <p className="text-xs text-muted-foreground">
-                          MCP server status could not be loaded. try again or
+                          MCP server status could not be loaded. Try again or
                           manage custom MCP servers in settings.
                         </p>
                       ) : (
                         <p className="text-xs text-muted-foreground">
-                          custom MCP servers are configured once, then selected by scheduled tasks.
+                          Custom MCP servers are configured once, then selected by scheduled tasks.
                         </p>
                       )}
                       <div className="flex flex-wrap gap-2">
@@ -373,10 +471,10 @@ export function PostInstallConnectionsModal({
                             {removingConnection === connId ? (
                               <>
                                 <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                                removing...
+                                Removing...
                               </>
                             ) : (
-                              "remove from scheduled task"
+                              ui("Remove from scheduled task")
                             )}
                           </Button>
                         )}
@@ -387,9 +485,20 @@ export function PostInstallConnectionsModal({
                           onClick={openCustomMcpSettings}
                         >
                           <ExternalLink className="h-3 w-3" />
-                          manage MCP servers
+                          Manage MCP servers
                         </Button>
                       </div>
+                    </div>
+                  )}
+
+                  {isExpanded && isComposio && composioToolkit && (
+                    <div className="px-3 pb-3 border-t border-border pt-3">
+                      <PostInstallComposioConnection
+                        connId={connId}
+                        toolkit={composioToolkit}
+                        configured={status.configured}
+                        onChanged={handleComposioChanged}
+                      />
                     </div>
                   )}
 
@@ -404,10 +513,10 @@ export function PostInstallConnectionsModal({
                         {status?.loading ? (
                           <>
                             <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                            connecting...
+                            Connecting...
                           </>
                         ) : (
-                          <>connect with {integration.name}</>
+                          <>Connect with {integration.name}</>
                         )}
                       </Button>
                     </div>
@@ -416,16 +525,16 @@ export function PostInstallConnectionsModal({
                   {isExpanded && integration && !integration.is_oauth && integration.fields.length === 0 && (
                     <div className="px-3 pb-3 border-t border-border pt-3">
                       <p className="text-xs text-muted-foreground">
-                        connect {integration.name} in{" "}
-                        <strong>settings &gt; connections</strong> then come back here.
+                        Connect {integration.name} in{" "}
+                        <strong>Settings &gt; connections</strong> then come back here.
                       </p>
                     </div>
                   )}
 
-                  {isExpanded && !integration && !isMcp && (
+                  {isExpanded && !integration && !isMcp && !isComposio && (
                     <div className="px-3 pb-3 border-t border-border pt-3">
                       <p className="text-xs text-muted-foreground">
-                        connection &quot;{connId}&quot; is not available. it
+                        Connection &quot;{connId}&quot; is not available. It
                         may need to be configured manually in settings &gt;
                         connections.
                       </p>
@@ -444,7 +553,7 @@ export function PostInstallConnectionsModal({
             className="text-xs"
             onClick={() => onOpenChange(false)}
           >
-            skip
+            Skip
           </Button>
           <Button
             size="sm"
@@ -452,7 +561,7 @@ export function PostInstallConnectionsModal({
             onClick={() => onOpenChange(false)}
             disabled={!allConfigured && false}
           >
-            {allConfigured ? "done" : "done"}
+            {allConfigured ? ui("Done") : ui("Done")}
           </Button>
         </DialogFooter>
       </DialogContent>

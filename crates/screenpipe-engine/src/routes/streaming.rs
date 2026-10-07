@@ -21,6 +21,7 @@ use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    history_access::HistoryAccessPolicy,
     routes::search::is_screenpipe_app,
     server::AppState,
     video_cache::{AudioEntry, DeviceFrame, FrameMetadata, TimeSeriesFrame},
@@ -42,6 +43,49 @@ pub struct StreamFramesRequest {
     order: Order,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StreamCompletion {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl StreamCompletion {
+    fn new(request: &StreamFramesRequest) -> Self {
+        Self {
+            kind: "stream_complete",
+            start_time: request.start_time,
+            end_time: request.end_time,
+            error: None,
+        }
+    }
+}
+
+enum StreamEvent {
+    Frame(TimeSeriesFrame),
+    Complete(StreamCompletion),
+}
+
+/// Clamp a timeline request to the rolling history window. Returns `true`
+/// when the requested range is wholly before the accessible window.
+fn apply_stream_history_access(
+    policy: &HistoryAccessPolicy,
+    request: &mut StreamFramesRequest,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(cutoff) = policy.cutoff(now) else {
+        return false;
+    };
+    if request.end_time < cutoff {
+        return true;
+    }
+    request.start_time = request.start_time.max(cutoff);
+    false
 }
 
 const MAX_STREAM_FRAME_LIMIT: usize = 10_000;
@@ -169,6 +213,7 @@ pub struct DeviceMetadata {
 
 #[derive(Debug, Serialize)]
 pub struct AudioData {
+    pub captured_at: Option<DateTime<Utc>>,
     pub device_name: String,
     pub is_input: bool,
     pub transcription: String,
@@ -208,6 +253,7 @@ impl From<TimeSeriesFrame> for StreamTimeSeriesResponse {
                             .audio_entries
                             .into_iter()
                             .map(|audio| AudioData {
+                                captured_at: audio.captured_at,
                                 device_name: audio.device_name,
                                 is_input: audio.is_input,
                                 transcription: audio.transcription,
@@ -233,6 +279,7 @@ pub(crate) fn create_time_series_frame(chunk: FrameData) -> TimeSeriesFrame {
         .audio_entries
         .iter()
         .map(|a| AudioEntry {
+            captured_at: a.captured_at,
             transcription: a.transcription.clone(),
             device_name: a.device_name.clone(),
             is_input: a.is_input,
@@ -343,13 +390,14 @@ async fn handle_stream_frames_socket(
     let (mut sender, mut receiver) = socket.split();
     let cache = state.hot_frame_cache.clone();
     let db = state.db.clone();
+    let history_access = state.history_access.clone();
 
     // Shared state: track sent frame IDs to avoid duplicates
     let sent_frame_ids: Arc<Mutex<std::collections::HashSet<i64>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     // Channel for initial batch results (from cache or DB)
-    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<TimeSeriesFrame>(100);
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
     // Shared flag: should we subscribe to live cache updates?
     let live_subscribe: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
@@ -358,6 +406,7 @@ async fn handle_stream_frames_socket(
     let live_sub_clone = live_subscribe.clone();
     let cache_clone = cache.clone();
     let db_clone = db.clone();
+    let receive_history_access = history_access.clone();
 
     // Handle incoming messages for time range requests
     let receive_lifecycle = lifecycle.clone();
@@ -365,7 +414,19 @@ async fn handle_stream_frames_socket(
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<StreamFramesRequest>(&text) {
-                    Ok(request) => {
+                    Ok(mut request) => {
+                        let mut completion = StreamCompletion::new(&request);
+                        let now = Utc::now();
+                        if apply_stream_history_access(
+                            &receive_history_access,
+                            &mut request,
+                            now,
+                        ) {
+                            sent_ids_clone.lock().await.clear();
+                            *live_sub_clone.lock().await = Some(false);
+                            let _ = frame_tx.send(StreamEvent::Complete(completion)).await;
+                            continue;
+                        }
                         let start_time = request.start_time;
                         let end_time = request.end_time;
                         let is_descending = request.order == Order::Descending;
@@ -379,7 +440,6 @@ async fn handle_stream_frames_socket(
                         // Only use hot_cache if end_time reaches into the present/future.
                         // If the entire range is in the past (even on today's calendar day),
                         // use database — hot_cache only has recent in-memory frames.
-                        let now = Utc::now();
                         let is_today = (cache_clone.is_today(start_time).await
                             || cache_clone.is_today(end_time).await)
                             && end_time >= now;
@@ -456,7 +516,7 @@ async fn handle_stream_frames_socket(
                             } // lock dropped
 
                             for frame in sorted {
-                                let _ = frame_tx.send(frame).await;
+                                let _ = frame_tx.send(StreamEvent::Frame(frame)).await;
                             }
 
                             let backfill_limit = limit.saturating_sub(initial_count);
@@ -499,16 +559,21 @@ async fn handle_stream_frames_socket(
                                                 if frame.frame_data.is_empty() {
                                                     continue;
                                                 }
-                                                if frame_tx_db.send(frame).await.is_err() {
+                                                if frame_tx_db.send(StreamEvent::Frame(frame)).await.is_err() {
                                                     break;
                                                 }
                                             }
                                             info!("Today DB backfill complete");
                                         }
-                                        Err(e) => warn!("Today DB backfill failed: {}", e),
+                                        Err(e) => {
+                                            warn!("Today DB backfill failed: {}", e);
+                                            completion.error = Some(e.to_string());
+                                        },
                                     }
+                                    let _ = frame_tx_db.send(StreamEvent::Complete(completion)).await;
                                 });
                             } else {
+                                let _ = frame_tx.send(StreamEvent::Complete(completion)).await;
                                 info!(
                                     "skipping DB backfill — hot cache covers full range or stream limit reached"
                                 );
@@ -526,7 +591,7 @@ async fn handle_stream_frames_socket(
                                         db,
                                         start_time,
                                         end_time,
-                                        frame_tx,
+                                        frame_tx.clone(),
                                         is_descending,
                                         limit,
                                         sent_ids,
@@ -536,9 +601,16 @@ async fn handle_stream_frames_socket(
 
                                 match fetch_result {
                                     Ok(Ok(_)) => info!("Past-day fetch complete"),
-                                    Ok(Err(e)) => error!("Past-day fetch failed: {}", e),
-                                    Err(_) => warn!("Past-day fetch timed out after 120s"),
+                                    Ok(Err(e)) => {
+                                        error!("Past-day fetch failed: {}", e);
+                                        completion.error = Some(e.to_string());
+                                    },
+                                    Err(_) => {
+                                        warn!("Past-day fetch timed out after 120s");
+                                        completion.error = Some("Timeline request timed out".into());
+                                    },
                                 }
+                                let _ = frame_tx.send(StreamEvent::Complete(completion)).await;
                             });
                         }
                     }
@@ -572,11 +644,22 @@ async fn handle_stream_frames_socket(
                     }
                 } => {
                     match frame {
-                        Some(tsf) => {
+                        Some(StreamEvent::Complete(completion)) => {
+                            // The same channel orders completion after every frame
+                            // in this range, including a range with no frames.
+                            if send_batch(&mut sender, &mut frame_buffer).await.is_err() { break; }
+                            next_batch_flush_at = None;
+                            let text = serde_json::to_string(&completion).expect("stream completion");
+                            if sender.send(Message::Text(text)).await.is_err() { break; }
+                        }
+                        Some(StreamEvent::Frame(tsf)) => {
                             if let Some(ref error) = tsf.error {
                                 let _ = sender
                                     .send(Message::Text(format!("{{\"error\": \"{}\"}}", error)))
                                     .await;
+                                continue;
+                            }
+                            if !history_access.allows(tsf.timestamp, Utc::now()) {
                                 continue;
                             }
                             push_stream_batch(
@@ -606,6 +689,9 @@ async fn handle_stream_frames_socket(
                             // Check if live subscription is active
                             let is_live = live_subscribe.lock().await.unwrap_or(false);
                             if !is_live {
+                                continue;
+                            }
+                            if !history_access.allows(hot_frame.timestamp, Utc::now()) {
                                 continue;
                             }
                             // Skip already-sent frames
@@ -644,6 +730,7 @@ async fn handle_stream_frames_socket(
                                     audio: audio_entries
                                         .into_iter()
                                         .map(|a| AudioData {
+                                            captured_at: a.captured_at,
                                             device_name: a.device_name,
                                             is_input: a.is_input,
                                             transcription: a.transcription,
@@ -692,12 +779,16 @@ async fn handle_stream_frames_socket(
                             if !is_live {
                                 continue;
                             }
+                            if !history_access.allows(hot_audio.timestamp, Utc::now()) {
+                                continue;
+                            }
                             // Send a lightweight audio-update message so the
                             // frontend can merge transcription into existing frames.
                             let update = serde_json::json!({
                                 "type": "audio_update",
                                 "timestamp": hot_audio.timestamp,
                                 "audio": {
+                                    "captured_at": hot_audio.captured_at(),
                                     "device_name": hot_audio.device_name,
                                     "is_input": hot_audio.is_input,
                                     "transcription": hot_audio.transcription,
@@ -758,7 +849,7 @@ async fn fetch_and_process_frames_with_tracking(
     db: Arc<DatabaseManager>,
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
-    frame_tx: mpsc::Sender<TimeSeriesFrame>,
+    frame_tx: mpsc::Sender<StreamEvent>,
     is_descending: bool,
     limit: usize,
     sent_frame_ids: Arc<Mutex<std::collections::HashSet<i64>>>,
@@ -796,7 +887,7 @@ async fn fetch_and_process_frames_with_tracking(
         if latest_timestamp.is_none() || ts > latest_timestamp.unwrap() {
             latest_timestamp = Some(ts);
         }
-        frame_tx.send(frame).await?;
+        frame_tx.send(StreamEvent::Frame(frame)).await?;
     }
 
     Ok(latest_timestamp)
@@ -886,6 +977,123 @@ mod tests {
     use super::*;
     use screenpipe_db::{AudioEntry as DbAudioEntry, FrameData, OCREntry, OcrEngine};
 
+    #[tokio::test]
+    async fn timeline_websocket_completes_empty_cached_and_database_ranges() {
+        assert_timeline_ranges_complete(true).await;
+    }
+
+    #[tokio::test]
+    async fn timeline_websocket_reads_saved_history_with_screenshots_off() {
+        assert_timeline_ranges_complete(false).await;
+    }
+
+    async fn assert_timeline_ranges_complete(warm_cache: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+                .await
+                .unwrap(),
+        );
+        let today = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let previous = today - chrono::Duration::minutes(1);
+        let mut tx = db.begin_immediate_with_retry().await.unwrap();
+        sqlx::query("INSERT INTO frames(id,timestamp,full_text,snapshot_path,device_name) VALUES(1,?,'previous day','/tmp/synthetic-timeline.jpg','monitor')")
+            .bind(previous).execute(&mut **tx.conn()).await.unwrap();
+        if !warm_cache {
+            sqlx::query("INSERT INTO frames(id,timestamp,full_text,snapshot_path,device_name) VALUES(2,?,'saved today','/tmp/synthetic-timeline.jpg','monitor')")
+                .bind(Utc::now()).execute(&mut **tx.conn()).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        db.seal_frame_payloads().await.unwrap();
+        let cache = Arc::new(crate::hot_frame_cache::HotFrameCache::new());
+        if warm_cache {
+            cache.warm_from_db(&db, 24).await;
+            assert!(cache.earliest_coverage().await.unwrap() < today);
+        }
+        let audio = Arc::new(
+            screenpipe_audio::audio_manager::AudioManagerBuilder::new()
+                .is_disabled(true)
+                .output_path(root.path().join("audio"))
+                .build(Arc::clone(&db))
+                .await
+                .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut server = crate::SCServer::new(
+            Arc::clone(&db),
+            address,
+            root.path().to_path_buf(),
+            true,
+            true,
+            audio,
+            false,
+            "balanced".into(),
+        );
+        server.timeline_disabled = true;
+        server.advertise_mdns = false;
+        server.hot_frame_cache = Some(cache);
+        let router = server.try_create_router().await.unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(crate::SCServer::serve_router_with_listener_graceful(
+            address,
+            listener,
+            router,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/stream/frames"))
+                .await
+                .unwrap();
+        // Warm variant: today's covered range is empty. Cold variant: today's
+        // saved frame must arrive from the DB without the 30-second warm wait.
+        // Past days exercise empty and populated DB ranges in both variants.
+        for (day, expected) in [
+            (today, if warm_cache { 0 } else { 1 }),
+            (today - chrono::Duration::days(2), 0),
+            (today - chrono::Duration::days(1), 1),
+        ] {
+            let end = day + chrono::Duration::days(1) - chrono::Duration::milliseconds(1);
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::json!({"start_time":day,"end_time":end,"order":"descending","limit":2500}).to_string().into())).await.unwrap();
+            let mut received = 0;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let message = socket.next().await.unwrap().unwrap();
+                    if !message.is_text() {
+                        continue;
+                    }
+                    let value: serde_json::Value =
+                        serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    if let Some(batch) = value.as_array() {
+                        received += batch.len();
+                    }
+                    if value["type"] == "stream_complete" {
+                        assert!(value.get("error").is_none(), "{value}");
+                        assert_eq!(value["start_time"], serde_json::to_value(day).unwrap());
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("every range must finish without waiting for keepalive");
+            assert_eq!(received, expected);
+        }
+        socket.close(None).await.unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        db.close().await;
+    }
+
     fn create_test_frame_data(num_ocr_entries: usize, num_audio_entries: usize) -> FrameData {
         let ocr_entries: Vec<OCREntry> = (0..num_ocr_entries)
             .map(|i| OCREntry {
@@ -900,6 +1108,7 @@ mod tests {
 
         let audio_entries: Vec<DbAudioEntry> = (0..num_audio_entries)
             .map(|i| DbAudioEntry {
+                captured_at: Some(Utc::now()),
                 transcription: format!("Audio transcription {}", i),
                 device_name: format!("microphone_{}", i),
                 is_input: true,
@@ -1062,6 +1271,64 @@ mod tests {
         );
     }
 
+    fn stream_request(start: &str, end: &str) -> StreamFramesRequest {
+        StreamFramesRequest {
+            start_time: start.parse().unwrap(),
+            end_time: end.parse().unwrap(),
+            order: Order::Descending,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn restricted_stream_clamps_crossing_ranges_at_the_inclusive_cutoff() {
+        let now: DateTime<Utc> = "2026-08-24T20:00:00Z".parse().unwrap();
+        let cutoff = now - chrono::Duration::hours(24);
+        let mut request = stream_request("2026-08-20T00:00:00Z", "2026-08-24T20:00:00Z");
+
+        assert!(!apply_stream_history_access(
+            &HistoryAccessPolicy::last_24_hours(),
+            &mut request,
+            now,
+        ));
+        assert_eq!(request.start_time, cutoff);
+
+        let mut exact = stream_request("2026-08-20T00:00:00Z", "2026-08-23T20:00:00Z");
+        assert!(!apply_stream_history_access(
+            &HistoryAccessPolicy::last_24_hours(),
+            &mut exact,
+            now,
+        ));
+        assert_eq!(exact.start_time, cutoff);
+        assert_eq!(exact.end_time, cutoff);
+    }
+
+    #[test]
+    fn restricted_stream_marks_wholly_old_ranges_empty() {
+        let now: DateTime<Utc> = "2026-08-24T20:00:00Z".parse().unwrap();
+        let mut request = stream_request("2026-08-20T00:00:00Z", "2026-08-23T19:59:59Z");
+
+        assert!(apply_stream_history_access(
+            &HistoryAccessPolicy::last_24_hours(),
+            &mut request,
+            now,
+        ));
+    }
+
+    #[test]
+    fn unrestricted_stream_preserves_old_ranges() {
+        let now: DateTime<Utc> = "2026-08-24T20:00:00Z".parse().unwrap();
+        let mut request = stream_request("2025-08-20T00:00:00Z", "2025-08-21T00:00:00Z");
+        let original_start = request.start_time;
+
+        assert!(!apply_stream_history_access(
+            &HistoryAccessPolicy::unrestricted(),
+            &mut request,
+            now,
+        ));
+        assert_eq!(request.start_time, original_start);
+    }
+
     #[test]
     fn test_stream_db_fetch_limit_uses_memory_cap_not_display_limit() {
         assert_eq!(stream_db_fetch_limit(0), 0);
@@ -1166,7 +1433,7 @@ mod tests {
         .expect("timeline fetch should succeed");
 
         let mut streamed_frames = Vec::new();
-        while let Some(frame) = frame_rx.recv().await {
+        while let Some(StreamEvent::Frame(frame)) = frame_rx.recv().await {
             streamed_frames.push(frame);
         }
 

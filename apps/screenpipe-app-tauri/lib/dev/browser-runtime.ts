@@ -28,6 +28,10 @@ function parseScenario(value: string | undefined): BrowserDevScenario {
 declare global {
   interface Window {
     __SCREENPIPE_BROWSER_RUNTIME_INSTALLED__?: boolean;
+    __SCREENPIPE_WEB_DEV_EMIT__?: (
+      event: string,
+      payload: unknown,
+    ) => Promise<void>;
   }
 }
 
@@ -37,7 +41,8 @@ export function installBrowserRuntime() {
   if (window.__SCREENPIPE_BROWSER_RUNTIME_INSTALLED__) return;
   window.__SCREENPIPE_BROWSER_RUNTIME_INSTALLED__ = true;
 
-  const apiPort = Number(process.env.NEXT_PUBLIC_SCREENPIPE_WEB_API_PORT) || 3030;
+  const apiPort =
+    Number(process.env.NEXT_PUBLIC_SCREENPIPE_WEB_API_PORT) || 3030;
   const scenario = parseScenario(
     process.env.NEXT_PUBLIC_SCREENPIPE_WEB_SCENARIO,
   );
@@ -51,20 +56,25 @@ export function installBrowserRuntime() {
     exe_extension: "",
   };
 
-  mockWindows("main");
+  mockWindows("home");
   mockConvertFileSrc("macos");
   mockIPC(
     createBrowserIpcMock({
+      systemLocale: new URLSearchParams(window.location.search).get("mockLocale") ?? undefined,
       mode,
+      scenario,
       apiPort,
       apiKey: process.env.NEXT_PUBLIC_SCREENPIPE_WEB_API_KEY,
       onStoreChange: (change) => {
         void emit("store://change", change);
       },
+      onEvent: (event, payload) => { void emit(event, payload); },
       warn: console.warn,
     }),
     { shouldMockEvents: true },
   );
+  window.__SCREENPIPE_WEB_DEV_EMIT__ = (event, payload) =>
+    emit(event, payload);
 
   if (mode === "mock") installMockEngine(apiPort, scenario);
 

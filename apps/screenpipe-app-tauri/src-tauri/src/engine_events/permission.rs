@@ -14,19 +14,78 @@
 //! the UI shows a softer notification instead of the blocking modal that
 //! TCC losses trigger.
 
+use std::sync::Arc;
+
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
+
+use crate::analytics::AnalyticsManager;
 
 /// Handle one frame of `permission_lost`, `permission_restored`, or
 /// `permission_needed`. Called from [`super::dispatch`].
 pub(super) fn handle(app: &AppHandle, name: &str, data: &Value) {
+    let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let audio_disabled = crate::store::SettingsStore::get(app)
+        .ok()
+        .flatten()
+        .map(|settings| !crate::permissions::microphone_required(&settings.recording))
+        .unwrap_or(false);
+    if kind == "microphone" && audio_disabled {
+        debug!("microphone permission event ignored while audio capture is disabled");
+        return;
+    }
     match name {
         "permission_lost" => handle_lost(app, data),
         "permission_restored" => handle_restored(app, data),
         "permission_needed" => handle_needed(app, data),
         _ => debug!("permission::handle called with unexpected name: {}", name),
     }
+}
+
+/// PostHog properties for a permission engine event.
+///
+/// `permission_lost` keeps the boolean property names of the old webview
+/// capture (`use-permission-monitor.tsx`) so existing PostHog insights keep
+/// working across the move; `kind` and `capture_source` are additive.
+fn telemetry_props(name: &str, data: &Value) -> Value {
+    let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let reason = data.get("reason").and_then(|v| v.as_str());
+    match name {
+        "permission_lost" => serde_json::json!({
+            "screen_recording_lost": kind == "screen_recording",
+            "microphone_lost": kind == "microphone",
+            "accessibility_lost": kind == "accessibility",
+            "browser_automation_lost": false,
+            "kind": kind,
+            "reason": reason,
+            "capture_source": "app_backend",
+        }),
+        _ => serde_json::json!({
+            "kind": kind,
+            "capture_source": "app_backend",
+        }),
+    }
+}
+
+/// Send the event to PostHog from the backend.
+///
+/// This used to happen in the main webview, which is destroyed in
+/// dormant/headless mode — exactly the tray-only population where a revoked
+/// grant (e.g. Deny on the macOS periodic screen-recording re-approval
+/// alert) otherwise kills capture with zero telemetry. The engine emits
+/// these events on state transitions only, so volume stays one event per
+/// loss/restore.
+fn track(app: &AppHandle, event: &'static str, data: &Value) {
+    let props = telemetry_props(event, data);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(analytics) = app.try_state::<Arc<AnalyticsManager>>() {
+            if let Err(e) = analytics.send_event(event, Some(props)).await {
+                warn!("failed to send {} telemetry: {}", event, e);
+            }
+        }
+    });
 }
 
 fn handle_lost(app: &AppHandle, data: &Value) {
@@ -38,6 +97,7 @@ fn handle_lost(app: &AppHandle, data: &Value) {
         return;
     }
     let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    track(app, "permission_lost", data);
 
     if kind == "keychain" {
         info!(event = %data, "permission-lost keychain (from engine)");
@@ -70,6 +130,9 @@ fn handle_lost(app: &AppHandle, data: &Value) {
 
 fn handle_restored(app: &AppHandle, data: &Value) {
     let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    // Restores were never tracked before — without them there is no way to
+    // measure how many lost grants recover, or how long recovery takes.
+    track(app, "permission_restored", data);
     if kind == "keychain" {
         info!(event = %data, "permission-restored keychain (from engine)");
         if let Err(e) = app.emit("permission-restored-keychain", data.clone()) {
@@ -91,6 +154,7 @@ fn handle_needed(app: &AppHandle, data: &Value) {
         return;
     }
     let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    track(app, "permission_needed", data);
     info!(kind = %kind, "permission_needed (from engine)");
     // Forward raw payload — frontend PermissionNeededPayload expects { kind }.
     if let Err(e) = app.emit("permission_needed", data.clone()) {
@@ -104,5 +168,45 @@ fn onboarding_completed(app: &AppHandle) -> bool {
     match crate::store::OnboardingStore::get(app) {
         Ok(Some(store)) => store.is_completed,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::telemetry_props;
+    use serde_json::json;
+
+    #[test]
+    fn lost_props_map_kind_to_booleans_and_carry_reason() {
+        let props = telemetry_props(
+            "permission_lost",
+            &json!({"kind": "screen_recording", "reason": "poll"}),
+        );
+        assert_eq!(props["screen_recording_lost"], json!(true));
+        assert_eq!(props["microphone_lost"], json!(false));
+        assert_eq!(props["accessibility_lost"], json!(false));
+        assert_eq!(props["kind"], json!("screen_recording"));
+        assert_eq!(props["reason"], json!("poll"));
+        assert_eq!(props["capture_source"], json!("app_backend"));
+    }
+
+    #[test]
+    fn lost_props_keychain_sets_no_tcc_booleans() {
+        let props = telemetry_props("permission_lost", &json!({"kind": "keychain"}));
+        assert_eq!(props["screen_recording_lost"], json!(false));
+        assert_eq!(props["microphone_lost"], json!(false));
+        assert_eq!(props["accessibility_lost"], json!(false));
+        assert_eq!(props["kind"], json!("keychain"));
+        assert_eq!(props["reason"], json!(null));
+    }
+
+    #[test]
+    fn restored_and_needed_props_carry_kind() {
+        for name in ["permission_restored", "permission_needed"] {
+            let props = telemetry_props(name, &json!({"kind": "microphone"}));
+            assert_eq!(props["kind"], json!("microphone"));
+            assert_eq!(props["capture_source"], json!("app_backend"));
+            assert!(props.get("screen_recording_lost").is_none());
+        }
     }
 }
