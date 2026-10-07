@@ -146,7 +146,7 @@ fn recording_access_policy(
 pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
     recording_access_policy(
         cfg!(feature = "enterprise-build"),
-        cfg!(debug_assertions),
+        cfg!(debug_assertions) || cfg!(feature = "dev-billing-bypass"),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
         store.app_entitled_or_dev(),
         !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
