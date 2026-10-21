@@ -124,6 +124,14 @@ fn configured_local_api_port(app: &tauri::AppHandle) -> u16 {
         .unwrap_or(DEFAULT_LOCAL_API_PORT)
 }
 
+/// True when this build should skip the sign-in / billing gate entirely.
+/// Mirrors the frontend's NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS flag.
+/// Debug builds get this automatically; release builds opt in via the
+/// `dev-billing-bypass` Cargo feature (see scripts/local-build/build.ps1).
+fn dev_billing_bypass_active() -> bool {
+    cfg!(debug_assertions) || cfg!(feature = "dev-billing-bypass")
+}
+
 fn recording_access_policy(
     is_enterprise_build: bool,
     dev_bypass: bool,
@@ -174,6 +182,9 @@ fn server_access_policy(
 }
 
 pub(crate) fn server_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
+    if dev_billing_bypass_active() {
+        return true;
+    }
     let startup_authentication = app
         .try_state::<crate::startup_auth::AuthenticationStatus>()
         .map(|status| *status)
@@ -191,7 +202,7 @@ pub(crate) fn server_access_allowed(app: &tauri::AppHandle, store: &SettingsStor
 
     server_access_policy(
         cfg!(feature = "enterprise-build"),
-        cfg!(debug_assertions),
+        dev_billing_bypass_active(),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
         crate::enterprise_policy::recording_authorized(),
         !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
@@ -202,6 +213,9 @@ pub(crate) fn server_access_allowed(app: &tauri::AppHandle, store: &SettingsStor
 /// Enterprise builds keep their native entitlement guard, and consumer builds
 /// still reject accounts that are required to use an enterprise binary.
 pub(crate) fn recording_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
+    if dev_billing_bypass_active() {
+        return true;
+    }
     let trial_activation_paywall = !crate::should_skip_onboarding()
         && OnboardingStore::get(app)
             .ok()
@@ -229,7 +243,7 @@ pub(crate) fn recording_access_allowed(app: &tauri::AppHandle, store: &SettingsS
     };
     recording_access_policy(
         cfg!(feature = "enterprise-build"),
-        cfg!(debug_assertions) || cfg!(feature = "dev-billing-bypass"),
+        dev_billing_bypass_active(),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
         crate::enterprise_policy::recording_authorized(),
         !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),

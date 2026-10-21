@@ -78,9 +78,10 @@ $env:PATH = "$libDir;$env:PATH"
 Set-Location (Join-Path $root "apps\screenpipe-app-tauri")
 bun install --frozen-lockfile
 bun tauri build --target x86_64-pc-windows-msvc --features directml,redact-onnx-directml,dev-billing-bypass
+if ($LASTEXITCODE -ne 0) { throw "bun tauri build failed with exit code $LASTEXITCODE" }
 
 $bundleDir = Join-Path $root "apps\screenpipe-app-tauri\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis"
-$installer = Get-ChildItem "$bundleDir\*-setup.exe" | Select-Object -First 1
+$installer = Get-ChildItem "$bundleDir\*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $installer) { throw "installer not found in $bundleDir" }
 Write-Host "installer built: $($installer.FullName)"
 
