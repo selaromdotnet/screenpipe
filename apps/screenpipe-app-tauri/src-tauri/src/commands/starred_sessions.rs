@@ -5,8 +5,8 @@ use crate::window::GatedWindowPlacement;
 use tauri::{Emitter, Manager};
 
 const LABEL: &str = "starred-sessions";
-const WIDTH: f64 = 360.0;
-const HEIGHT: f64 = 420.0;
+const WIDTH: f64 = 308.0;
+const HEIGHT: f64 = 128.0;
 
 /// Place below the trigger, or above it at the bottom edge, in one coordinate space.
 fn attached_origin(anchor: (f64, f64, f64, f64), screen: (f64, f64, f64, f64)) -> (f64, f64) {
@@ -284,6 +284,10 @@ fn show(app: &tauri::AppHandle) -> Result<(), String> {
             window
         }
     };
+    // Reset a previously expanded panel before placing the compact controls.
+    window
+        .set_size(tauri::LogicalSize::new(WIDTH, HEIGHT))
+        .map_err(|e| e.to_string())?;
     // Wayland compositors may refuse absolute placement. The controls must
     // still open; the compositor chooses their position in that case.
     #[cfg(target_os = "linux")]
@@ -321,15 +325,11 @@ fn show(app: &tauri::AppHandle) -> Result<(), String> {
         }
         window.show().map_err(|e| e.to_string())?;
         panel.order_front_regardless();
-        crate::window::make_panel_key_if_allowed(&panel);
-        unsafe {
-            crate::window::make_webview_first_responder(&panel);
-        }
+        // Passive confirmation must not take keyboard focus from the current app.
     }
     #[cfg(not(target_os = "macos"))]
     {
         window.show().map_err(|e| e.to_string())?;
-        crate::window::focus_window(&window);
     }
     let _ = window.emit("starred-sessions-visibility", true);
     Ok(())
@@ -397,11 +397,11 @@ mod tests {
     fn starred_panel_hugs_trigger_and_stays_on_its_display() {
         assert_eq!(
             attached_origin((700.0, 12.0, 22.0, 16.0), (0.0, 0.0, 1440.0, 900.0)),
-            (531.0, 34.0)
+            (557.0, 34.0)
         );
         assert_eq!(
             attached_origin((1400.0, 850.0, 22.0, 16.0), (0.0, 0.0, 1440.0, 900.0)),
-            (1080.0, 424.0)
+            (1132.0, 716.0)
         );
         assert_eq!(
             attached_origin(
@@ -420,7 +420,7 @@ mod tests {
                 (-2560.0, 0.0, 2560.0, 1540.0),
                 1.5
             ),
-            (-1620, 861),
+            (-1581, 1299),
         );
         // A 200% display above the primary, with reserved space on the left.
         assert_eq!(
@@ -431,14 +431,14 @@ mod tests {
             ),
             (80, -1506),
         );
-        // Right edge at 125%: the entire 450px picker stays inside the work area.
+        // Right edge at 125%: the entire 385px picker stays inside the work area.
         assert_eq!(
             physical_origin(
                 (3730.0, 20.0, 28.0, 20.0),
                 (1920.0, 0.0, 1840.0, 1000.0),
                 1.25
             ),
-            (3310, 48),
+            (3375, 48),
         );
     }
 }

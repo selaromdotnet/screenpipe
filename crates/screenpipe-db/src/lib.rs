@@ -31,6 +31,7 @@ mod cancellable_query;
 mod db;
 #[cfg(test)]
 mod failpoint_vfs;
+pub mod planner_stats;
 mod recovery;
 mod sqlite_error;
 pub mod storage;
@@ -79,3 +80,6 @@ pub use write_queue::{
     request_write_resume, DatabaseRestartHook, DatabaseRestartReason, PersistentFailureHook,
     SyncTable, WriteQueueHealth, WRITE_LOCK_HELD_MESSAGE, WRITE_POOL_STARVED_MESSAGE,
 };
+
+pub use db::privacy_exports;
+pub use db::privacy_release;

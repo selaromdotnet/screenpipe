@@ -346,6 +346,10 @@ async fn collect_migration_diagnostics_from_root(root: std::path::PathBuf) -> St
             // if the snapshot directory is missing or unreadable.
             json!({
                 "attempts": attempts,
+                "sqlite_planner": match screenpipe_db::planner_stats::report(&root) {
+                    Ok(report) => json!(report),
+                    Err(_) => json!({"error": "Could not read SQLite planner maintenance diagnostics"}),
+                },
                 "retry_block": crate::storage_migration::saved_migration_error(&root),
             })
         }),
@@ -660,13 +664,17 @@ async fn run_feedback_upload(
     let screenshot = prepare_screenshot(request.screenshot_data_url.as_deref())?;
     let video = prepare_video(request)?;
     let logs = collect_log_text(app).await;
-    let (recording_diagnostics, migration_diagnostics) = tokio::join!(
+    let (recording_diagnostics, migration_diagnostics, process_diagnostics) = tokio::join!(
         collect_recording_diagnostics(app),
         collect_migration_diagnostics(app),
+        collect_process_diagnostics(),
     );
-    let raw_bundle = format!(
-        "{}{}\n\n=== Browser Console Logs ===\n{}\n\n=== Recording Diagnostics ===\n{}\n\n=== Storage Migration Diagnostics ===\n{}",
-        request.chat_history, logs, request.console_log, recording_diagnostics, migration_diagnostics
+    let raw_bundle = assemble_diagnostic_bundle(
+        request,
+        &logs,
+        &recording_diagnostics,
+        &migration_diagnostics,
+        &process_diagnostics,
     );
     let raw_bundle =
         append_localization_diagnostics(raw_bundle, &crate::localization::diagnostics());
@@ -688,6 +696,43 @@ async fn run_feedback_upload(
         video,
     )
     .await
+}
+
+fn assemble_diagnostic_bundle(
+    request: &FeedbackUploadRequest,
+    logs: &str,
+    recording_diagnostics: &str,
+    migration_diagnostics: &str,
+    process_diagnostics: &str,
+) -> String {
+    let bundle = format!(
+        "{}{}\n\n=== Browser Console Logs ===\n{}\n\n=== Recording Diagnostics ===\n{}\n\n=== Storage Migration Diagnostics ===\n{}",
+        request.chat_history, logs, request.console_log, recording_diagnostics, migration_diagnostics
+    );
+    #[cfg(target_os = "windows")]
+    return format!("{bundle}\n\n=== Windows Process Diagnostics ===\n{process_diagnostics}");
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = process_diagnostics;
+        bundle
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn collect_process_diagnostics() -> String {
+    match tokio::task::spawn_blocking(crate::windows_process_diagnostics::collect).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => json!({
+            "capturedAt": chrono::Utc::now().to_rfc3339(),
+            "status": "unavailable",
+            "probeErrors": [format!("snapshot task failed: {error}")],
+        }).to_string(),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn collect_process_diagnostics() -> String {
+    String::new()
 }
 
 pub(crate) fn append_localization_diagnostics(bundle: String, diagnostics: &str) -> String {
@@ -778,6 +823,48 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_process_snapshot_failure_reaches_upload_after_redaction() {
+        let mut request = request();
+        request.chat_history = "contact=popup-canary@example.com password=popup-secret".into();
+        let process_diagnostics =
+            crate::windows_process_diagnostics::collect_after_failed_process_probe();
+        let snapshot: serde_json::Value = serde_json::from_str(&process_diagnostics).unwrap();
+        assert_eq!(snapshot["status"], "partial");
+        assert_eq!(snapshot["screenpipeState"], "unavailable");
+        let native_cause = snapshot["probeErrors"][0].as_str().unwrap();
+        assert!(native_cause.contains("OpenProcess"));
+        assert!(native_cause.contains("HRESULT=0x"));
+        let raw = assemble_diagnostic_bundle(&request, "", "{}", "{}", &process_diagnostics);
+        let redacted = crate::feedback_redact::redact_diagnostics_locally(raw).await.unwrap();
+        assert!(redacted.contains("Windows Process Diagnostics"));
+        assert!(redacted.contains(native_cause));
+        assert!(!redacted.contains("popup-canary"));
+        assert!(!redacted.contains("popup-secret"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/api/logs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "signedUrl": format!("{}/upload/log", server.uri()), "path": "logs/report.log"
+            }}))).mount(&server).await;
+        Mock::given(method("PUT")).and(path("/upload/log"))
+            .and(body_bytes(redacted.as_bytes())).respond_with(ResponseTemplate::new(200))
+            .mount(&server).await;
+        Mock::given(method("POST")).and(path("/api/logs/confirm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"id": 42}})))
+            .mount(&server).await;
+        upload_report(&Client::new(), &server.uri(), &request, redacted, None, None)
+            .await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let upload = requests.iter().find(|request| request.method == "PUT").unwrap();
+        let report = String::from_utf8_lossy(&upload.body);
+        assert!(report.contains(native_cause));
+        assert!(report.contains("partial"));
+        assert!(!report.contains("popup-canary"));
+        assert!(!report.contains("popup-secret"));
+    }
+
     #[tokio::test]
     async fn pi_transport_cause_reaches_support_after_rotation_and_redaction() {
         let logs = tempfile::tempdir().unwrap();
@@ -834,6 +921,73 @@ mod tests {
             "pipe 'daily-summary' error: The system cannot find the file specified. (os error 2)"
         ));
         assert!(!report.contains("private-person"));
+        assert!(!report.contains("hunter2"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn starter_skill_failure_reaches_support_after_rotation_and_redaction() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().canonicalize().unwrap().join("skills");
+        std::fs::create_dir(&skills).unwrap();
+        let (name, body) = screenpipe_core::starter_skills::STARTER_SKILLS[0];
+        symlink(root.path().join("missing"), skills.join(name)).unwrap();
+        let cause = screenpipe_core::starter_skills::install_one(&skills, name, body)
+            .unwrap_err()
+            .to_string();
+        let logs = tempfile::tempdir().unwrap();
+        std::fs::write(logs.path().join("screenpipe-app.2026-10-12.log"),
+            format!("WARN AI tool background setup could not connect one tool failure=Claude Code: {cause} password=hunter2\n")).unwrap();
+        std::fs::write(logs.path().join("screenpipe-app.2026-10-13.log"),
+            "INFO capture session schedule initialized schedule_enabled=false schedule_rules=0 schedule_paused=false\n").unwrap();
+        let files = crate::log_files::collect_log_files(&[logs.path().to_path_buf()]).await;
+        let raw = collect_log_text_from_files(files).await;
+        let redacted = crate::feedback_redact::redact_diagnostics_locally(raw)
+            .await
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/logs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "signedUrl": format!("{}/upload/log", server.uri()), "path": "logs/report.log"
+            }})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/log"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/logs/confirm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"id": 42}})))
+            .mount(&server)
+            .await;
+        upload_report(
+            &Client::new(),
+            &server.uri(),
+            &request(),
+            redacted,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let upload = requests.iter().find(|r| r.method == "PUT").unwrap();
+        let report = String::from_utf8_lossy(&upload.body);
+        for expected in [
+            "Claude Code",
+            "screenpipe-recall/SKILL.md",
+            "os error 2",
+            "repair the link and retry",
+            "existing files were preserved",
+            "schedule_enabled=false",
+            "schedule_paused=false",
+        ] {
+            assert!(report.contains(expected), "missing {expected}: {report}");
+        }
         assert!(!report.contains("hunter2"));
     }
 
@@ -1359,6 +1513,134 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn planner_maintenance_failure_survives_restart_and_reaches_redacted_support() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db.sqlite");
+        let db = screenpipe_db::DatabaseManager::new(
+            path.to_str().unwrap(),
+            screenpipe_config::DbConfig { write_pool_max: 1, ..Default::default() },
+        )
+        .await
+        .unwrap();
+        db.execute_raw_sql_write("INSERT INTO frames(timestamp,full_text) VALUES('2026-10-08','private history password=hunter2')").await.unwrap();
+        db.execute_raw_sql_write("PRAGMA query_only=ON").await.unwrap();
+        // A genuine SQLite failure, not a fabricated diagnostic record.
+        let attempt = db.maintain_planner_statistics().await;
+        assert_eq!(attempt.sqlite_code.as_deref(), Some("8"));
+        db.execute_raw_sql_write("PRAGMA query_only=OFF").await.unwrap();
+        db.close().await;
+        // The originating engine and its rolling logs are gone. Collect and
+        // redact the persisted attempt, then inspect the mock support upload.
+        assert_migration_report_uploaded(
+            root.path(),
+            &[
+                "sqlite_planner", "duration_ms", "last_failure", "deferred",
+                "attempt to write a readonly database", "sqlite_code",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compact_preflight_failure_reaches_support_after_restart_and_rotation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = screenpipe_db::storage::MigrationOptions::default();
+        options.budget.disk_reserve_bytes = 0;
+        let db =
+            screenpipe_db::DatabaseManager::new_hybrid(root.path(), Default::default(), options)
+                .await
+                .unwrap();
+        let mut descriptor = screenpipe_db::storage::StorageDescriptor::read(root.path())
+            .unwrap()
+            .unwrap();
+        descriptor.budget.disk_reserve_bytes = u64::MAX;
+        db.execute_raw_sql_write(&format!(
+            "UPDATE storage_metadata SET descriptor='{}'",
+            serde_json::to_string(&descriptor).unwrap().replace('\'', "''"),
+        )).await.unwrap();
+        std::fs::write(
+            root.path().join("storage.json"),
+            serde_json::to_vec(&descriptor).unwrap(),
+        )
+        .unwrap();
+        db.close().await;
+        // Run the real preflight and persist its outcome before collecting it.
+        let error = screenpipe_db::storage::diagnostics::observe(
+            root.path(),
+            "compact",
+            |_, _| {},
+            async {
+                let result = screenpipe_db::storage::compact(root.path(), Default::default()).await;
+                // Desktop keeps one attempt through failed compaction and reopen.
+                // Recovery must not overwrite the originating preflight failure.
+                screenpipe_db::storage::diagnostics::stage("restoring_recording_after_compact");
+                screenpipe_db::storage::recover_interrupted_compaction(
+                    root.path(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+                let reopened = screenpipe_db::DatabaseManager::new(
+                    root.path().join("db.sqlite").to_str().unwrap(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+                reopened
+                    .insert_audio_chunk("recording-after-refused-compaction.wav", None)
+                    .await
+                    .unwrap();
+                reopened.close().await;
+                result
+            },
+        )
+        .await
+        .unwrap_err();
+        wait_for_migration_failure(root.path()).await;
+        assert!(error
+            .to_string()
+            .contains("insufficient compact disk reserve"));
+        assert!(!root.path().join("storage-maintenance.json").exists());
+        // Subsequent recovery attempts must not displace the compaction cause.
+        for kind in ["recovery1", "recovery2", "recovery3", "recovery4"] {
+            screenpipe_db::storage::diagnostics::observe(root.path(), kind, |_, _| {}, async {
+                Ok::<_, String>(())
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if screenpipe_db::storage::diagnostics::recent(root.path())
+                        .unwrap()
+                        .iter()
+                        .any(|snapshot| snapshot.kind == kind && snapshot.status == "completed")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_migration_report_uploaded(
+            root.path(),
+            &[
+                "compact",
+                "failed",
+                "compact_copy_preflight",
+                "insufficient compact disk reserve",
+                "available_bytes",
+                "required_bytes",
+                "reserve_bytes",
+                "source retained",
+                "retry compact",
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]

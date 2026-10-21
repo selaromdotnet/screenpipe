@@ -533,6 +533,9 @@ export function createBrowserIpcMock(options: BrowserIpcMockOptions) {
           source,
           sourceId: `${source}-browser-dev-${index}`,
           importedAt: timestamp,
+          config: source === "codex"
+            ? { model: "gpt-5.4", reasoningEffort: "high" }
+            : { model: "claude-sonnet-4-6", modeId: "plan" },
           harness,
         },
         messages: [
@@ -675,6 +678,8 @@ export function createBrowserIpcMock(options: BrowserIpcMockOptions) {
     }
 
     switch (command) {
+      case "get_keychain_status":
+        return { state: "unavailable" };
       case "get_env":
         return options.mode === "mock" && input.name === "SCREENPIPE_STARTUP_AUTHENTICATION_STATUS" ? "authenticated" : "";
       case "get_onboarding_status":
@@ -687,6 +692,22 @@ export function createBrowserIpcMock(options: BrowserIpcMockOptions) {
         return { ...storageMigration };
       case "get_storage_migration_activity":
         return { ...migrationActivity, elapsed_seconds: migrationActivity.busy ? Math.floor((Date.now() - migrationStartedAt) / 1000) : migrationActivity.elapsed_seconds };
+      case "compact_storage": {
+        if (input.root !== storageMigration.root || input.generation !== storageMigration.generation || !storageMigration.generation || storageMigration.busy) {
+          throw new Error("Storage changed. Review storage and confirm compaction again.");
+        }
+        migrationStartedAt = Date.now();
+        storageMigration = { ...storageMigration, busy: true };
+        migrationActivity = { ...migrationActivity, busy: true, completed: false, message: "compacting database; recording and history are paused" };
+        emitMigrationActivity();
+        // Synthetic time for inspecting the same progress gate used by native maintenance.
+        return new Promise(resolve => setTimeout(() => {
+          storageMigration = { ...storageMigration, busy: false };
+          migrationActivity = { ...migrationActivity, busy: false, message: "" };
+          emitMigrationActivity();
+          resolve(null);
+        }, 2000));
+      }
       case "start_storage_migration": {
         if (input.root !== storageMigration.root || storageMigration.busy) throw new Error("Storage changed or migration is already running.");
         migrationStartedAt = Date.now();

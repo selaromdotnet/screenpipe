@@ -55,6 +55,7 @@ mod audio_exclusions;
 #[cfg(all(test, target_os = "windows", feature = "vulkan"))]
 mod whisper_vulkan_tests;
 mod auth_token;
+mod acquisition_handoff;
 mod brain_views;
 mod calendar;
 mod capture_session;
@@ -128,6 +129,8 @@ mod recording;
 mod remote_support_logs;
 mod remote_sync_commands;
 mod search_only;
+#[cfg(any(target_os = "macos", test))]
+mod manual_handoff;
 mod secrets;
 mod server;
 mod server_core;
@@ -151,6 +154,10 @@ mod window;
 mod workflows_runtime;
 mod workflows_media;
 mod windows_ca_bundle;
+#[cfg(target_os = "windows")]
+mod windows_enterprise_takeover;
+#[cfg(target_os = "windows")]
+mod windows_process_diagnostics;
 #[cfg(target_os = "windows")]
 mod windows_crash_dump;
 #[cfg(target_os = "windows")]
@@ -502,6 +509,45 @@ async fn main() {
     // See `dev_isolation`.
     dev_isolation::apply();
 
+    let focus_port: u16 = std::env::var("SCREENPIPE_FOCUS_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(11435);
+    #[cfg(target_os = "windows")]
+    let api_port: u16 = std::env::var("SCREENPIPE_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| recording::LocalApiContext::default().port);
+
+    // Enterprise owns an edition marker before either build can initialize
+    // Tauri, the store, database, or recorder. Consumer exits based on this
+    // kernel-backed build identity even while Enterprise has not bound a port
+    // or its HTTP endpoints are unhealthy.
+    #[cfg(target_os = "windows")]
+    if !arguments.iter().any(|argument| argument == "--cpu-smoke")
+    {
+        #[cfg(feature = "enterprise-build")]
+        if let Err(error) =
+            windows_enterprise_takeover::publish_enterprise_presence(focus_port, api_port)
+        {
+            eprintln!("screenpipe: enterprise presence initialization failed: {error}");
+            std::process::exit(1);
+        }
+
+        #[cfg(not(feature = "enterprise-build"))]
+        match windows_enterprise_takeover::enterprise_is_present(focus_port, api_port).await {
+            Ok(true) => {
+                eprintln!("screenpipe: Enterprise is running; Consumer startup is blocked.");
+                std::process::exit(0);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("screenpipe: Enterprise presence check failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     linux_webkit_env::configure();
 
@@ -584,10 +630,23 @@ async fn main() {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    if let Err(error) = manual_handoff::initialize().await {
+        eprintln!("screenpipe: manual launch failed: {error:#}");
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    let use_http_handoff = !manual_handoff::owns_launch();
+    #[cfg(not(target_os = "macos"))]
+    let use_http_handoff = true;
+
+    // Packaged macOS launches already authenticated their owner above. Do not
+    // let an unrelated edition at the shared focus port discard this launch.
     // Single-instance check: if sidecar server is already listening, hand off and exit.
     // This covers Linux (where tauri-plugin-single-instance is disabled due to
     // zbus/tokio conflict) and acts as a fallback on macOS/Windows.
-    {
+    if use_http_handoff {
         let args: Vec<String> = std::env::args().collect();
         let deep_link_url = deep_link::url_from_args(&args);
         let launch_exe = std::env::current_exe()
@@ -602,11 +661,22 @@ async fn main() {
         #[cfg(not(target_os = "macos"))]
         let launchd_job_label: Option<String> = None;
 
-        let focus_port: u16 = std::env::var("SCREENPIPE_FOCUS_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(11435);
-        if let Ok(resp) = reqwest::Client::new()
+        #[cfg(all(target_os = "windows", feature = "enterprise-build"))]
+        let enterprise_duplicate = {
+            match windows_enterprise_takeover::take_over_screenpipe_owners(focus_port, api_port)
+                .await
+            {
+                Ok(windows_enterprise_takeover::TakeoverOutcome::SameExecutable) => true,
+                Ok(windows_enterprise_takeover::TakeoverOutcome::NoOwner)
+                | Ok(windows_enterprise_takeover::TakeoverOutcome::ReplacedCompetingOwner) => false,
+                Err(error) => {
+                    eprintln!("screenpipe: enterprise takeover failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        let focus_response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{}/focus", focus_port))
             .timeout(std::time::Duration::from_secs(2))
             .json(&serde_json::json!({
@@ -616,16 +686,29 @@ async fn main() {
                 "launchd_job_label": launchd_job_label,
             }))
             .send()
-            .await
-        {
+            .await;
+
+        #[cfg(all(target_os = "windows", feature = "enterprise-build"))]
+        if enterprise_duplicate {
+            eprintln!("screenpipe: Enterprise is already running — focused existing window, exiting.");
+            std::process::exit(0);
+        }
+
+        if let Ok(resp) = focus_response {
             if resp.status().is_success() {
-                eprintln!("screenpipe: another instance is already running — focused existing window, exiting.");
-                std::process::exit(0);
+                #[cfg(not(all(target_os = "windows", feature = "enterprise-build")))]
+                {
+                    eprintln!("screenpipe: another instance is already running — focused existing window, exiting.");
+                    std::process::exit(0);
+                }
             } else if resp.status() == reqwest::StatusCode::CONFLICT {
+                #[cfg(not(all(target_os = "windows", feature = "enterprise-build")))]
+                {
                 // The control endpoint answered with Screenpipe's explicit
                 // cross-install rejection. Preserve that healthy instance;
                 // the bind path will report it instead of reclaiming its port.
                 crate::port_conflict::mark_healthy_control_server_present();
+                }
             }
         }
     }
@@ -638,20 +721,7 @@ async fn main() {
 
     // Check if telemetry is disabled via store setting (analyticsEnabled)
     let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
-    let store_json = std::fs::read(&store_path).ok().and_then(|data| {
-        if data.len() >= 8 && &data[..8] == b"SPSTORE1" {
-            // The encrypted file is authoritative: every reader asks the OS
-            // vault for its existing key instead of relying on a separate flag.
-            let key = match secrets::get_key() {
-                secrets::KeyResult::Found(k) => k,
-                _ => return None,
-            };
-            let plain = screenpipe_vault::crypto::decrypt_small(&data[8..], &key).ok()?;
-            serde_json::from_slice::<serde_json::Value>(&plain).ok()
-        } else {
-            serde_json::from_slice::<serde_json::Value>(&data).ok()
-        }
-    });
+    let store_json = store::read_startup_store(&store_path).ok();
     // Helper: look up a bool key in the store JSON (check both top-level and nested "settings")
     let store_bool = |key: &str| -> Option<bool> {
         store_json.as_ref().and_then(|data| {
@@ -1072,6 +1142,10 @@ async fn main() {
     // an unrelated developer or CI app silently win before WebDriver starts.
     #[cfg(all(not(target_os = "linux"), not(feature = "e2e")))]
     let app = app.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        #[cfg(target_os = "macos")]
+        if manual_handoff::pending() {
+            return;
+        }
         // Defer off event stack: plugin may invoke this from run loop (nounwind).
         let app_for_closure = app.clone();
         let args_clone = args.clone();
@@ -1087,8 +1161,15 @@ async fn main() {
             // consume one plain main-app handoff from the short guard armed
             // during setup; normal subsequent launches retain Home behavior.
             let login_duplicate = should_suppress_startup_handoff(&args_clone);
+            #[cfg(target_os = "macos")]
+            if !login_duplicate
+                && deep_link_url.is_none()
+                && manual_handoff::reopen(&app_for_closure, "single_instance")
+            {
+                return;
+            }
             if !crate::enterprise_policy::is_app_ui_hidden() && !login_duplicate {
-                if crate::search_only::is_active() {
+                if crate::search_only::needs_wake() {
                     crate::headless::wake_from_tray(&app_for_closure);
                 }
                 match deep_link::handoff_window(deep_link_url.as_deref()) {
@@ -1369,7 +1450,7 @@ async fn main() {
 
             // mlx.metallib and libonnxruntime.dylib are staged at build time
             // for macOS release bundling (see build.rs stage_macos_sidecar_libs).
-            // arm64 bundles mlx.metallib as a Tauri externalBin so Tauri signs it;
+            // arm64 seals mlx.metallib in Resources with its lookup link made before signing;
             // x86_64 copies libonnxruntime.dylib via macOS.files.
             //
             // Previously this block created a symlink at Contents/MacOS/mlx.metallib
@@ -1407,6 +1488,10 @@ async fn main() {
                 std::io::Error::other(e)
             })?;
             let search_only_startup = crate::search_only::initialize(from_autostart);
+            #[cfg(target_os = "windows")]
+            if search_only_startup {
+                tray::sync_search_visibility(&app_handle)?;
+            }
 
             #[cfg(feature = "e2e")]
             e2e::seeds::apply_settings(app.handle(), &mut store);
@@ -1671,14 +1756,8 @@ async fn main() {
             // setup is backgrounded and idempotent: it installs missing MCP +
             // skill entries, refreshes stale screenpipe launchers, and leaves
             // unrelated tool settings alone.
-            if !app_ui_hidden {
-                let local_api = recording::local_api_context_from_app(&app.handle());
-                skills::connect_detected_ai_tools_in_background(
-                    app.handle().clone(),
-                    store.recording.api_auth,
-                    local_api.port,
-                );
-            }
+            let local_api_config = store.to_recording_config(data_dir.clone());
+            skills::connect_detected_ai_tools_in_background(&local_api_config);
 
             // Enterprise hidden-UI deployments always run headless with the
             // recorder only, regardless of user settings or onboarding state.
@@ -1796,10 +1875,6 @@ async fn main() {
             let app_handle = app.handle().clone();
 
             // Initialize server first (core service)
-            let focus_port: u16 = std::env::var("SCREENPIPE_FOCUS_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(11435);
             let server_shutdown_tx = spawn_server(app_handle.clone(), focus_port);
             app.manage(server_shutdown_tx);
 
@@ -1957,12 +2032,11 @@ async fn main() {
                         };
 
                         server_runtime.block_on(async move {
-                            // Resolve + seed the shared api_auth_key cache before building
-                            // the config. `to_recording_config` is sync and reads the
-                            // cache; without this step the server would start with
-                            // `api_auth_key = None` on the app-auto-start path and every
-                            // request would 403. Mirrors the path in `spawn_screenpipe`.
-                            if store_clone.recording.api_auth {
+                            // Use effective auth: LAN access requires a key even when
+                            // the persisted auth toggle is off. Match `spawn_screenpipe`
+                            // and seed the same key the background installer waits for.
+                            let mut config = store_clone.to_recording_config(data_dir_clone.clone());
+                            if config.api_auth {
                                 let settings_key_opt = if store_clone.recording.api_key.is_empty() {
                                     None
                                 } else {
@@ -1974,11 +2048,13 @@ async fn main() {
                                 )
                                 .await
                                 {
-                                    Ok(key) => crate::store::seed_api_auth_key(key),
+                                    Ok(key) => {
+                                        crate::store::seed_api_auth_key(key.clone());
+                                        config.api_auth_key = Some(key);
+                                    },
                                     Err(e) => tracing::error!("failed to resolve api auth key: {}", e),
                                 }
                             }
-                            let config = store_clone.to_recording_config(data_dir_clone.clone());
 
                             // Check if server already running
                             let server_running = tokio::time::timeout(
@@ -2199,10 +2275,8 @@ async fn main() {
             app_handle.manage(update_manager.clone()); // Register for state::<Arc<UpdatesManager>>()
 
             // Setup tray
-            if let Some(_) = app_handle.tray_by_id("screenpipe_main") {
-                if let Err(e) = tray::setup_tray(&app_handle, update_manager.update_now_menu_item_ref()) {
-                    error!("Failed to setup tray: {}", e);
-                }
+            if let Err(e) = tray::setup_tray(&app_handle, update_manager.update_now_menu_item_ref()) {
+                error!("Failed to setup tray: {}", e);
             }
 
             // Log tray icon position for diagnostics.
@@ -2262,6 +2336,8 @@ async fn main() {
                 any(target_os = "macos", target_os = "windows")
             ))]
             enterprise_autostart::spawn(&app_handle);
+
+            acquisition_handoff::spawn(app_handle.clone());
 
             // Use persistent analytics_id for PostHog (consistent across frontend and backend)
             let unique_id = store.recording.analytics_id.clone();
@@ -2485,6 +2561,8 @@ async fn main() {
                 sync::auto_start_retention(&app_handle_clone).await;
             });
 
+            #[cfg(target_os = "macos")]
+            manual_handoff::install(app.handle())?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -2621,20 +2699,10 @@ async fn main() {
                             warn!("autostart: could not inspect macOS Reopen event: {error}")
                         }
                     }
-                    // Defer off the event stack so run handler stays panic-free.
-                    // Showing Onboarding is the app-entry gate: it focuses setup
-                    // while incomplete and routes to Home once complete.
-                    if crate::search_only::is_active() {
-                        crate::headless::wake_from_tray(app_handle.app_handle());
-                    }
-                    if crate::enterprise_policy::is_app_ui_hidden() || crate::headless::is_dormant()
-                    {
+                    if manual_handoff::reopen(app_handle.app_handle(), "native_reopen") {
                         return;
                     }
-                    let app = app_handle.app_handle().clone();
-                    let _ = app_handle.app_handle().run_on_main_thread(move || {
-                        let _ = ShowRewindWindow::Onboarding.show(&app);
-                    });
+                    manual_reopen(app_handle.app_handle());
                 }
                 _ => {}
             }
@@ -2642,6 +2710,21 @@ async fn main() {
         if let Err(e) = result {
             error!("panic in run event handler: {:?}", e);
         }
+    });
+}
+
+
+#[cfg(target_os = "macos")]
+fn manual_reopen(app: &tauri::AppHandle) {
+    if crate::search_only::needs_wake() {
+        crate::headless::wake_from_tray(app);
+    }
+    if crate::enterprise_policy::is_app_ui_hidden() || crate::headless::is_dormant() {
+        return;
+    }
+    let foreground = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = ShowRewindWindow::Onboarding.show(&foreground);
     });
 }
 

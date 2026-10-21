@@ -34,6 +34,7 @@ type BuildMode =
   | "build"
   | "e2e"
   | "signed"
+  | "packaged-updater"
   | "test"
   | "persistence-test"
   | "persistence-release"
@@ -85,6 +86,27 @@ export function nativeTestCommand(args: string[]): string[] {
     "--profile", "debug-dev",
     ...args,
   ];
+}
+
+export function parseEnterpriseBundleArgs(args: string[]): {
+  build: boolean;
+  updaterArtifacts: boolean;
+  upstreamTemplate: boolean;
+  ignoreVersionMismatches: boolean;
+  bundleArgs: string[];
+} {
+  return {
+    build: args.includes("--build"),
+    updaterArtifacts: args.includes("--updater-artifacts"),
+    upstreamTemplate: args.includes("--upstream-template"),
+    ignoreVersionMismatches: args.includes("--ignore-version-mismatches"),
+    bundleArgs: args.filter((arg) => ![
+      "--upstream-template",
+      "--build",
+      "--updater-artifacts",
+      "--ignore-version-mismatches",
+    ].includes(arg)),
+  };
 }
 
 function decode(value: Uint8Array): string {
@@ -186,7 +208,7 @@ function persistentEnterpriseConfig(target: string): string {
   return JSON.stringify(mergeConfig(enterprise, persistence));
 }
 
-function unsignedEnterpriseConfig(): string {
+function unsignedEnterpriseConfig(createUpdaterArtifacts = false): string {
   const enterprise = JSON.parse(readFileSync(
     join(APP_ROOT, "src-tauri", "tauri.enterprise.conf.json"),
     "utf8",
@@ -197,9 +219,15 @@ function unsignedEnterpriseConfig(): string {
   ));
   return JSON.stringify(mergeConfig(mergeConfig(enterprise, windows), {
     bundle: {
-      createUpdaterArtifacts: false,
+      createUpdaterArtifacts,
       windows: { signCommand: null },
     },
+  }));
+}
+
+function upstreamMachineEnterpriseConfig(createUpdaterArtifacts = false): string {
+  return JSON.stringify(mergeConfig(JSON.parse(unsignedEnterpriseConfig(createUpdaterArtifacts)), {
+    bundle: { windows: { nsis: { installMode: "perMachine", template: null } } },
   }));
 }
 
@@ -361,6 +389,7 @@ function modeLabel(mode: BuildMode): string {
     case "build": return "one-shot debug-dev build";
     case "e2e": return "debug-dev E2E build";
     case "signed": return "signed debug-dev app build";
+    case "packaged-updater": return "packaged macOS updater regression";
     case "test": return "queued native app tests";
     case "persistence-test": return "Windows persistence supervisor tests";
     case "persistence-release": return "Windows persistence supervisor release build";
@@ -390,6 +419,9 @@ async function perform(mode: BuildMode, args: string[]): Promise<number> {
       ], env);
     case "signed":
       return run(["bash", "scripts/build_macos.sh", "--queue-held"], env);
+    case "packaged-updater":
+      env.NEXT_PUBLIC_SCREENPIPE_E2E = "true";
+      return run(["bun", "e2e/mock-updates/packaged-update-restart.e2e.ts", ...args], env);
     case "test": {
       const exitCode = await run(["bun", "scripts/pre_build.js"], env);
       if (exitCode !== 0) return exitCode;
@@ -493,11 +525,26 @@ async function perform(mode: BuildMode, args: string[]): Promise<number> {
     }
     case "enterprise-bundle": {
       const target = "x86_64-pc-windows-msvc";
+      const { build, updaterArtifacts, upstreamTemplate, ignoreVersionMismatches, bundleArgs } =
+        parseEnterpriseBundleArgs(args);
+      const config = upstreamTemplate
+        ? upstreamMachineEnterpriseConfig(updaterArtifacts)
+        : unsignedEnterpriseConfig(updaterArtifacts);
+      if (build) {
+        const buildArgs = [
+          "bun", "tauri", "build", "--no-bundle", "--target", target,
+          "--features", "enterprise-build", "--config", config,
+          ...bundleArgs,
+        ];
+        if (ignoreVersionMismatches) buildArgs.splice(8, 0, "--ignore-version-mismatches");
+        const exitCode = await run(buildArgs, env);
+        if (exitCode !== 0) return exitCode;
+      }
       return run([
         "bun", "tauri", "bundle", "--target", target,
         "--features", "enterprise-build", "--bundles", "nsis",
-        "--config", unsignedEnterpriseConfig(),
-        ...args,
+        "--config", config,
+        ...bundleArgs,
       ], env);
     }
     case "warmup": {
@@ -642,6 +689,7 @@ async function main(): Promise<number> {
     "build",
     "e2e",
     "signed",
+    "packaged-updater",
     "test",
     "persistence-test",
     "persistence-release",
@@ -654,7 +702,7 @@ async function main(): Promise<number> {
   }
 
   console.error(
-    "usage: bun scripts/native-build-queue.ts <dev|build|e2e|signed|test|persistence-test|persistence-release|persistence-package|persistence-bundle|enterprise-bundle|status>",
+    "usage: bun scripts/native-build-queue.ts <dev|build|e2e|signed|packaged-updater|test|persistence-test|persistence-release|persistence-package|persistence-bundle|enterprise-bundle|status>",
   );
   return 2;
 }

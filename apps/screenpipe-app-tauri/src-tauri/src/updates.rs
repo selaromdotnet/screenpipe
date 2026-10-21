@@ -45,7 +45,9 @@ fn configured_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Up
     let mut builder = app.updater_builder();
     let settings = SettingsStore::get(app).ok().flatten();
     let is_beta_build = app.config().identifier.contains("beta");
-    if !is_enterprise_build(app) && !is_beta_build {
+    // Packaged updater acceptance supplies a local signed fixture endpoint.
+    // Keep that endpoint in E2E builds; shipping consumer builds use their channel.
+    if !is_enterprise_build(app) && !is_beta_build && !cfg!(feature = "e2e") {
         let channel = consumer_update_channel(settings.as_ref());
         builder = builder.endpoints(vec![consumer_update_endpoint(channel).parse()?])?;
     }
@@ -1349,7 +1351,7 @@ impl UpdatesManager {
             }
 
             {
-                let theme = dark_light::detect().unwrap_or(Mode::Dark);
+                let theme = crate::tray::tray_theme();
                 let icon_path = if theme == Mode::Light {
                     "assets/screenpipe-logo-tray-updates-black.png"
                 } else {

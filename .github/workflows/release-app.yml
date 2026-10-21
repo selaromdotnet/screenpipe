@@ -276,6 +276,8 @@ jobs:
           sparse-checkout: |
             .github/actions/setup-persistent-macos-cache
             .github/scripts
+            apps/screenpipe-app-tauri/scripts
+            apps/screenpipe-app-tauri/src-tauri/assets/dmg-background.png
 
       - name: Recover runaway macOS builder services
         if: runner.environment == 'self-hosted' && matrix.os_type == 'macos'
@@ -868,28 +870,7 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
-          node <<'NODE'
-          const fs = require("fs");
-          const path = "apps/screenpipe-app-tauri/src-tauri/tauri.macos.conf.json";
-          const target = process.env.TARGET;
-          const config = JSON.parse(fs.readFileSync(path, "utf8"));
-          config.bundle ??= {};
-          config.bundle.macOS ??= {};
-          config.bundle.externalBin = [...new Set(config.bundle.externalBin ?? [])]
-            .filter((entry) => entry !== "mlx.metallib");
-          if (target === "aarch64-apple-darwin") {
-            config.bundle.macOS.files = {};
-            config.bundle.externalBin.push("mlx.metallib");
-          } else if (target === "x86_64-apple-darwin") {
-            config.bundle.macOS.files = {
-              "MacOS/libonnxruntime.dylib": "libonnxruntime.dylib",
-            };
-          } else {
-            throw new Error(`unknown macOS release target: ${target}`);
-          }
-          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
-          console.log(`macOS bundle sidecars configured for ${target}`);
-          NODE
+          bun .release-workflow/apps/screenpipe-app-tauri/scripts/macos_bundle_sidecars.js "$TARGET" "$GITHUB_WORKSPACE/apps/screenpipe-app-tauri"
         env:
           TARGET: ${{ matrix.target }}
 
@@ -1446,10 +1427,8 @@ jobs:
             fi
 
             cd apps/screenpipe-app-tauri
-            BUNDLE_ARGS=()
-            if [[ "${{ runner.environment }}" == "self-hosted" ]]; then
-              BUNDLE_ARGS=(--bundles app)
-            fi
+            # Build the styled DMG below, with the app and Applications shortcut.
+            BUNDLE_ARGS=(--bundles app)
             if bunx tauri build -v $TAURI_ARGS "${BUNDLE_ARGS[@]}" 2>&1 | tee /tmp/tauri-build-$attempt.log; then
               echo "✅ Build succeeded on attempt $attempt"
               cd ../..
@@ -1507,7 +1486,7 @@ jobs:
           echo "all .app bundles pass codesign --verify --deep --strict"
 
       - name: Create headless DMG (macOS)
-        if: matrix.os_type == 'macos' && runner.environment == 'self-hosted'
+        if: matrix.os_type == 'macos'
         shell: bash
         run: |
           set -euo pipefail
@@ -1525,7 +1504,7 @@ jobs:
           esac
           APP_PATH="${BUNDLE_DIR}/macos/screenpipe.app"
           DMG_PATH="${BUNDLE_DIR}/dmg/screenpipe_${VERSION}_${PACKAGE_ARCH}.dmg"
-          .github/scripts/create-headless-dmg.sh "$APP_PATH" "$DMG_PATH" "screenpipe"
+          bash .release-workflow/.github/scripts/create-headless-dmg.sh "$APP_PATH" "$DMG_PATH" "screenpipe"
 
       - name: Notarize and staple DMGs (macOS)
         if: matrix.os_type == 'macos'

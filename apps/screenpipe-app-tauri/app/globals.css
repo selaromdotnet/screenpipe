@@ -1171,3 +1171,12 @@
     scroll-behavior: auto !important;
   }
 }
+
+@keyframes star-session-pulse {
+  0% { opacity: 0; transform: scale(0.65); }
+  55% { opacity: 1; transform: scale(1.15); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .motion-safe\:animate-star-session-pulse { animation: star-session-pulse 300ms ease-out both; }
+}

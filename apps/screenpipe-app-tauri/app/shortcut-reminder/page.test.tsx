@@ -15,6 +15,7 @@ import ShortcutReminderPage from "./page";
 import { formatShortcut } from "./format-shortcut";
 
 const mocks = vi.hoisted(() => ({
+  starred: { active: undefined as undefined | { end: string }, now: 0 },
   getRecordingHealthState: vi.fn(),
   overlayRestartRecording: vi.fn(),
   listen: vi.fn(),
@@ -128,6 +129,8 @@ vi.mock("@/lib/utils/tauri", () => ({
     setShortcutOverlayAnchor: mocks.setShortcutOverlayAnchor,
   },
 }));
+
+vi.mock("@/components/starred-sessions/use-starred-sessions", () => ({ useStarredSessions: () => mocks.starred }));
 
 vi.mock("./use-overlay-data", () => ({
   useOverlayData: () => ({
@@ -936,4 +939,23 @@ describe("cross-platform star controls", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not open session controls");
     cleanup();
   });
+});
+
+it("shows remaining minutes in the star button and updates the active disclosure", async () => {
+  mocks.meetingOverlayState.active = false;
+  mocks.getRecordingHealthState.mockResolvedValue("normal");
+  mocks.starred = { active: { end: new Date(3600000).toISOString() }, now: 59000 };
+  const view = render(<ShortcutReminderPage />);
+  fireEvent.mouseEnter(await screen.findByTestId("shortcut-reminder-root"));
+  const star = await screen.findByRole("button", { name: "60 min left · click to end" });
+  expect(star).toHaveTextContent("60m");
+  fireEvent.mouseEnter(star);
+  expect(await screen.findByText("60 min left · click to end", { exact: false })).toBeVisible();
+  mocks.starred.now = 60000;
+  view.rerender(<ShortcutReminderPage />);
+  expect(screen.getByRole("button", { name: "59 min left · click to end" })).toHaveTextContent("59m");
+  mocks.starred.active = undefined;
+  view.rerender(<ShortcutReminderPage />);
+  expect(screen.getByRole("button", { name: "Starred work sessions" })).not.toHaveTextContent("59m");
+  cleanup();
 });

@@ -1327,7 +1327,7 @@ fn finish_gcal_snapshot(
     Ok(merge_gcal_events(lists))
 }
 
-/// Fetch all readable calendars and all event pages for one account atomically.
+/// Fetch visible, owned calendars and all their event pages for one account atomically.
 async fn gcal_fetch_all_calendars(
     client: &reqwest::Client,
     base: &str,
@@ -1342,8 +1342,8 @@ async fn gcal_fetch_all_calendars(
             .get(base.join("users/me/calendarList")?)
             .bearer_auth(token)
             .query(&[
-                ("minAccessRole", "reader"),
-                ("showHidden", "true"),
+                ("minAccessRole", "owner"),
+                ("showHidden", "false"),
                 ("maxResults", "250"),
             ]),
     )
@@ -1356,7 +1356,12 @@ async fn gcal_fetch_all_calendars(
     let time_max = (now + chrono::Duration::hours(hours_ahead)).to_rfc3339();
     let mut lists = Vec::new();
     for calendar in calendars {
-        if calendar["deleted"].as_bool() == Some(true) || calendar["accessRole"] == "freeBusyReader"
+        // Read/write access to someone else's calendar does not make its
+        // meetings the connected user's. Keep this check even if a provider
+        // response includes entries excluded by the calendar-list query.
+        if calendar["deleted"].as_bool() == Some(true)
+            || calendar["hidden"].as_bool() == Some(true)
+            || calendar["accessRole"].as_str() != Some("owner")
         {
             continue;
         }
@@ -1491,6 +1496,7 @@ fn google_calendar_event_json(item: &Value, calendar_label: &str) -> Value {
         "attendees": attendees,
         "location": item["location"].as_str(),
         "meetingUrl": meeting_url,
+        "excludeFromMeetingDetection": google_calendar_event_is_reference_reminder(item),
         "calendarName": calendar_label,
         "isAllDay": is_all_day,
     })
@@ -1536,7 +1542,29 @@ fn gcal_event_start_epoch(event: &Value) -> i64 {
     i64::MAX
 }
 
+// A free personal reminder may reference a later call in its notes. Decide
+// before normalization loses URL provenance; keep the event and reference URL
+// available to calendar readers, but not to automatic meeting consumers.
+fn google_calendar_event_is_reference_reminder(item: &Value) -> bool {
+    item["transparency"].as_str() == Some("transparent")
+        && !item["attendees"].as_array().is_some_and(|attendees| {
+            attendees.iter().any(|attendee| {
+                attendee["self"].as_bool() != Some(true)
+                    && attendee["resource"].as_bool() != Some(true)
+            })
+        })
+        && google_calendar_conference_url(item).is_none()
+        && extract_meeting_url(item["location"].as_str()).is_none()
+        && extract_meeting_url(item["description"].as_str()).is_some()
+}
+
 fn google_calendar_meeting_url(item: &Value) -> Option<String> {
+    google_calendar_conference_url(item)
+        .or_else(|| extract_meeting_url(item["location"].as_str()))
+        .or_else(|| extract_meeting_url(item["description"].as_str()))
+}
+
+fn google_calendar_conference_url(item: &Value) -> Option<String> {
     item["hangoutLink"]
         .as_str()
         .and_then(|s| normalize_meeting_url(Some(s.to_string())))
@@ -1552,8 +1580,6 @@ fn google_calendar_meeting_url(item: &Value) -> Option<String> {
                         .and_then(|uri| normalize_meeting_url(Some(uri.to_string())))
                 })
         })
-        .or_else(|| extract_meeting_url(item["location"].as_str()))
-        .or_else(|| extract_meeting_url(item["description"].as_str()))
 }
 
 fn normalize_meeting_url(raw: Option<String>) -> Option<String> {
@@ -4385,6 +4411,63 @@ mod tests {
     }
 
     #[test]
+    fn google_calendar_reference_reminder_keeps_reference_but_excludes_automatic_meetings() {
+        let raw = json!({
+            "id": "prep", "summary": "Prepare for the later call",
+            "start": {"dateTime": "2026-10-08T16:15:00-07:00"},
+            "end": {"dateTime": "2026-10-08T16:25:00-07:00"},
+            "transparency": "transparent", "attendees": [],
+            "description": "Review notes for https://meet.google.com/abc-defg-hij"
+        });
+        assert!(google_calendar_event_is_available(&raw));
+        let event = google_calendar_event_json(&raw, "Personal");
+        assert_eq!(event["excludeFromMeetingDetection"], true);
+        assert_eq!(event["meetingUrl"], "https://meet.google.com/abc-defg-hij");
+        assert_eq!(event["start"], raw["start"]["dateTime"]);
+        assert_eq!(event["title"], raw["summary"]);
+    }
+
+    #[test]
+    fn google_calendar_reference_reminder_policy_preserves_real_meeting_links() {
+        let reference = json!({
+            "transparency": "transparent",
+            "description": "https://meet.google.com/abc-defg-hij"
+        });
+        for (key, value) in [
+            ("transparency", json!("opaque")),
+            ("transparency", Value::Null),
+            ("attendees", json!([{"email": "guest@example.test"}])),
+            ("hangoutLink", json!("https://meet.google.com/abc-defg-hij")),
+            (
+                "conferenceData",
+                json!({"entryPoints": [{"entryPointType": "video", "uri": "https://meet.google.com/abc-defg-hij"}]}),
+            ),
+            ("location", json!("https://meet.google.com/abc-defg-hij")),
+        ] {
+            let mut raw = reference.clone();
+            raw[key] = value;
+            assert!(!google_calendar_event_is_reference_reminder(&raw), "{key}");
+            assert_eq!(
+                google_calendar_meeting_url(&raw).as_deref(),
+                Some("https://meet.google.com/abc-defg-hij")
+            );
+        }
+        // Provider representations can include the owner or a room resource.
+        for attendees in [
+            json!([]),
+            json!([{"self": true}]),
+            json!([{"resource": true}]),
+        ] {
+            let mut raw = reference.clone();
+            raw["attendees"] = attendees;
+            assert!(google_calendar_event_is_reference_reminder(&raw));
+        }
+        assert!(!google_calendar_event_is_reference_reminder(&json!({
+            "transparency": "transparent", "description": "https://docs.google.com/document/test"
+        })));
+    }
+
+    #[test]
     fn google_calendar_meeting_url_prefers_conference_video() {
         let item = json!({
             "location": "Board room",
@@ -4534,7 +4617,7 @@ mod tests {
         Mock::given(header("authorization", "Bearer healthy"))
             .and(path("/users/me/calendarList"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "items":[{"id":"work", "primary":true}]
+                "items":[{"id":"work", "primary":true, "accessRole":"owner"}]
             })))
             .mount(&server)
             .await;
@@ -4590,14 +4673,14 @@ mod tests {
         Mock::given(path("/users/me/calendarList"))
             .and(query_param("pageToken", "second"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "items": [{"id":"shared@example.com", "hidden":true, "accessRole":"reader"}]
+                "items": [{"id":"secondary@example.com", "hidden":false, "accessRole":"owner"}]
             })))
             .with_priority(1)
             .mount(&server)
             .await;
         Mock::given(path("/users/me/calendarList"))
-            .and(query_param("showHidden", "true"))
-            .and(query_param("minAccessRole", "reader"))
+            .and(query_param("showHidden", "false"))
+            .and(query_param("minAccessRole", "owner"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "items": [{"id":"primary-id", "primary":true, "accessRole":"owner"}],
                 "nextPageToken":"second"
@@ -4609,7 +4692,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[]})))
             .mount(&server)
             .await;
-        Mock::given(path("/calendars/shared@example.com/events"))
+        Mock::given(path("/calendars/secondary@example.com/events"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{
                 "id":"secondary", "start":{"dateTime":"2026-10-02T18:00:00Z"},
                 "end":{"dateTime":"2026-10-02T18:30:00Z"}, "hangoutLink":"https://meet.google.com/abc-defg-hij"
@@ -4625,13 +4708,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["id"], "shared@example.com:secondary");
-        assert_eq!(events[0]["calendarName"], "Work / shared@example.com");
+        assert_eq!(events[0]["id"], "secondary@example.com:secondary");
+        assert_eq!(events[0]["calendarName"], "Work / secondary@example.com");
         assert_eq!(
             events[0]["meetingUrl"],
             "https://meet.google.com/abc-defg-hij"
         );
-        Mock::given(path("/calendars/shared@example.com/events"))
+        Mock::given(path("/calendars/secondary@example.com/events"))
             .respond_with(ResponseTemplate::new(503))
             .with_priority(1)
             .mount(&server)
@@ -4649,7 +4732,48 @@ mod tests {
         .to_string();
         assert!(error.contains("503"), "{error}");
         assert!(error.contains("calendar_events"), "{error}");
-        assert!(!error.contains("shared@example.com"));
+        assert!(!error.contains("secondary@example.com"));
+    }
+
+    #[tokio::test]
+    async fn google_calendar_excludes_shared_hidden_and_deleted_calendars_before_fetching_events() {
+        use wiremock::{
+            matchers::{path, query_param},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(path("/users/me/calendarList"))
+            .and(query_param("minAccessRole", "owner"))
+            .and(query_param("showHidden", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    {"id":"coworker", "accessRole":"reader"},
+                    {"id":"editable-shared", "accessRole":"writer"},
+                    {"id":"limited-writer", "accessRole":"writerWithoutPrivateAccess"},
+                    {"id":"availability", "accessRole":"freeBusyReader"},
+                    {"id":"hidden-owned", "accessRole":"owner", "hidden":true},
+                    {"id":"deleted-owned", "accessRole":"owner", "deleted":true},
+                    {"id":"unknown-owner"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // No event endpoints are mocked: querying any excluded calendar would
+        // fail the snapshot instead of returning a successful empty refresh.
+        let events = gcal_fetch_all_calendars(
+            &reqwest::Client::new(),
+            &format!("{}/", server.uri()),
+            "test-token",
+            "Work",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

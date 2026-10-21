@@ -163,6 +163,7 @@ function importedConversationIsUnchanged(
     || existing.title !== incoming.title
     || existing.titleSource !== incoming.titleSource
     || existing.lastViewedAt !== incoming.lastViewedAt
+    || JSON.stringify(existing.importedFrom) !== JSON.stringify(incoming.importedFrom)
     || existing.messages.length !== incoming.messages.length
   ) {
     return false;
@@ -174,6 +175,7 @@ function importedConversationIsUnchanged(
       && message.id === candidate.id
       && message.role === candidate.role
       && message.content === candidate.content
+      && JSON.stringify(message.images ?? []) === JSON.stringify(candidate.images ?? [])
       && JSON.stringify(message.contentBlocks ?? [])
         === JSON.stringify(candidate.contentBlocks ?? []);
   });

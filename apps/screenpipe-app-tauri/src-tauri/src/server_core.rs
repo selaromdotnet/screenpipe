@@ -352,6 +352,7 @@ impl ServerCore {
         workflow_catalog_dir: Option<std::path::PathBuf>,
         runtime_lifetime: tokio::sync::oneshot::Sender<()>,
     ) -> Result<Self, String> {
+        screenpipe_engine::meeting_watcher::set_capture_stopped(true);
         screenpipe_core::health_diagnostics::begin_startup(&config.data_dir);
         screenpipe_core::health_diagnostics::configure_media_required(
             !config.disable_audio
@@ -396,6 +397,12 @@ impl ServerCore {
             message
         })?;
 
+        screenpipe_db::storage::recover_interrupted_compaction(
+            &local_data_dir,
+            config.db_config.clone(),
+        )
+        .await
+        .map_err(|error| format!("Failed to restore storage after compaction: {error}"))?;
         screenpipe_db::storage::recover_interrupted_migration(
             &local_data_dir,
             config.db_config.clone(),
@@ -407,6 +414,9 @@ impl ServerCore {
         // A crash during repair may leave the committed WAL archived separately
         // from the main file. Reconcile the swap before ordinary DB diagnosis.
         let startup_guard = prepare_database_startup(&local_data_dir).await?;
+        // Fresh startup may have published a new physical index. Recovery must
+        // follow that generation before any recording is admitted.
+        crate::db_relaunch::set_active_database(&local_data_dir);
         let db_path =
             screenpipe_db::storage::resolve_database_path(&local_data_dir.join("db.sqlite"))
                 .map_err(|e| e.to_string())?
@@ -503,6 +513,20 @@ impl ServerCore {
             }
         };
         info!("Database initialized at {}", db_path);
+        db.configure_release(&screenpipe_db::privacy_release::ReleasePolicy {
+            identity: format!(
+                "pii-release-v1:{}:{}:{:?}:{:?}:{}",
+                screenpipe_redact::release_model_identity(),
+                config.pii_backend,
+                config.pii_redaction_labels,
+                config.pii_redaction_columns,
+                config.pii_redaction_pseudonyms
+            ),
+            text: config.async_pii_redaction,
+            images: config.async_image_pii_redaction,
+        })
+        .await
+        .map_err(|e| format!("Cannot configure privacy release policy: {e}"))?;
 
         // Finish fallible database setup before sharing the owner with pipes,
         // HTTP, or background workers. A failure must close this generation.
@@ -1428,6 +1452,7 @@ impl ServerCore {
                         ..Default::default()
                     },
                 )
+                .with_release_storage(Arc::clone(&db))
                 .with_database_error_hook(redact_database_error_hook.clone())
                 .spawn_with_shutdown(redact_shutdown.clone());
             } else {
@@ -1437,6 +1462,7 @@ impl ServerCore {
                 // The concrete model name + version are logged once it
                 // loads, so they never drift on a model bump.
                 let shutdown = redact_shutdown.clone();
+                let image_release_db = Arc::clone(&db);
                 let labels = pii_labels.clone();
                 let database_error_hook = redact_database_error_hook.clone();
                 tokio::spawn(async move {
@@ -1461,6 +1487,7 @@ impl ServerCore {
                                     ..Default::default()
                                 },
                             )
+                            .with_release_storage(image_release_db)
                             .with_database_error_hook(database_error_hook)
                             .spawn_with_shutdown(shutdown);
                         }
@@ -1585,6 +1612,44 @@ impl ServerCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fresh_storage_failure_survives_restart_and_support_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        // Prevent the fresh initializer from creating its generation directory.
+        std::fs::write(root.path().join("storage"), b"not a directory").unwrap();
+        let error = match prepare_database_startup(root.path()).await {
+            Ok(_) => panic!("initialization unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("failed to initialize new history storage"));
+        assert!(error.contains("os error"));
+        assert!(!root.path().join("storage.json").exists());
+        assert!(!root.path().join("db.sqlite").exists());
+
+        std::fs::remove_file(root.path().join("storage")).unwrap();
+        let _restarted = prepare_database_startup(root.path()).await.unwrap();
+        assert!(root.path().join("storage.json").exists());
+        for day in 1..=7 {
+            std::fs::write(
+                root.path()
+                    .join(format!("screenpipe-app.2026-10-{day:02}.log")),
+                "app restarted\n",
+            )
+            .unwrap();
+        }
+        let report =
+            crate::diagnostic_logs::collect_redacted_from_dirs(&[root.path().to_path_buf()])
+                .await
+                .unwrap();
+        assert!(report.contains("database_startup_failed"));
+        assert!(report.contains("failed to initialize new history storage"));
+        assert!(
+            report.contains(&error),
+            "support must retain the originating OS error"
+        );
+        assert!(report.contains("outcome=recording_blocked"));
+    }
 
     #[tokio::test]
     async fn failed_privacy_setup_releases_owner_and_preserves_recordings() {

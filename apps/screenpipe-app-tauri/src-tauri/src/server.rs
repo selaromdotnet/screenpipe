@@ -128,6 +128,10 @@ async fn handle_focus(
     State(state): State<ServerState>,
     Json(payload): Json<FocusPayload>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    #[cfg(target_os = "macos")]
+    if crate::manual_handoff::pending() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "switching to the selected app copy".into()));
+    }
     info!(
         "Received focus request: args_count={}, deep_link_present={}, target={:?}",
         payload.args.len(),
@@ -173,7 +177,7 @@ async fn handle_focus(
             payload.deep_link_url.as_deref(),
             payload.target.as_deref(),
         );
-    if !startup_handoff && crate::search_only::is_active() {
+    if !startup_handoff && crate::search_only::needs_wake() {
         crate::headless::wake_from_tray(&state.app_handle);
     }
     if startup_handoff {
@@ -375,7 +379,12 @@ pub async fn run_server(app_handle: tauri::AppHandle, port: u16) {
         .route("/e2e/search-only/quit", axum::routing::post(e2e_search_only_quit))
         .route("/e2e/search-only/reopen", axum::routing::post(e2e_search_only_reopen))
         .route("/e2e/search-only/resume", axum::routing::post(e2e_search_only_resume))
+        .route("/e2e/search-only/stop-server", axum::routing::post(e2e_search_only_stop_server))
         .route("/e2e/search-only/restart", axum::routing::post(e2e_search_only_restart))
+        .route(
+            "/e2e/search-only/recreate-tray",
+            axum::routing::post(e2e_search_only_recreate_tray),
+        )
         .route("/e2e/updates/state", axum::routing::get(e2e_updates_state))
         .route("/e2e/updates/click", axum::routing::post(e2e_updates_click))
         .route(
@@ -394,45 +403,28 @@ pub async fn run_server(app_handle: tauri::AppHandle, port: u16) {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-    // main.rs marks a responsive Screenpipe control endpoint before this task
-    // starts. Preserve that healthy instance; reclaim only an unrelated or
-    // unresponsive owner left on the control port.
-    crate::port_conflict::reclaim_owner(
+    match crate::port_conflict::bind_control_port(
         port,
         crate::port_conflict::healthy_control_server_present(),
+        crate::config::app_data_dir(),
+        || axum::Server::try_bind(&addr),
     )
-    .await;
-
-    // Retry binding with backoff — avoids panic when a previous instance hasn't
-    // released the port yet (e.g. fast restart, TIME_WAIT on Linux).
-    let mut last_err = None;
-    for attempt in 0..5u64 {
-        if attempt > 0 {
-            tracing::warn!("port {} in use, retry {}/5...", port, attempt);
-            tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
-        }
-        match axum::Server::try_bind(&addr) {
-            Ok(builder) => {
-                info!("Server listening on {}", addr);
-                if let Err(e) = builder.serve(app.into_make_service()).await {
-                    error!("server error on {}: {}", addr, e);
-                }
-                return;
-            }
-            Err(e) => {
-                last_err = Some(e);
+    .await
+    {
+        Ok(builder) => {
+            info!("Server listening on {}", addr);
+            if let Err(e) = builder.serve(app.into_make_service()).await {
+                error!("server error on {}: {}", addr, e);
             }
         }
-    }
-    error!(
-        "failed to bind to {} after 5 attempts: {}",
-        addr,
-        last_err.map(|e| e.to_string()).unwrap_or_default()
-    );
-    if crate::port_conflict::healthy_control_server_present() {
-        crate::port_conflict::show_healthy_screenpipe(&app_handle, port);
-    } else {
-        crate::port_conflict::show_reclaim_failed(&app_handle, port);
+        Err(error) => {
+            error!("failed to bind to {addr}: {error:#}");
+            if crate::port_conflict::healthy_control_server_present() {
+                crate::port_conflict::show_healthy_screenpipe(&app_handle, port);
+            } else {
+                crate::port_conflict::show_control_start_failed(&app_handle, port, &error);
+            }
+        }
     }
 }
 
@@ -693,6 +685,8 @@ async fn e2e_search_only_state(State(state): State<ServerState>) -> impl IntoRes
         "capture_running": recording.capture.lock().await.is_some(),
         "webviews": app.webview_windows().keys().cloned().collect::<Vec<_>>(),
         "keep_search_after_quit": crate::search_only::keep_after_quit(app),
+        "tray_registered": app.tray_by_id("screenpipe_main").is_some(),
+        "platform": std::env::consts::OS,
     }))
 }
 
@@ -721,9 +715,29 @@ async fn e2e_search_only_resume(State(state): State<ServerState>) -> impl IntoRe
 }
 
 #[cfg(feature = "e2e")]
+async fn e2e_search_only_stop_server(State(state): State<ServerState>) -> impl IntoResponse {
+    use tauri::Manager;
+    let result = crate::recording::stop_screenpipe(state.app_handle.state(), state.app_handle.clone()).await;
+    Json(serde_json::json!({"stopped": result.is_ok(), "error": result.err()}))
+}
+
+#[cfg(feature = "e2e")]
 async fn e2e_search_only_restart(State(state): State<ServerState>) -> impl IntoResponse {
     let result = crate::updates::restart_for_update(state.app_handle, Some(10)).await;
     Json(serde_json::json!({"result": result}))
+}
+
+#[cfg(feature = "e2e")]
+async fn e2e_search_only_recreate_tray(State(state): State<ServerState>) -> impl IntoResponse {
+    crate::tray::recreate_tray(&state.app_handle);
+    // This barrier runs after the queued recreation, so callers can inspect
+    // the resulting native tray without guessing how long the main loop needs.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let scheduled = state.app_handle.run_on_main_thread(move || {
+        let _ = tx.send(());
+    });
+    let completed = scheduled.is_ok() && rx.await.is_ok();
+    Json(serde_json::json!({"accepted": completed}))
 }
 
 /// Content-free updater state for the packaged e2e test: what the tray menu
@@ -791,6 +805,13 @@ async fn e2e_updates_start_capture(State(state): State<ServerState>) -> impl Int
             }));
         }
     };
+    // The initial boot stays signed out to reproduce the idle-update path.
+    // This second phase uses the existing isolated E2E authentication fixture
+    // so the production capture path reaches ScreenCaptureKit after relaunch.
+    crate::e2e::seeds::seed_cloud_authentication(&mut settings);
+    if let Err(error) = crate::store::OnboardingStore::update(&state.app_handle, |onboarding| onboarding.complete()) {
+        return Json(serde_json::json!({ "started": false, "error": format!("failed to prepare E2E onboarding: {error}") }));
+    }
     settings.user.id = Some("packaged_updater_e2e".to_string());
     settings.user.subscription_plan = Some("none".to_string());
     settings.user.entitlement = Some(serde_json::json!({
@@ -800,23 +821,31 @@ async fn e2e_updates_start_capture(State(state): State<ServerState>) -> impl Int
         "checked_at": chrono::Utc::now().to_rfc3339(),
         "features": { "app": true, "cloud": false }
     }));
-    if let Err(error) = settings.save(&state.app_handle) {
+    // Publish the existing fixture sentinel with the account in one store
+    // mutation. Otherwise a webview refresh sends the synthetic token to the
+    // real account service and clears the fixture on its expected 401.
+    let mut user = serde_json::json!(settings.user);
+    user["__e2eSkipAccountRefresh"] = serde_json::json!(true);
+    if let Err(error) = settings.replace_startup_user(&state.app_handle, user) {
         return Json(serde_json::json!({
             "started": false,
             "error": format!("failed to save E2E recording entitlement: {error}"),
         }));
     }
 
-    let result = crate::recording::spawn_screenpipe(
-        state.app_handle.state(),
+    if let Err(error) = crate::commands::set_cloud_token(
+        settings.user.token.clone(),
         state.app_handle.clone(),
-        None,
-    )
-    .await;
-    match result {
-        Ok(()) => Json(serde_json::json!({ "started": true, "error": null })),
-        Err(error) => Json(serde_json::json!({ "started": false, "error": error })),
+        state.app_handle.state(),
+    ).await {
+        return Json(serde_json::json!({ "started": false, "error": error }));
     }
+
+    // set_cloud_token schedules the production deferred account start. Do not
+    // also call spawn_screenpipe: that explicit start cancels the deferred
+    // request while it can already hold the lifecycle lock, losing both starts.
+    // The caller must verify a real frame; this only acknowledges the request.
+    Json(serde_json::json!({ "started": true, "error": null }))
 }
 
 async fn set_window_size(

@@ -61,7 +61,22 @@ async fn run_guarded_routine_wal_checkpoint(
 impl DatabaseManager {
     /// Execute trusted, row-returning dynamic SQL on the query pool.
     pub async fn query_raw_sql(&self, query: &str) -> Result<serde_json::Value, sqlx::Error> {
-        if self.storage.is_some() {
+        if self.release_owner.is_some() {
+            return Err(sqlx::Error::Protocol(
+                "privacy-required: use typed search; unrestricted SQL is unavailable".into(),
+            ));
+        }
+        self.query_activity_summary_sql(query).await
+    }
+
+    /// Internal activity-summary queries use only audited fields and resolve
+    /// through the protected TEMP views. Never pass caller-supplied SQL here.
+    /// The external raw-SQL API remains disabled for protected readers.
+    pub async fn query_activity_summary_sql(
+        &self,
+        query: &str,
+    ) -> Result<serde_json::Value, sqlx::Error> {
+        if self.storage.is_some() && self.release_owner.is_none() {
             crate::storage::sql::validate_resident_query(&self.pool, query).await?;
         }
         self.consistent_read(|| async {
@@ -104,7 +119,7 @@ impl DatabaseManager {
         Ok(Self::raw_sql_rows(&rows))
     }
 
-    fn raw_sql_rows(rows: &[sqlx::sqlite::SqliteRow]) -> serde_json::Value {
+    pub(super) fn raw_sql_rows(rows: &[sqlx::sqlite::SqliteRow]) -> serde_json::Value {
         let result: Vec<serde_json::Map<String, serde_json::Value>> = rows
             .iter()
             .map(|row| {
@@ -932,6 +947,29 @@ impl DatabaseManager {
         end: DateTime<Utc>,
         collect_all_files: bool,
     ) -> Result<DeleteTimeRangeResult, sqlx::Error> {
+        self.delete_time_range_batch_inner(start, end, collect_all_files, start)
+            .await
+    }
+
+    /// A local-retention slice keeps the latest display context for the whole
+    /// processed range, rather than retaining another old layout per recording.
+    pub async fn delete_retention_time_slice(
+        &self,
+        range_start: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<DeleteTimeRangeResult, sqlx::Error> {
+        self.delete_time_range_batch_inner(start, end, true, range_start)
+            .await
+    }
+
+    async fn delete_time_range_batch_inner(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        collect_all_files: bool,
+        layout_start: DateTime<Utc>,
+    ) -> Result<DeleteTimeRangeResult, sqlx::Error> {
         let mut tx = self.begin_immediate_with_retry().await?;
 
         let start_str = start.to_rfc3339();
@@ -1091,7 +1129,7 @@ impl DatabaseManager {
                               WHERE timestamp BETWEEN ?1 AND ?2
                               ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
         )
-        .bind(&start_str)
+        .bind(layout_start.to_rfc3339())
         .bind(&end_str)
         .execute(&mut **tx.conn())
         .await?;
@@ -1161,6 +1199,50 @@ impl DatabaseManager {
         );
 
         Ok((video_chunks_deleted, audio_chunks_deleted))
+    }
+
+    /// Next recording-time boundary for a retention scheduling slice. Select
+    /// metadata before acquiring the writer; an hour can contain enough archived
+    /// elements to hold that writer past the capture request's own deadline.
+    pub async fn next_retention_timestamp(
+        &self,
+        after: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        // Keep index range bounds while comparing instants across RFC3339
+        // fractions and Z/+00:00 spellings. SQLite's millisecond date precision
+        // groups close timestamps; the following delete still covers that group.
+        let lower = after.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let upper = end
+            .checked_add_signed(chrono::Duration::seconds(1))
+            .unwrap_or(end)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let next: Option<String> = sqlx::query_scalar(
+            "SELECT ts FROM (
+                SELECT MIN(timestamp) AS ts FROM frames
+                WHERE timestamp>=?1 AND timestamp<?2 AND julianday(timestamp)>julianday(?3) AND julianday(timestamp)<=julianday(?4)
+                UNION ALL
+                SELECT MIN(timestamp) AS ts FROM audio_transcriptions
+                WHERE timestamp>=?1 AND timestamp<?2 AND julianday(timestamp)>julianday(?3) AND julianday(timestamp)<=julianday(?4)
+                UNION ALL
+                SELECT MIN(timestamp) AS ts FROM ui_events
+                WHERE timestamp>=?1 AND timestamp<?2 AND julianday(timestamp)>julianday(?3) AND julianday(timestamp)<=julianday(?4)
+             ) WHERE ts IS NOT NULL ORDER BY julianday(ts) LIMIT 1",
+        ).bind(lower).bind(upper).bind(after.to_rfc3339()).bind(end.to_rfc3339())
+            .fetch_optional(&self.pool).await?;
+        next.map(|value| {
+            let next = DateTime::parse_from_rfc3339(&value)
+                .map_err(|_| sqlx::Error::Protocol("retention timestamp is invalid".into()))?
+                .with_timezone(&Utc);
+            if next <= after {
+                return Err(sqlx::Error::Protocol(
+                    "retention timestamp did not advance; range remains pending".into(),
+                ));
+            }
+            Ok(next.min(end))
+        })
+        .transpose()
     }
 
     /// Returns the oldest timestamp across frames and audio_transcriptions.
@@ -1382,6 +1464,38 @@ impl DatabaseManager {
         )
     }
 
+    fn planner_diagnostics_root(&self) -> Option<std::path::PathBuf> {
+        let options = self.write_pool.connect_options();
+        if options.get_filename() == std::path::Path::new(":memory:")
+            || options
+                .get_filename()
+                .to_string_lossy()
+                .contains("mode=memory")
+        {
+            return None;
+        }
+        self.storage.as_ref().map(|s| s.root.clone()).or_else(|| {
+            options
+                .get_filename()
+                .parent()
+                .map(std::path::Path::to_path_buf)
+        })
+    }
+
+    /// Attempt the same sampled, coordinated maintenance used by the hourly
+    /// background task. Start only with an idle writer and yield between tables;
+    /// an analysis already running finishes before waiting writes proceed.
+    pub async fn maintain_planner_statistics(&self) -> crate::planner_stats::Attempt {
+        crate::planner_stats::run_and_report(
+            &self.write_pool,
+            &self.write_semaphore,
+            &self.write_queue_health,
+            &self.close_token,
+            self.planner_diagnostics_root().as_deref(),
+        )
+        .await
+    }
+
     /// Spawn the background task that owns routine WAL checkpointing.
     ///
     /// Since `wal_autocheckpoint = 0` (see [`WAL_SAFETY_PRAGMAS`]), committing
@@ -1391,6 +1505,7 @@ impl DatabaseManager {
     /// finish; backlog alone must not interrupt capture.
     pub fn start_wal_maintenance(&self) {
         let pool = self.write_pool.clone();
+        let diagnostics_root = self.planner_diagnostics_root();
         let shutdown = self.close_token.clone();
         let write_queue_health = self.write_queue_health.clone();
         let write_semaphore = std::sync::Arc::clone(&self.write_semaphore);
@@ -1401,6 +1516,7 @@ impl DatabaseManager {
             const INTERVAL: Duration = Duration::from_secs(60);
             let mut interval = tokio::time::interval(INTERVAL);
             let mut backlog_since = None;
+            let mut next_planner_run = tokio::time::Instant::now();
             // `interval()` yields its first tick immediately. Startup has just
             // run a serialized checkpoint, so consume that tick and wait a
             // full interval instead of racing callers' first transactions.
@@ -1449,16 +1565,22 @@ impl DatabaseManager {
                     Err(e) => warn!("wal checkpoint failed: {}", e),
                 }
 
-                // Nothing else refreshes SQLite's query-planner statistics on a
-                // 24/7 recorder — ANALYZE otherwise only runs inside the
-                // emergency `repair_database()` path. `PRAGMA optimize` is
-                // designed to be cheap to call on every tick: it only does
-                // real work on tables whose content has changed enough since
-                // the last run to make stale stats likely, so piggybacking it
-                // on this existing 60s tick keeps planner stats fresh without
-                // a dedicated schedule.
-                if let Err(e) = sqlx::query("PRAGMA optimize").execute(&pool).await {
-                    warn!("pragma optimize failed: {}", e);
+                drop(_write_guard);
+                // Repair existing histories on the first background tick;
+                // check hourly thereafter, retrying deferred work next tick.
+                if tokio::time::Instant::now() >= next_planner_run {
+                    let attempt = crate::planner_stats::run_and_report(
+                        &pool,
+                        &write_semaphore,
+                        &write_queue_health,
+                        &shutdown,
+                        diagnostics_root.as_deref(),
+                    )
+                    .await;
+                    if attempt.status == "complete" {
+                        next_planner_run =
+                            tokio::time::Instant::now() + crate::planner_stats::INTERVAL;
+                    }
                 }
             }
         });
@@ -1642,6 +1764,59 @@ mod wal_maintenance_tests {
     use sqlx::Row;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn retention_cursor_uses_all_streams_and_preserves_time_spelling() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        db.execute_raw_sql_write("INSERT INTO frames(timestamp) VALUES('2026-10-12T20:00:01.000Z'),('2026-10-12T20:00:01.000100+00:00'),('2026-10-12T20:00:03.000Z'); INSERT INTO ui_events(timestamp,event_type) VALUES('2026-10-12T20:00:02.000+00:00','click');").await.unwrap();
+        let start = "2026-10-12T20:00:00Z".parse().unwrap();
+        let end = "2026-10-12T20:01:00Z".parse().unwrap();
+        let first = db
+            .next_retention_timestamp(start, end)
+            .await
+            .unwrap()
+            .unwrap();
+        // Both spellings belong to the same SQLite millisecond group. The
+        // chosen boundary can be either member; the next slice covers its tail.
+        assert!(
+            first
+                >= "2026-10-12T20:00:01Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+        );
+        assert!(
+            first
+                <= "2026-10-12T20:00:01.000100Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+        );
+        // Sub-millisecond neighbours share the next delete slice rather than
+        // stalling the cursor when timestamp fractions/timezones differ.
+        let second = db
+            .next_retention_timestamp(first, end)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second,
+            "2026-10-12T20:00:02Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
+        let third = db
+            .next_retention_timestamp(second, end)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .next_retention_timestamp(third, end)
+            .await
+            .unwrap()
+            .is_none());
+        db.close().await;
+    }
 
     #[tokio::test]
     async fn startup_integrity_uses_fresh_fts_state_after_concurrent_writes() {

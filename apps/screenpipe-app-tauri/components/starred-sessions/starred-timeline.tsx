@@ -7,6 +7,7 @@ import { emit } from "@tauri-apps/api/event";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { useTauriEvent } from "@/lib/hooks/use-tauri-event";
 import { useStarredSessions } from "./use-starred-sessions";
+import { SessionHistory } from "./session-history";
 import { StarredSessionPanel } from "./starred-session-panel";
 
 export function StarredTimeline({
@@ -44,7 +45,7 @@ export function StarredTimeline({
       {showStrip && (
         <div
           aria-label="Starred moments"
-          className="flex shrink-0 items-center gap-2 overflow-x-auto border-b px-3 py-2 text-xs"
+          className="flex shrink-0 items-center gap-2 overflow-hidden border-b px-3 py-2 text-xs"
         >
           <button
             className="flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 hover:bg-muted"
@@ -57,9 +58,10 @@ export function StarredTimeline({
             <Star
               className={`h-3.5 w-3.5 ${state.active ? "fill-current" : ""}`}
             />
-            {state.active ? "Starring" : "Star session"}
+            {state.active ? `${Math.max(1, Math.ceil((Date.parse(state.active.end) - state.now) / 60000))} min left` : "Star session"}
           </button>
-          {state.sessions.slice(0, 10).map((s) => (
+          <div className="hidden min-w-0 flex-1 items-center gap-1 overflow-hidden sm:flex">
+          {state.sessions.slice(0, 3).map((s) => (
             <button
               key={s.id}
               title={`${new Date(s.start).toLocaleString()} to ${new Date(s.end).toLocaleString()}`}
@@ -77,6 +79,8 @@ export function StarredTimeline({
               })}
             </button>
           ))}
+          </div>
+          <SessionHistory />
         </div>
       )}
       {!showStrip && (

@@ -1098,7 +1098,7 @@ pub fn remove_tray(app: &AppHandle) {
                 if app_for_thread.tray_by_id("screenpipe_main").is_none() {
                     return;
                 }
-                info!("tray: removing icon (suppressed by enterprise policy)");
+                info!("tray: removing suppressed icon");
                 let _old = app_for_thread.remove_tray_by_id("screenpipe_main");
                 drop(_old);
             });
@@ -1131,6 +1131,11 @@ pub fn remove_tray(app: &AppHandle) {
 /// with no menu for a full poll interval.
 pub fn enforce_tray_visibility(app: &AppHandle) {
     if tray_suppressed_by_policy() {
+        remove_tray(app);
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    if crate::search_only::is_active() {
         remove_tray(app);
         return;
     }
@@ -1186,6 +1191,26 @@ pub fn enforce_tray_visibility(app: &AppHandle) {
     });
 }
 
+/// Theme the tray icon must contrast against.
+///
+/// On Windows the taskbar/tray follows `SystemUsesLightTheme`, not the
+/// `AppsUseLightTheme` value `dark_light` reads. The two differ on the Windows
+/// 10 default (light apps, dark taskbar) and on any Windows 11 "Custom" mode,
+/// which put a black icon on a dark taskbar.
+pub fn tray_theme() -> dark_light::Mode {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let system_light = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+            .and_then(|k| k.get_value::<u32, _>("SystemUsesLightTheme"));
+        if let Ok(v) = system_light {
+            return if v == 0 { dark_light::Mode::Dark } else { dark_light::Mode::Light };
+        }
+    }
+    dark_light::detect().unwrap_or(dark_light::Mode::Dark)
+}
+
 pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wry>>) -> Result<()> {
     // Store update_item globally so recreate_tray can use it (None for enterprise).
     // Do this even when suppressed: `enforce_tray_visibility` needs the item to
@@ -1237,6 +1262,19 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
 
 /// Confirmed Quit leaves no tray UI. Reopening restores the same tray item.
 /// Call on the main thread, including after a search-only updater relaunch.
+#[cfg(target_os = "windows")]
+pub(crate) fn sync_search_visibility(app: &AppHandle) -> Result<()> {
+    if crate::search_only::is_active() {
+        // tray-icon 0.23.1 registers hidden icons again on TaskbarCreated.
+        // Remove the native object so an Explorer restart cannot resurrect it.
+        remove_tray(app);
+    } else if app.tray_by_id("screenpipe_main").is_none() {
+        enforce_tray_visibility(app);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn sync_search_visibility(app: &AppHandle) -> Result<()> {
     if let Some(tray) = app.tray_by_id("screenpipe_main") {
         tray.set_visible(!crate::search_only::is_active())?;
@@ -1292,7 +1330,16 @@ fn recreate_tray_on_main_thread(app: &AppHandle) {
         // the next poll. Take it down instead and stop.
         if tray_suppressed_by_policy() {
             if app.tray_by_id("screenpipe_main").is_some() {
-                info!("recreate_tray: suppressed by enterprise policy, removing instead");
+                info!("recreate_tray: tray suppressed, removing instead");
+                let _old = app.remove_tray_by_id("screenpipe_main");
+                drop(_old);
+            }
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        if crate::search_only::is_active() {
+            if app.tray_by_id("screenpipe_main").is_some() {
+                info!("recreate_tray: search-only, removing instead");
                 let _old = app.remove_tray_by_id("screenpipe_main");
                 drop(_old);
             }

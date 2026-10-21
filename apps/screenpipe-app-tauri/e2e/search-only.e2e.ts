@@ -23,6 +23,8 @@ type State = {
   capture_running: boolean;
   webviews: string[];
   keep_search_after_quit: boolean;
+  tray_registered: boolean;
+  platform: string;
 };
 async function request(
   base: string,
@@ -66,11 +68,14 @@ const counts = async () => {
 };
 
 const initial = await state();
+assert(initial.platform, "The E2E app must report its target platform");
+const windowsTray = initial.platform === "windows";
 assert(initial.keep_search_after_quit, "The preference defaults On");
 assert(
   initial.capture_intended && initial.capture_running,
   "Start real capture before running this check",
 );
+assert(initial.tray_registered, "Normal recording has a native tray");
 const history = await request(api, "/search?limit=1&content_type=all");
 assert(
   history.data?.length > 0,
@@ -86,7 +91,8 @@ for (let cycle = 0; cycle < 2; cycle++) {
       !s.entering &&
       !s.capture_intended &&
       !s.capture_running &&
-      s.webviews.length === 0
+      s.webviews.length === 0 &&
+      (!windowsTray || !s.tray_registered)
     );
   }, "Quit stops capture and destroys webviews");
   assert.equal(
@@ -94,6 +100,23 @@ for (let cycle = 0; cycle < 2; cycle++) {
     initial.pid,
     "Quit must retain the existing process",
   );
+  if (windowsTray) {
+    assert.equal(
+      (await state()).tray_registered,
+      false,
+      "Quit removes the native tray registration",
+    );
+    assert.equal(
+      (await request(control, "/e2e/search-only/recreate-tray", "POST")).accepted,
+      true,
+      "Native tray recreation completed",
+    );
+    assert.equal(
+      (await state()).tray_registered,
+      false,
+      "Explicit tray recreation cannot resurrect search-only tray UI",
+    );
+  }
   assert(
     (await request(api, "/search?limit=1&content_type=all")).data.length > 0,
     "External history request succeeds after Quit",
@@ -136,11 +159,38 @@ for (let cycle = 0; cycle < 2; cycle++) {
     "Reopening resumes recording without a separate Start action",
   );
   assert.equal((await state()).pid, initial.pid);
+  assert.equal(
+    (await state()).tray_registered,
+    true,
+    "Manual reopen restores the native tray",
+  );
   await until(async () => {
     const resumed = await counts();
     return Date.parse(resumed.lastFrame) > Date.parse(stopped.lastFrame);
   }, "Reopened capture persists new frames");
 }
+
+await request(control, "/e2e/search-only/quit", "POST");
+await until(async () => {
+  const s = await state();
+  return s.search_only && !s.entering && !s.capture_running;
+}, "Quit before retained-server failure");
+const beforeServerStop = await counts();
+assert.equal(
+  (await request(control, "/e2e/search-only/stop-server", "POST")).stopped,
+  true,
+  "Stop the retained server through the normal lifecycle owner",
+);
+await request(control, "/e2e/search-only/reopen", "POST");
+await until(async () => {
+  const s = await state();
+  return !s.search_only && s.capture_running && s.capture_intended;
+}, "Reopen starts the server and capture when the retained server is absent");
+assert.equal((await state()).pid, initial.pid);
+await until(async () => {
+  const resumed = await counts();
+  return Date.parse(resumed.lastFrame) > Date.parse(beforeServerStop.lastFrame);
+}, "Reopen after server loss persists new frames");
 
 await request(control, "/e2e/search-only/quit", "POST");
 await until(async () => {
@@ -157,7 +207,8 @@ await until(async () => {
       s.search_only &&
       !s.capture_running &&
       !s.capture_intended &&
-      s.webviews.length === 0
+      s.webviews.length === 0 &&
+      (!windowsTray || !s.tray_registered)
     );
   } catch {
     return false;
@@ -180,7 +231,12 @@ assert.deepEqual(
 await request(control, "/e2e/search-only/reopen", "POST");
 await until(async () => {
   const s = await state();
-  return !s.search_only && s.capture_running && s.capture_intended;
+  return (
+    !s.search_only &&
+    s.capture_running &&
+    s.capture_intended &&
+    s.tray_registered
+  );
 }, "Manual reopen after an updater restart resumes capture");
 const recordingBeforeUpdate = await state();
 await request(control, "/e2e/search-only/restart", "POST");
@@ -197,5 +253,5 @@ await until(async () => {
   }
 }, "Updater relaunch while recording restores recording");
 console.log(
-  "PASS: two Quit/search/reopen cycles resume and persist frames in the same PID; Quit blocks captures and mutations; updater relaunch preserves paused search or active recording",
+  "PASS: Quit/search/reopen resumes and persists frames in the same PID, including after retained-server loss; Quit blocks captures and mutations; updater relaunch preserves paused search or active recording",
 );

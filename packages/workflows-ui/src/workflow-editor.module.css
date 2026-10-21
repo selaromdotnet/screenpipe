@@ -37,31 +37,36 @@
 .intro .title { font-family: var(--heading-font); font-size: 30px; font-weight: 600; line-height: 1.25; letter-spacing: -.03em; margin-bottom: 4px; }
 .endpoint { display: block; color: var(--muted); font-size: 11px; padding: 6px 5px; }
 .endpoint textarea { margin-left: -5px; }
-.stepsHeading { margin: 18px 0 8px; padding: 0 5px; }
+.stepsHeading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin: 48px 0 16px; padding: 0; min-height: 44px; border-bottom: 1px solid var(--line); }
+.editor:not(.localEditor) .stepsHeading { margin: 18px 0 8px; padding: 0 5px; min-height: 0; border: 0; }
+.workflowTab { align-self: stretch; display: flex; align-items: center; border-bottom: 2px solid var(--ink); color: var(--ink); font-size: 14px; font-weight: 550; }
+.viewTools, .viewSwitch { display: flex; align-items: center; gap: 2px; }
+.editor .viewTools button { min-height: 36px; min-width: 36px; padding: 6px 10px; font-size: 14px; gap: 8px; }
+.viewSwitch button[aria-pressed="true"], .viewTools > button[aria-expanded="true"] { background: var(--soft); color: var(--ink); }
+.walkthroughNavigation { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; padding: 12px; min-height: 44px; border-top: 1px solid var(--line); }
+.editor .walkthroughNavigation button { min-height: 44px; min-width: 44px; padding: 6px 8px; font-size: 12px; }
+.walkthroughNavigation span { color: var(--muted); font: 12px var(--mono-font, monospace); }
+.step[hidden], .insertion[hidden] { display: none; }
+.step[tabindex="-1"] { scroll-margin-top: 80px; }
 .stepsHeading strong { color: var(--muted); font-size: 11px; font-weight: 500; }
 .steps { margin: 0 0 4px; padding-left: 26px; }
 .step { position: relative; padding: 4px 0; margin: 0 0 24px; border: 0; background: transparent; }
 .step::before { content: ""; position: absolute; left: -30px; top: 0; bottom: 0; width: 30px; }
 .step.drop { box-shadow: 0 -2px 0 var(--ink); }
-.stepTop { padding-right: 30px; position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: start; }
+.stepTop { position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: start; }
 .number { padding-top: 7px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .step .title { font-family: var(--heading-font); min-width: 0; font-size: 17px; font-weight: 550; line-height: 1.4; }
 .step > textarea, .step > div[data-testid="procedure-markdown"] { width: calc(100% - 24px); margin-left: 24px; }
 .editor .grip {
   -webkit-user-drag: element; cursor: grab; color: var(--muted); }
 .editor .grip:active { cursor: grabbing; }
-.stepTop > .grip { position: absolute; left: -30px; top: 0; }
-.controls { position: relative; }
-.controls > summary { display: flex; align-items: center; justify-content: center; min-width: 28px; min-height: 28px; border-radius: 4px; color: var(--muted); list-style: none; cursor: pointer; }
-.controls > summary::-webkit-details-marker { display: none; }
-.controls > summary:hover { background: var(--soft); }
-.controls > summary:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
-.stepMenu { display: flex; position: absolute; top: 30px; right: 0; z-index: 3; padding: 4px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); box-shadow: 0 4px 12px #0000000d; }
-.controls[open] { opacity: 1; pointer-events: auto; z-index: 6; }
-.stepTop > .grip, .controls, .step > .add, .blockControls > .grip { opacity: 0; pointer-events: none; transition: opacity .12s ease; }
-.step:hover > .stepTop > .grip, .step:focus-within > .stepTop > .grip,
-.step:hover > .stepTop > .controls, .step:focus-within > .stepTop > .controls,
-.step:hover > .add, .step:focus-within > .add,
+.stepControls { position: absolute; left: -30px; top: 0; }
+.stepControls[data-open] { z-index: 6; }
+.stepMenu { display: flex; flex-direction: column; position: absolute; top: 32px; left: 0; z-index: 3; width: 200px; padding: 4px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); box-shadow: 0 4px 12px #0000000d; }
+.stepMenu > button { justify-content: flex-start; width: 100%; padding: 7px 6px; gap: 8px; }
+.stepControls > .grip, .blockControls > .grip { opacity: 0; pointer-events: none; transition: opacity .12s ease; }
+.step:hover .stepTop > .stepControls > .grip, .step:focus-within .stepTop > .stepControls > .grip,
+.stepControls[data-open] > .grip,
 .block:hover > .blockControls > .grip, .block:focus-within > .blockControls > .grip,
 .blockControls[data-open] > .grip { opacity: 1; pointer-events: auto; }
 .blocks { margin-left: 24px; }
@@ -87,18 +92,18 @@
 .source > details > summary svg { width: 12px; height: 12px; }
 .source p, .source blockquote { font-size: 12px; line-height: 1.5; }
 .source small { display: block; color: var(--muted); }
-.editor .add { position: absolute; top: 4px; right: 0; font-size: 0; gap: 0; }
 .editor .addStep { margin: 0 0 12px 49px; padding: 4px 6px; color: var(--muted); }
 .note { font-size: 11px; color: var(--muted); line-height: 1.5; padding: 0 5px; }
 .error { padding: 12px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; line-height: 1.6; }
 .srOnly { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
 @media (hover: none) {
+  .stepControls > .grip, .blockControls > .grip { opacity: 1; pointer-events: auto; }
   .kindLabel[data-kind="action"], .kindLabel svg { opacity: 1; }
   .kindLabel select { min-height: 32px; }
   .editor button { min-width: 32px; min-height: 32px; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .stepTop > .grip, .controls, .step > .add, .blockControls > .grip { transition: none; }
+  .stepControls > .grip, .blockControls > .grip { transition: none; }
 }
 @container workflow-editor (max-width: 560px) {
   .intro .title { font-family: var(--heading-font); font-size: 25px; }
@@ -121,8 +126,141 @@
 .titleRow > textarea { flex: 1; min-width: 0; }
 .titleRow > span { margin-top: 6px; }
 .stepActions { display: flex; align-items: flex-start; }
-.step:hover > .stepTop .controls, .step:focus-within > .stepTop .controls { opacity: 1; pointer-events: auto; }
 
 .readOnlyText { display: block; padding: 3px 5px; color: var(--ink); font-size: 14px; line-height: 1.6; }
 .titleRow > h1 { flex: 1; min-width: 0; padding: 3px 5px; }
 .endpoint .readOnlyText { margin-left: -5px; }
+
+/* Static document text uses the same geometry as editable fields. */
+.editor h1, .editor h2, .editor p { margin-top: 0; }
+.editor .readOnlyText { margin-bottom: 0; overflow-wrap: anywhere; }
+.readOnlyKind { grid-column: 2; grid-row: 1; padding: 6px 4px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.stepApps { margin: 4px 0 0 29px; color: var(--muted); font-size: 11px; }
+.reference { margin: 4px 5px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.reference summary { cursor: pointer; }
+.reference blockquote { margin: 8px 0; max-height: 200px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.reference small { display: block; }
+@container workflow-editor (max-width: 560px) {
+  .readOnlyKind { grid-column: 1; grid-row: 2; }
+  .stepApps { margin-left: 25px; }
+}
+
+/* Plus insertion follows the web document: reveal in the gap between steps. */
+.insertion + .step { margin-bottom: 4px; }
+.insertion { position: relative; display: flex; align-items: center; height: 24px; margin-left: -30px; padding-left: 30px; }
+.insertion > button { position: absolute; left: 0; opacity: 0; pointer-events: none; }
+.insertion > span { width: 100%; border-top: 1px solid transparent; }
+.insertion:hover > button, .insertion:focus-within > button { opacity: 1; pointer-events: auto; }
+.insertion:hover > span, .insertion:focus-within > span { border-color: var(--line); }
+.editor .addDetail { margin: 4px 0 4px 25px; font-size: 12px; gap: 5px; }
+/* Keep measured timing available without a permanent clock on every row. */
+.stepActions > span, .titleRow > span { opacity: 0; pointer-events: none; }
+.step:hover .stepTop > .stepActions > span, .step:focus-within .stepTop > .stepActions > span,
+.titleRow:hover > span, .titleRow:focus-within > span { opacity: 1; pointer-events: auto; }
+@media (hover: none) {
+  .insertion > button, .stepActions > span, .titleRow > span { opacity: 1; pointer-events: auto; }
+}
+@container workflow-editor (max-width: 560px) {
+  .editor .addDetail { margin-left: 21px; }
+}
+
+/* Match the website's document + optional Variables rail. */
+.withPanel { max-width: 1120px; }
+.documentLayout { display: grid; grid-template-columns: minmax(0,1fr); gap: 28px; }
+.withPanel .documentLayout { grid-template-columns: minmax(0,1fr) 290px; }
+.panel { position:sticky;top:20px;align-self:start;max-height:calc(100vh - 120px);overflow:auto;border-left: 1px solid var(--line); padding-left: 20px; min-width:0; overflow-wrap:anywhere; }
+.panel h2 { font-size:16px; margin:0 0 12px; }
+.panel h3 { font-size:13px; margin:18px 0 8px; }
+.panel p, .panel small { font-size:12px; color:var(--muted); line-height:1.6; }
+.panel header { display:flex;justify-content:space-between;align-items:center; }
+.panel label, .execution label { display:block; font-size:12px; margin:12px 0; }
+.panel input, .panel textarea, .panel select, .execution select { box-sizing:border-box;display:block;width:100%;min-height:36px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px;font:inherit; }
+.panel textarea { min-height:70px; }
+.panel blockquote { margin:10px 0; padding-left:10px; border-left:2px solid var(--line);white-space:pre-wrap; font-size:12px; }
+.panel pre { white-space:pre-wrap;word-break:break-word;font-size:11px;max-height:220px;overflow:auto;background:var(--soft);padding:8px; }
+.variable { border-top:1px solid var(--line);padding:8px 0; }
+.variable > button { font-weight:600; }
+.execution { margin:12px 0 12px 24px; font-size:12px; }
+.execution > summary { cursor:pointer; color:var(--muted); }
+@container workflow-editor (max-width: 850px) { .withPanel .documentLayout { grid-template-columns:minmax(0,1fr); } .panel { position:static;max-height:none;grid-row:1; border-left:0;border-bottom:1px solid var(--line);padding:0 0 20px; } }
+
+.editor a[href^="#workflow-io-"] { color:var(--ink); background:var(--soft); border-bottom:1px dashed var(--muted);border-radius:3px;padding:1px 3px;text-decoration:none; }
+
+/* Use the website's section toolbar, inspector card, and card footer. */
+.localEditor { max-width: 1280px; }
+.localEditor.withPanel { max-width: 1120px; }
+.metadata { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+.editor .metadata button { padding: 0; font-size: 14px; }
+.stepLayout { min-width: 0; }
+.stepBody { display: flex; flex-direction: column; }
+.instructions { display: contents; }
+.instructions > .stepTop { order: -2; }
+.instructions > [data-variable-field="description"] { margin-left: 24px; }
+.readOnlyText[hidden], .execution[hidden], .editor button[hidden], .endpoint[hidden], .source[hidden] { display: none; }
+.execution { padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
+.execution > header { display: flex; justify-content: space-between; align-items: center; }
+.editor .stepBehavior { margin: 4px 0 0 24px; padding: 4px; gap: 6px; min-height: 36px; }
+.expectedLabel { grid-column: 1; grid-row: 1; color: var(--muted); font-size: 12px; padding: 8px 5px 0; }
+.localEditor .block[data-kind="check"] > [data-testid="procedure-markdown"] { grid-row: 2; }
+.localEditor .block[data-kind="check"] > .kindLabel { grid-row: 2; }
+.walkthrough .steps { padding-left: 0; }
+.walkthrough .insertion { display: none; }
+.walkthrough .step { padding: 0; margin: 0; border: 1px solid var(--line); }
+.walkthrough .stepBody { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); }
+.walkthrough .instructions { display: block; min-width: 0; grid-column: 2; grid-row: 1; padding: 20px; }
+.walkthrough .instructions:only-child, .noEvidence .instructions { grid-column: 1 / -1; }
+.noEvidence .stepBody { grid-template-columns: minmax(0, 1fr); }
+.walkthrough .source { grid-column: 1; grid-row: 1; margin: 0; padding: 20px; background: var(--soft); border-right: 1px solid var(--line); }
+.walkthrough .step .title { font-size: 18px; line-height: 1.5; font-weight: 600; }
+.walkthrough .stepTop { grid-template-columns: minmax(0, 1fr) auto; margin-bottom: 0; }
+.walkthrough .number { display: none; }
+.stepCounter { color: var(--muted); font: 12px var(--mono-font, monospace); margin: 0 0 12px; }
+.walkthrough .stepApps { margin: 6px 5px 20px; min-height: 24px; font-size: 12px; }
+.walkthrough .blocks, .walkthrough .instructions > [data-variable-field="description"] { margin-left: 0; }
+.walkthrough .block { grid-template-columns: minmax(0, 1fr); margin: 8px 0; }
+.walkthrough .kindLabel { grid-column: 1; grid-row: 3; opacity: 0; height: 0; overflow: hidden; }
+.walkthrough .block[data-kind="check"] > .kindLabel { grid-row: 3; }
+.walkthrough .block:hover .kindLabel, .walkthrough .block:focus-within .kindLabel { opacity: 1; height: auto; overflow: visible; }
+.walkthrough .stepControls { left: -24px; }
+.walkthrough .stepControls > .grip { opacity: 0; pointer-events: none; }
+.walkthrough .step:hover .stepControls > .grip, .walkthrough .step:focus-within .stepControls > .grip { opacity: 1; pointer-events: auto; }
+.walkthrough .stepMenu { left: 24px; }
+.walkthrough .stepBehavior { margin-left: 0; }
+.mapView { max-width: 1280px; }
+.mapView .stepLayout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; align-items: start; gap: 20px; }
+.focusMap .stepLayout { grid-template-columns: 380px minmax(0, 1fr); }
+.mapView .step { border-radius: 8px; overflow: clip; }
+.mapView .steps { position: sticky; top: 64px; }
+.mapView .stepBody { grid-template-columns: minmax(0, 1fr); }
+.mapView .instructions { grid-column: 1; grid-row: 1; }
+.mapView .source { grid-column: 1; grid-row: 2; border-right: 0; border-top: 1px solid var(--line); }
+@container workflow-editor (max-width: 760px) {
+  .walkthrough .stepBody { grid-template-columns: minmax(0, 1fr); }
+  .walkthrough .instructions { grid-column: 1; grid-row: 1; padding: 16px; }
+  .walkthrough .source { grid-column: 1; grid-row: 2; border-right: 0; border-top: 1px solid var(--line); padding: 16px; }
+  .mapView .stepLayout, .focusMap .stepLayout { grid-template-columns: minmax(0, 1fr); }
+  .mapView .steps { position: static; }
+  .stepsHeading { gap: 8px; }
+  .editor .viewTools button { padding: 6px 8px; font-size: 12px; }
+}
+
+.reviewLabel { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:14px; padding:8px; }
+.stepIdentity { display:flex; flex-wrap:wrap; align-items:center; gap:12px 20px; margin:8px 5px 20px; color:var(--muted); font-size:12px; }
+.stepIdentity > span { display:inline-flex; align-items:center; gap:10px; }
+.stepKind { min-width:80px; }
+.detailsSheet { position:fixed; inset:0 0 0 auto; margin:0; width:400px; max-width:100vw; height:100dvh; max-height:100dvh; box-sizing:border-box; padding:24px; border:0; border-left:1px solid var(--line); background:var(--panel); color:var(--ink); overflow:auto; font:inherit; }
+.detailsSheet::backdrop { background:#00000030; }
+.detailsSheet > div { min-height:100%; }
+.detailsSheet header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.detailsSheet h2 { font-size:18px; margin:0; }
+.detailsSheet h3 { font-size:13px; margin:24px 0 8px; }
+.detailsSheet p, .detailsSheet small { font-size:12px; line-height:1.7; color:var(--muted); }
+.detailsSheet label { display:block; font-size:12px; margin:16px 0; }
+.detailsSheet select, .detailsSheet textarea { display:block; box-sizing:border-box; width:100%; min-height:36px; padding:8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); font:inherit; }
+
+.stepProperties { display:grid; gap:12px; margin:12px 5px; }
+.stepProperties:empty { display:none; }
+.stepProperties > div { min-width:0; }
+.stepProperties label, .stepProperties h3 { display:block; margin:0 0 4px; color:var(--muted); font-size:12px; font-weight:400; }
+.behaviorMenu { display:inline-block; margin:4px 0; }
+.editor .behaviorMenu > div > button { min-height:36px; padding:4px; font-size:12px; gap:6px; }

@@ -12,12 +12,24 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Page from "./page";
 
 const mocks = vi.hoisted(() => ({
+  resize: vi.fn(),
+  move: vi.fn(),
   hide: vi.fn(),
   fetch: vi.fn(),
   visibility: null as null | ((e: { payload: boolean }) => void),
 }));
 vi.mock("@/lib/utils/tauri", () => ({
   commands: { hideStarredSessions: mocks.hide },
+}));
+vi.mock("@tauri-apps/api/window", () => ({
+  LogicalSize: class { constructor(public width: number, public height: number) {} },
+  PhysicalPosition: class { constructor(public x: number, public y: number) {} },
+  currentMonitor: async () => ({ workArea: { position: { x: -1920, y: -1080 }, size: { width: 1920, height: 1040 } } }),
+  getCurrentWindow: () => ({
+    setSize: mocks.resize, setPosition: mocks.move,
+    outerPosition: async () => ({ x: -250, y: -160 }),
+    outerSize: async () => ({ width: 616, height: 600 }),
+  }),
 }));
 vi.mock("@/lib/api", () => ({ localFetch: mocks.fetch }));
 vi.mock("@/lib/hooks/use-tauri-event", () => ({
@@ -86,7 +98,7 @@ it("dismisses after five idle seconds without changing the saved session", async
   const session = { id: "active", start: new Date().toISOString(), end: new Date(Date.now() + 3600000).toISOString(), revision: 1, hd_requested: false, has_audio: false };
   mocks.fetch.mockResolvedValue({ ok: true, json: async () => ({ data: [session] }) });
   render(<Page />);
-  await screen.findByText("Starred session in progress");
+  await screen.findByText("Session starred");
   vi.useFakeTimers();
   fireEvent.pointerMove(screen.getByRole("region", { name: "Starred work sessions" }));
   await act(async () => { await vi.advanceTimersByTimeAsync(4999); });
@@ -99,7 +111,8 @@ it("keeps the popup open during inline time edits", async () => {
   const session = { id: "active", start: new Date().toISOString(), end: new Date(Date.now() + 3600000).toISOString(), revision: 1, hd_requested: false, has_audio: false };
   mocks.fetch.mockResolvedValue({ ok: true, json: async () => ({ data: [session] }) });
   render(<Page />);
-  await screen.findByText("Starred session in progress");
+  await screen.findByText("Session starred");
+  fireEvent.click(screen.getByRole("button", { name: "More", exact: true }));
   fireEvent.click(screen.getByRole("button", { name: "Edit session end" }));
   vi.useFakeTimers();
   await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
@@ -113,4 +126,55 @@ it("does not auto-dismiss a storage error", async () => {
   vi.useFakeTimers();
   await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
   expect(mocks.hide).not.toHaveBeenCalled();
+});
+
+it("shows the star before controls, keeps the default, and updates the same session", async () => {
+  vi.useFakeTimers();
+  let session = { id: "active", start: new Date().toISOString(), end: new Date(Date.now() + 3600000).toISOString(), revision: 1, hd_requested: false, has_audio: false };
+  mocks.fetch.mockImplementation(async (_url, init) => {
+    if (init?.method === "POST") {
+      session = { ...JSON.parse(init.body), revision: 2 };
+      return { ok: true, json: async () => session };
+    }
+    return { ok: true, json: async () => ({ data: [session] }) };
+  });
+  await act(async () => { render(<Page />); });
+  expect(screen.getByRole("status", { name: "Session starred" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "15 min" })).toBeNull();
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  expect(screen.getByRole("button", { name: "60 min" })).toHaveAttribute("aria-pressed", "true");
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "15 min" })); });
+  expect(session.id).toBe("active");
+  expect(Date.parse(session.end) - Date.parse(session.start)).toBe(15 * 60000);
+  expect(session.hd_requested).toBe(false);
+  expect(screen.getByText("15 min left")).toBeVisible();
+});
+
+it("pauses dismissal while hovered and resumes after leaving", async () => {
+  mocks.fetch.mockResolvedValue({ ok: true, json: async () => ({ data: [{ id: "active", start: new Date().toISOString(), end: new Date(Date.now() + 3600000).toISOString(), revision: 1, hd_requested: false, has_audio: false }] }) });
+  render(<Page />);
+  await screen.findByText("Session starred");
+  vi.useFakeTimers();
+  const controls = screen.getByRole("region", { name: "Starred work sessions" });
+  fireEvent.pointerEnter(controls);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+  expect(mocks.hide).not.toHaveBeenCalled();
+  fireEvent.pointerLeave(controls);
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(mocks.hide).toHaveBeenCalledTimes(1);
+});
+
+it("fits expanded controls inside a negative-origin monitor work area", async () => {
+  let resized!: () => void;
+  vi.stubGlobal("ResizeObserver", class {
+    constructor(callback: () => void) { resized = callback; }
+    observe() {} disconnect() {}
+  });
+  try {
+    const { container } = render(<Page />);
+    Object.defineProperty(container.firstElementChild, "scrollHeight", { value: 300 });
+    await act(async () => { resized(); });
+    expect(mocks.resize).toHaveBeenCalledWith(expect.objectContaining({ width: 308, height: 300 }));
+    expect(mocks.move).toHaveBeenCalledWith(expect.objectContaining({ x: -616, y: -640 }));
+  } finally { cleanup(); vi.unstubAllGlobals(); }
 });
