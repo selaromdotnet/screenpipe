@@ -254,7 +254,7 @@ static REQUIRED_PI_PACKAGE_INSTALL_LOCK: std::sync::OnceLock<Mutex<()>> =
 static PI_EXTENSION_SAFE_MODE_PROJECTS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::OnceLock::new();
 
-const MANAGED_PI_EXTENSION_FILES: [&str; 9] = [
+const MANAGED_PI_EXTENSION_FILES: [&str; 10] = [
     "web-search.ts",
     "mcp-bridge.ts",
     "save-artifact.ts",
@@ -262,6 +262,7 @@ const MANAGED_PI_EXTENSION_FILES: [&str; 9] = [
     "connection-gate.ts",
     "context-pruning.ts",
     "tinfoil.ts",
+    "gemini.ts",
     "work-context.ts",
     "workflow-feedback.ts",
 ];
@@ -1833,6 +1834,8 @@ fn ensure_shared_pi_extensions(project_dir: &str) -> Result<(), String> {
     ensure_context_pruning_extension(project_dir)?;
     screenpipe_core::agents::pi::PiExecutor::ensure_tinfoil_extension(Path::new(project_dir))
         .map_err(|e| e.to_string())?;
+    screenpipe_core::agents::pi::PiExecutor::ensure_gemini_extension(Path::new(project_dir))
+        .map_err(|e| e.to_string())?;
     // MCP bridge: lets the agent reach user-registered MCP servers.
     ensure_mcp_bridge_extension(project_dir)?;
     // Save artifact: lets the agent register deliverables in the Artifacts library.
@@ -1855,6 +1858,7 @@ const SHARED_PI_EXTENSION_FILES: &[&str] = &[
     "context-usage.ts",
     "context-pruning.ts",
     "tinfoil.ts",
+    "gemini.ts",
     "mcp-bridge.ts",
     "save-artifact.ts",
     "live-views.ts",
@@ -8167,6 +8171,7 @@ error: InstallFailed extracting tarball"#;
 
         assert_eq!(custom["baseUrl"], pc.url);
         assert_eq!(model["compat"]["supportsStore"], false);
+        assert_eq!(model["api"], "screenpipe-gemini-openai");
     }
 
     #[tokio::test]

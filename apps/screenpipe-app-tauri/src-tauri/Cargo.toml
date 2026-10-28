@@ -299,6 +299,12 @@ e2e = [
   "screenpipe-engine/e2e",
 ]
 
+# Local personal builds only (see scripts/local-build/build.ps1): mirrors the
+# frontend's NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS flag on the Rust side
+# so the recording-access gate in recording.rs doesn't require sign-in in a
+# release build. Never set by CI/release workflows.
+dev-billing-bypass = []
+
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
 
