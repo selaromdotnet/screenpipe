@@ -4,6 +4,7 @@
 
 import { OpenAIProvider } from './openai';
 import { AstraProvider } from './astra';
+import { OpenAIProProvider, OPENAI_PRO_NATIVE_FEATURES } from './openai-pro';
 import { AnthropicProvider } from './anthropic';
 import { ScreenpipeEnclaveProvider, isScreenpipeEnclaveModel } from './screenpipe-enclave';
 import { ScreenpipeGlmProvider, isScreenpipeGlmModel } from './screenpipe-glm';
@@ -13,6 +14,8 @@ import { AIProvider } from './base';
 import { Env } from '../types';
 
 export interface ProviderConnectionOptions {
+	fetch?: typeof fetch;
+	explicitPromptCaching?: boolean;
 	baseURL?: string;
 	apiKey?: string;
 	maxRetries?: number;
@@ -180,6 +183,7 @@ export function createProvider(model: string, env: Env, connection?: ProviderCon
 			connection?.baseURL,
 			connection?.defaultHeaders,
 			connection?.maxRetries,
+			connection?.fetch,
 		);
 	}
 	// Screenpipe enclave — our own Tinfoil-hosted CVM serving Gemma 4 E4B
@@ -200,14 +204,21 @@ export function createProvider(model: string, env: Env, connection?: ProviderCon
 			connection?.maxRetries,
 		);
 	}
-	const Provider = model.toLowerCase() === 'gpt-6-astra' ? AstraProvider : OpenAIProvider;
-	return new Provider(
+	const proFeatures = Object.prototype.hasOwnProperty.call(OPENAI_PRO_NATIVE_FEATURES, model)
+		? OPENAI_PRO_NATIVE_FEATURES[model as keyof typeof OPENAI_PRO_NATIVE_FEATURES] : undefined;
+	const Provider = model.toLowerCase() === 'gpt-6-astra' ? AstraProvider
+		: proFeatures ? OpenAIProProvider : OpenAIProvider;
+	const provider = new Provider(
 		connection?.apiKey ?? requireSecret(env.OPENAI_API_KEY, 'OpenAI API key not configured'),
 		connection?.baseURL,
 		connection?.defaultHeaders,
 		connection?.maxRetries,
 		connection?.chatTemplateKwargs,
+		connection?.fetch,
+		connection?.explicitPromptCaching,
 	);
+	if (proFeatures) provider.supportsJson = proFeatures.structuredOutput;
+	return provider;
 }
 
 export type { AIProvider };

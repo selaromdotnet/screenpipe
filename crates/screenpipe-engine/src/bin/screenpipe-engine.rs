@@ -297,6 +297,11 @@ fn main() -> anyhow::Result<()> {
     let _profiler = dhat::Profiler::new_heap();
 
     let runtime = tokio::runtime::Runtime::new()?;
+    #[cfg(target_os = "macos")]
+    if let Some(code) = runtime.block_on(screenpipe_audio::core::vpio_process::run_hidden_mode()) {
+        std::process::exit(code);
+    }
+
     // Private ACP modes must run before public CLI parsing or AppKit startup.
     if let Some(exit_code) =
         runtime.block_on(screenpipe_core::agents::acp::run_hidden_mode_without_observer())
@@ -1116,8 +1121,8 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
             config.pii_redaction_columns,
             config.pii_redaction_pseudonyms
         ),
-        text: config.async_pii_redaction,
-        images: config.async_image_pii_redaction,
+        text: config.require_pii_completion && config.async_pii_redaction,
+        images: config.require_pii_completion && config.async_image_pii_redaction,
     })
     .await?;
     let database_failure = Arc::new(tokio::sync::Notify::new());

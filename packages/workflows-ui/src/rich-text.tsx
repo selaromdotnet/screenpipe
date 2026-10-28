@@ -5,8 +5,9 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Slice } from "prosemirror-model";
-import { EditorState } from "prosemirror-state";
+import { EditorState, TextSelection } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { setBlockType, toggleMark, wrapIn } from "prosemirror-commands";
 import { wrapInList } from "prosemirror-schema-list";
@@ -31,6 +32,7 @@ export function WorkflowRichText({
   className = "",
   fullDocument = false,
   imageUrl,
+  toolbarHost,
 }: {
   value: string;
   onChange?: (value: string) => void;
@@ -40,13 +42,18 @@ export function WorkflowRichText({
   className?: string;
   fullDocument?: boolean;
   imageUrl?: (src: string) => string | null;
+  /** Undefined keeps the inline toolbar; null suppresses it until a shared host is ready. */
+  toolbarHost?: HTMLElement | null;
 }) {
   const host = useRef<HTMLDivElement>(null);
+  const toolbarRef = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView>();
   const current = useRef({ value, onChange, maxLength, imageUrl });
   current.current = { value, onChange, maxLength, imageUrl };
   const emitted = useRef(value);
   const [expanded, setExpanded] = useState(false);
+  const [focusWithin, setFocusWithin] = useState(false);
+  const [hasTextSelection, setHasTextSelection] = useState(false);
   const [long, setLong] = useState(false);
   const [error, setError] = useState("");
   const [, refreshToolbar] = useState(0);
@@ -183,6 +190,42 @@ export function WorkflowRichText({
       );
   }, [value]);
 
+  useEffect(() => {
+    if (!editable || !fullDocument) {
+      setHasTextSelection(false);
+      return;
+    }
+    const syncTextSelection = () => {
+      const editor = view.current;
+      const selection = editor?.dom.ownerDocument.getSelection();
+      const selectedInsideEditor = Boolean(
+        editor && selection && !selection.isCollapsed && selection.rangeCount > 0 &&
+        selection.anchorNode && editor.dom.contains(selection.anchorNode) &&
+        selection.focusNode && editor.dom.contains(selection.focusNode),
+      );
+      if (editor && selection && selectedInsideEditor) {
+        // Keep the editor model aligned if the browser changed its native text selection first.
+        try {
+          const anchor = editor.posAtDOM(selection.anchorNode!, selection.anchorOffset);
+          const head = editor.posAtDOM(selection.focusNode!, selection.focusOffset);
+          const next = TextSelection.between(
+            editor.state.doc.resolve(anchor),
+            editor.state.doc.resolve(head),
+          );
+          if (!editor.state.selection.eq(next))
+            editor.dispatch(editor.state.tr.setSelection(next));
+        } catch {
+          // Ignore DOM selections that cannot map to a text position in this document.
+        }
+      }
+      setHasTextSelection(selectedInsideEditor);
+    };
+    const document = view.current?.dom.ownerDocument ?? window.document;
+    document.addEventListener("selectionchange", syncTextSelection);
+    syncTextSelection();
+    return () => document.removeEventListener("selectionchange", syncTextSelection);
+  }, [editable, fullDocument]);
+
   const schema = view.current?.state.schema;
   const marks = view.current ? view.current.state.storedMarks ?? view.current.state.selection.$from.marks() : [];
   const controls: Array<{ label: string; icon: typeof Bold; command: Command; active?: boolean }> = schema ? [
@@ -197,17 +240,25 @@ export function WorkflowRichText({
     { label: "Undo", icon: Undo2, command: undo },
     { label: "Redo", icon: Redo2, command: redo },
   ] : [];
-
-  return (
-    <div className={`${styles.root} ${className}`} data-testid="procedure-markdown">
-      {editable && fullDocument && <div className={styles.toolbar} role="toolbar" aria-label={`${label} formatting`}>
+  const toolbar = editable && fullDocument && focusWithin && hasTextSelection ? <div ref={toolbarRef} className={`${styles.toolbar} ${toolbarHost ? styles.embeddedToolbar : ""}`} role={toolbarHost ? "group" : "toolbar"} aria-label={`${label} formatting`}>
         {controls.map(control => <button key={control.label} type="button" aria-label={control.label} title={control.label} aria-pressed={control.active}
           disabled={!view.current || !control.command(view.current.state)}
           onMouseDown={event => event.preventDefault()}
           onClick={() => { const editor = view.current; if (editor) { control.command(editor.state, editor.dispatch, editor); editor.focus(); } }}>
           <control.icon size={15} />
         </button>)}
-      </div>}
+      </div> : null;
+  return (
+    <div
+      className={`${styles.root} ${className}`}
+      data-testid="procedure-markdown"
+      onFocusCapture={() => setFocusWithin(true)}
+      onBlurCapture={event => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null) && !toolbarRef.current?.contains(event.relatedTarget as Node | null))
+          setFocusWithin(false);
+      }}
+    >
+      {toolbarHost === undefined ? toolbar : toolbarHost && toolbar ? createPortal(toolbar, toolbarHost) : null}
       <div
         id={id}
         className={!fullDocument && long && !expanded ? styles.collapsed : undefined}

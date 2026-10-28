@@ -117,7 +117,12 @@ pub(crate) const SURFACES: &[Surface] = &[
     },
 ];
 
-/// Text worker scheduling follows the same registry as receipts and read gates.
+/// Audio receipts track sync revisions only; transcripts never require AI redaction.
+pub fn is_audio_surface(kind: &str) -> bool {
+    matches!(kind, "audio" | "segments")
+}
+
+/// Scheduling includes audio receipt bookkeeping, which never invokes a detector.
 pub fn text_release_kinds() -> Vec<&'static str> {
     SURFACES
         .iter()
@@ -298,10 +303,38 @@ impl DatabaseManager {
                 } else {
                     mutation
                 };
-                let create = format!("CREATE TRIGGER privacy_{kind}_{event} AFTER {clause} ON {table} {when} BEGIN
+                let create_trigger = |when: &str| {
+                    format!("CREATE TRIGGER privacy_{kind}_{event} AFTER {clause} ON {table} {when} BEGIN
                   UPDATE _privacy_policy SET epoch=epoch+1,revocation=revocation+1 WHERE EXISTS(SELECT 1 FROM _privacy_release WHERE kind='{kind}' AND id=CAST({id} AS TEXT) AND policy IS NOT NULL);
                   {mutation}
-                  END");
+                  END")
+                };
+                let old_image_update =
+                    (kind == "image" && event == "UPDATE").then(|| create_trigger(&when));
+                let create = if old_image_update.is_some() {
+                    let changed = watched
+                        .iter()
+                        .map(|column| {
+                            let changed = format!("NEW.\"{column}\" IS NOT OLD.\"{column}\"");
+                            if *column == "snapshot_path" {
+                                format!(
+                                    "({changed} AND NOT ({} AND EXISTS(SELECT 1 FROM _privacy_release r JOIN _privacy_policy p ON CAST(p.receipt_key AS TEXT)=r.policy WHERE r.kind='image' AND r.id=CAST(NEW.id AS TEXT))))",
+                                    crate::storage::read_schema::SNAPSHOT_MEDIA_RELOCATION
+                                )
+                            } else {
+                                changed
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    // Relocation preserves the image receipt. A simultaneous
+                    // name or timestamp edit still invalidates that receipt.
+                    // Pending inference must restart against the new locator:
+                    // it may still be processing the JPEG that compaction moved.
+                    create_trigger(&format!("WHEN {active} AND ({changed}){maintenance}"))
+                } else {
+                    create_trigger(&when)
+                };
                 let existing: Option<String> = sqlx::query_scalar(
                     "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
                 )
@@ -312,7 +345,11 @@ impl DatabaseManager {
                 // triggers invalidates cached FTS/write statements in other
                 // pooled connections and adds needless schema-lock work.
                 if existing.as_deref() != Some(create.as_str()) {
-                    changed_contract |= existing.is_some();
+                    // This exact installed image contract already certified all
+                    // watched values. Removing its relocation false positive
+                    // adds no coverage and needs no historical reprocessing.
+                    changed_contract |=
+                        existing.is_some() && existing.as_deref() != old_image_update.as_deref();
                     schema_changed = true;
                     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                         "DROP TRIGGER IF EXISTS privacy_{kind}_{event}; {create};"
@@ -454,7 +491,14 @@ impl DatabaseManager {
         // Candidate traversal is bounded even for malformed/future timestamps.
         // Young images move to a future deadline; subsequent polls advance past
         // them. The source lookup never scans certified capture history.
-        let sql = format!("WITH candidates AS MATERIALIZED (SELECT kind,id,available_at,sequence FROM _privacy_work INDEXED BY _privacy_work_due WHERE kind=? AND available_at<=unixepoch() ORDER BY available_at {order},sequence {order} LIMIT 256) SELECT CAST(s.id AS TEXT) AS source_id,r.revision,{columns} FROM candidates w CROSS JOIN _privacy_release r ON r.kind=w.kind AND r.id=w.id CROSS JOIN {} s ON s.id=w.id WHERE r.policy IS NULL{age} ORDER BY w.available_at {order},w.sequence {order} LIMIT ?", surface.table);
+        // Audio no longer uses the detector that scheduled old retry deadlines.
+        // Complete its revision bookkeeping without waiting for those failures.
+        let due = if is_audio_surface(kind) {
+            "1"
+        } else {
+            "available_at<=unixepoch()"
+        };
+        let sql = format!("WITH candidates AS MATERIALIZED (SELECT kind,id,available_at,sequence FROM _privacy_work INDEXED BY _privacy_work_due WHERE kind=? AND {due} ORDER BY available_at {order},sequence {order} LIMIT 256) SELECT CAST(s.id AS TEXT) AS source_id,r.revision,{columns} FROM candidates w CROSS JOIN _privacy_release r ON r.kind=w.kind AND r.id=w.id CROSS JOIN {} s ON s.id=w.id WHERE r.policy IS NULL{age} ORDER BY w.available_at {order},w.sequence {order} LIMIT ?", surface.table);
         let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
             .bind(kind)
             .bind(limit.min(256))
@@ -573,22 +617,27 @@ impl DatabaseManager {
         if complete {
             return Ok(());
         }
-        let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT id FROM {} WHERE id>? ORDER BY id LIMIT 128",
+        let ids: Vec<(i64, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT s.id,EXISTS(SELECT 1 FROM _privacy_work w WHERE w.kind=? AND w.id=CAST(s.id AS TEXT)) FROM {} s WHERE s.id>? ORDER BY s.id LIMIT 128",
             surface.table
         )))
+        .bind(surface.kind)
         .bind(after)
         .fetch_all(&mut **tx.conn())
         .await?;
-        for id in &ids {
+        for (id, already_queued) in &ids {
             sqlx::query("INSERT INTO _privacy_release(kind,id) VALUES(?,CAST(? AS TEXT)) ON CONFLICT(kind,id) DO UPDATE SET policy=NULL,attempts=0,retry_at=NULL WHERE policy IS NOT NULL AND policy!=(SELECT receipt_key FROM _privacy_policy WHERE identity=?)")
                 .bind(surface.kind).bind(id).bind(policy).execute(&mut **tx.conn()).await?;
-            // Also enroll pending receipts written by earlier draft versions.
-            sqlx::query("INSERT OR IGNORE INTO _privacy_work(kind,id,available_at) SELECT kind,id,COALESCE(retry_at,unixepoch()) FROM _privacy_release WHERE kind=? AND id=CAST(? AS TEXT) AND policy IS NULL")
-                .bind(surface.kind).bind(id).execute(&mut **tx.conn()).await?;
+            // Discovery is old work even though enrollment happens now. Giving
+            // it today's queue time lets every history page jump ahead of live
+            // capture in the recent-first lane. Keep existing capture/retry
+            // deadlines, and enroll newly discovered history at the old end.
+            // This also recovers pending receipts from earlier draft versions.
+            sqlx::query("INSERT INTO _privacy_work(kind,id,available_at) SELECT kind,id,COALESCE(retry_at,0) FROM _privacy_release WHERE kind=? AND id=CAST(? AS TEXT) AND policy IS NULL ON CONFLICT(kind,id) DO UPDATE SET available_at=excluded.available_at WHERE ?=0")
+                .bind(surface.kind).bind(id).bind(already_queued).execute(&mut **tx.conn()).await?;
         }
         sqlx::query("UPDATE _privacy_discovery SET after_id=?,complete=? WHERE kind=?")
-            .bind(ids.last().copied().unwrap_or(after))
+            .bind(ids.last().map(|(id, _)| *id).unwrap_or(after))
             .bind(ids.len() < 128)
             .bind(surface.kind)
             .execute(&mut **tx.conn())
@@ -749,7 +798,10 @@ impl DatabaseManager {
         }
         let storage = self.storage.clone();
         let mut views = Vec::new();
-        for surface in SURFACES.iter().filter(|s| s.kind != "image") {
+        for surface in SURFACES
+            .iter()
+            .filter(|s| s.kind != "image" && !is_audio_surface(s.kind))
+        {
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)")
                     .bind(surface.table)
@@ -842,7 +894,11 @@ impl DatabaseManager {
         }
         registry.push(pool.clone());
         drop(registry);
-        Ok(Arc::new(Self {
+        Ok(self.protected_read_adapter(pool))
+    }
+
+    fn protected_read_adapter(self: &Arc<Self>, pool: SqlitePool) -> Arc<Self> {
+        Arc::new(Self {
             release_owner: Some(Arc::clone(self)),
             release_read_pools: Arc::clone(&self.release_read_pools),
             storage: self.storage.clone(),
@@ -856,7 +912,7 @@ impl DatabaseManager {
             persistent_failure_hook: self.persistent_failure_hook.clone(),
             manager_lease: None,
             close_token: self.close_token.clone(),
-        }))
+        })
     }
 
     /// Revokes assembled uploads only when already released content or the
@@ -887,7 +943,6 @@ impl DatabaseManager {
         for (kind, table, timestamp) in [
             ("frames", "frames", "timestamp"),
             ("input", "ui_events", "timestamp"),
-            ("audio", "audio_transcriptions", "timestamp"),
         ] {
             let pending: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT EXISTS(SELECT 1 FROM {table} s CROSS JOIN _privacy_policy p WHERE p.id=1 AND s.{timestamp}>=? AND s.{timestamp}<? AND julianday(s.{timestamp}) BETWEEN julianday(?) AND julianday(?) AND NOT EXISTS(SELECT 1 FROM _privacy_release r WHERE r.kind=? AND r.id=CAST(s.id AS TEXT) AND r.policy=CAST(p.receipt_key AS TEXT)))")))
@@ -1005,13 +1060,7 @@ impl DatabaseManager {
                 .derived_release_page(kind, after, cutoff, end, limit)
                 .await;
         }
-        let (table,projection,time)=match kind {
-            "frames"=>("frames","s.id AS frame_id,s.timestamp,s.app_name,s.window_name,s.browser_url,s.accessibility_tree_json AS accessibility_tree,COALESCE(s.full_text,s.accessibility_text,'') AS text","timestamp"),
-            "audio"=>("audio_transcriptions","s.id AS transcription_id,s.timestamp,s.transcription,NULL AS speaker,s.device","timestamp"),
-            "input"=>("ui_events","s.id AS event_id,s.timestamp,s.event_type,s.app_name,s.window_title,s.browser_url,s.element_role,s.element_name,s.text_content","timestamp"),
-            "memory"=>("memories","s.id AS memory_id,s.created_at,s.updated_at,s.content,s.source,s.tags,s.importance,s.frame_id","created_at"),
-            _=>return Err(err("privacy export surface is not supported")),
-        };
+        let (table, projection, time) = export_surface(kind)?;
         let (sequence, more) = self
             .ready_range_window(kind, table, time, None, after, cutoff, end, limit)
             .await?;
@@ -1025,7 +1074,99 @@ impl DatabaseManager {
             .bind(end)
             .fetch_all(&self.pool)
             .await?;
-        let mut rows = Self::raw_sql_rows(&rows);
+        let rows = self.hydrate_release_export(kind, &rows).await?;
+        Ok(ReleasePage {
+            sequence,
+            rows,
+            more,
+        })
+    }
+    /// The policy generation changes for policy replacement, including a cycle
+    /// back to the same identity. Record revocations leave this value unchanged.
+    pub async fn release_policy_generation(&self) -> Result<Option<i64>, sqlx::Error> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='_privacy_policy')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            return Ok(None);
+        }
+        sqlx::query_scalar("SELECT receipt_key FROM _privacy_policy WHERE id=1")
+            .fetch_one(&self.pool)
+            .await
+            .map(Some)
+    }
+
+    /// Refresh only selected IDs through current completion receipts. Never
+    /// replace a processed export with a raw source, or enroll new captures.
+    pub async fn refresh_release_export_selection(
+        self: &Arc<Self>,
+        kind: &str,
+        ids: &[String],
+    ) -> Result<serde_json::Value, sqlx::Error> {
+        if self.close_token.is_cancelled() {
+            return Err(sqlx::Error::PoolClosed);
+        }
+        let reader = if self.protected_reads_enabled() {
+            Arc::clone(self)
+        } else {
+            // API admission already registered its protected pool. Reuse it
+            // across chunks/ticks instead of accumulating a pool per refresh.
+            let existing = self
+                .release_read_pools
+                .lock()
+                .await
+                .iter()
+                .find(|pool| !pool.is_closed())
+                .cloned();
+            match existing {
+                Some(pool) => self.protected_read_adapter(pool),
+                None => self.protected_reads().await?,
+            }
+        };
+        reader
+            .refresh_release_export_selection_inner(kind, ids)
+            .await
+    }
+
+    async fn refresh_release_export_selection_inner(
+        &self,
+        kind: &str,
+        ids: &[String],
+    ) -> Result<serde_json::Value, sqlx::Error> {
+        if !self.protected_reads_enabled() {
+            return Err(err("protected read adapter required"));
+        }
+        if ids.is_empty() {
+            return Ok(serde_json::json!([]));
+        }
+        let ids = serde_json::to_string(ids).map_err(|_| err("invalid export IDs"))?;
+        if matches!(kind, "activities" | "parsed" | "feedback") {
+            let values: Vec<(String, String)> = sqlx::query_as("SELECT s.template_json,s.text_json FROM json_each(?) selected JOIN _privacy_exports s ON s.source_id=selected.value AND s.stream=? JOIN _privacy_release r ON r.kind='exports' AND r.id=CAST(s.id AS TEXT) JOIN _privacy_policy p ON CAST(p.receipt_key AS TEXT)=r.policy")
+                .bind(ids).bind(kind).fetch_all(&self.pool).await?;
+            let rows = values
+                .into_iter()
+                .map(|(template, texts)| super::privacy_exports::restore_payload(&template, &texts))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(serde_json::json!(rows));
+        }
+        let (table, projection, _) = export_surface(kind)?;
+        let sql = format!("SELECT {projection} FROM json_each(?) selected JOIN {table} s ON s.id=selected.value JOIN _privacy_release r ON r.kind=? AND r.id=CAST(s.id AS TEXT) JOIN _privacy_policy p ON CAST(p.receipt_key AS TEXT)=r.policy");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(ids)
+            .bind(kind)
+            .fetch_all(&self.pool)
+            .await?;
+        self.hydrate_release_export(kind, &rows).await
+    }
+
+    async fn hydrate_release_export(
+        &self,
+        kind: &str,
+        rows: &[sqlx::sqlite::SqliteRow],
+    ) -> Result<serde_json::Value, sqlx::Error> {
+        let mut rows = Self::raw_sql_rows(rows);
         if let Some(items) = rows.as_array_mut() {
             if kind == "memory" {
                 for item in items.iter_mut() {
@@ -1072,11 +1213,7 @@ impl DatabaseManager {
                 }
             }
         }
-        Ok(ReleasePage {
-            sequence,
-            rows,
-            more,
-        })
+        Ok(rows)
     }
 }
 
@@ -1109,7 +1246,7 @@ impl DatabaseManager {
                 if s.kind == "image" {
                     policy.images
                 } else {
-                    policy.text
+                    policy.text && !is_audio_surface(s.kind)
                 }
             }) {
                 let complete: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _privacy_discovery WHERE kind=? AND policy=? AND complete=1)")
@@ -1152,4 +1289,14 @@ impl DatabaseManager {
             surfaces,
         })
     }
+}
+
+fn export_surface(kind: &str) -> Result<(&'static str, &'static str, &'static str), sqlx::Error> {
+    Ok(match kind {
+            "frames"=>("frames","s.id AS frame_id,s.timestamp,s.app_name,s.window_name,s.browser_url,s.accessibility_tree_json AS accessibility_tree,COALESCE(s.full_text,s.accessibility_text,'') AS text","timestamp"),
+            "audio"=>("audio_transcriptions","s.id AS transcription_id,s.timestamp,s.transcription,NULL AS speaker,s.device","timestamp"),
+            "input"=>("ui_events","s.id AS event_id,s.timestamp,s.event_type,s.app_name,s.window_title,s.browser_url,s.element_role,s.element_name,s.text_content","timestamp"),
+            "memory"=>("memories","s.id AS memory_id,s.created_at,s.updated_at,s.content,s.source,s.tags,s.importance,s.frame_id","created_at"),
+            _=>return Err(err("privacy export surface is not supported")),
+    })
 }

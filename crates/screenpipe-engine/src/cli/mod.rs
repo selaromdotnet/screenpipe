@@ -534,12 +534,16 @@ pub struct RecordArgs {
 
     /// Enable the async PII reconciliation worker. Runs a background
     /// task after capture that OVERWRITES PII in the source columns
-    /// of ocr_text, audio_transcriptions, frames.accessibility_text,
+    /// of ocr_text, frames.accessibility_text,
     /// ui_events.text_content, and elements.text. Raw secrets are
     /// gone after the worker processes the row. Off by default —
     /// capture path is unaffected either way.
     #[arg(long, default_value_t = false)]
     pub async_pii_redaction: bool,
+
+    /// Wait for AI privacy processing before reads and sync. Off by default.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub require_pii_completion: bool,
 
     /// Strip secrets from coding-agent (pi) session logs at rest. A
     /// background worker runs a secrets-only regex scrub over idle
@@ -570,7 +574,8 @@ pub struct RecordArgs {
     /// Which PII classes the AI redaction workers rewrite when enabled.
     /// Comma-separated canonical labels: secret, person, email, phone,
     /// address, sensitive, url, company, repo, handle, channel, id,
-    /// date. Also accepts fine-grained structured-ID sub-types handled by
+    /// date, dollar_amount (explicit $ / USD amounts, text only).
+    /// Also accepts fine-grained structured-ID sub-types handled by
     /// the deterministic detector: us_ssn, credit_card, iban, spain_dni,
     /// brazil_cpf, india_aadhaar, canada_sin, imei (enable one without
     /// turning on the whole `id` class). `secret` is always included
@@ -581,7 +586,7 @@ pub struct RecordArgs {
     /// WHICH columns the redaction worker scrubs (comma-separated stable
     /// keys; orthogonal to --pii-redaction-labels which picks categories).
     /// Keys: accessibility_text, accessibility_tree, window_name,
-    /// browser_url, audio_transcription, ui_text_content, ui_element_value,
+    /// browser_url, ui_text_content, ui_element_value,
     /// ui_window_title, ui_element_name, ui_element_description,
     /// ui_element_ancestors, element_text, element_properties,
     /// a11y_url_field. The list is exact (key present → on, absent → off);
@@ -595,7 +600,7 @@ pub struct RecordArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "accessibility_text,accessibility_tree,window_name,audio_transcription,ui_text_content,ui_element_value,ui_window_title,ui_element_ancestors,element_text,element_properties"
+        default_value = "accessibility_text,accessibility_tree,window_name,ui_text_content,ui_element_value,ui_window_title,ui_element_ancestors,element_text,element_properties"
     )]
     pub pii_redaction_columns: Vec<String>,
 
@@ -927,6 +932,7 @@ pub struct RecordArgSources {
     pub language: bool,
     pub use_pii_removal: bool,
     pub async_pii_redaction: bool,
+    pub require_pii_completion: bool,
     pub redact_agent_session_secrets: bool,
     pub async_image_pii_redaction: bool,
     pub pii_backend: bool,
@@ -995,6 +1001,7 @@ impl RecordArgSources {
             language: from_command_line(record, "language"),
             use_pii_removal: from_command_line(record, "use_pii_removal"),
             async_pii_redaction: from_command_line(record, "async_pii_redaction"),
+            require_pii_completion: from_command_line(record, "require_pii_completion"),
             redact_agent_session_secrets: from_command_line(record, "redact_agent_session_secrets"),
             async_image_pii_redaction: from_command_line(record, "async_image_pii_redaction"),
             pii_backend: from_command_line(record, "pii_backend"),
@@ -1055,6 +1062,7 @@ impl RecordArgSources {
             || self.language
             || self.use_pii_removal
             || self.async_pii_redaction
+            || self.require_pii_completion
             || self.redact_agent_session_secrets
             || self.async_image_pii_redaction
             || self.pii_backend
@@ -1237,6 +1245,7 @@ impl RecordArgs {
             disable_timeline: false,
             use_pii_removal: self.use_pii_removal,
             async_pii_redaction: self.async_pii_redaction,
+            require_pii_completion: self.require_pii_completion,
             redact_agent_session_secrets: self.redact_agent_session_secrets,
             async_image_pii_redaction: self.async_image_pii_redaction,
             pii_backend: self.pii_backend.clone(),
@@ -1521,6 +1530,9 @@ impl RecordArgs {
         }
         if sources.use_pii_removal {
             settings.use_pii_removal = self.use_pii_removal;
+        }
+        if sources.require_pii_completion {
+            settings.require_pii_completion = self.require_pii_completion;
         }
         if sources.async_pii_redaction {
             settings.async_pii_redaction = self.async_pii_redaction;

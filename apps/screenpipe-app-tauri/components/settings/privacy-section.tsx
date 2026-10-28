@@ -24,7 +24,8 @@ export const searchIndex: SettingsField[] = [
     keywords: ["private", "browser", "enhanced", "automation"],
   },
   { label: msg("Help improve Workflows", {}), keywords: ["sharing", "training", "consent", "delete shared chats"] },
-  { label: msg("PII masking", {}), keywords: ["mask", "redact", "columns", "url", "fields"] },
+  { label: msg("Wait for AI privacy checks", {}), keywords: ["backlog", "queue", "completion", "background", "redaction"] },
+  { label: msg("PII masking", {}), keywords: ["mask", "redact", "columns", "url", "fields", "dollar", "amount", "currency", "USD"] },
   {
     label: msg("Remote support logs", {}),
     keywords: ["support", "diagnostic", "troubleshooting", "remote", "logs"],
@@ -363,7 +364,7 @@ function RedactionWherePreview({
             <div className="h-1.5 w-full rounded bg-foreground" />
             <div className="h-1.5 w-4/5 rounded bg-foreground" />
             <div className="text-[9px] text-muted-foreground">
-              Typed text, transcripts &amp; on-screen text — always hidden
+              Typed text &amp; on-screen text — always hidden
             </div>
           </div>
         </div>
@@ -595,7 +596,9 @@ export function PrivacySection() {
   // Where the AI workers run — one switch covers both modalities.
   const piiBackend = (settings.piiBackend as "local" | "tinfoil" | undefined) ?? "local";
   const handlePiiBackendChange = (next: "local" | "tinfoil") => {
-    if (sharingRequiresCloud) return;
+    // Sharing requires the enclave, but keep Cloud selectable so a stale or
+    // partially migrated Local setting can be repaired from this screen.
+    if (sharingRequiresCloud && next !== "tinfoil") return;
     handleSettingsChange({ piiBackend: next } as any, true);
   };
 
@@ -610,6 +613,7 @@ export function PrivacySection() {
     label: string;
     desc: string;
     always?: boolean;
+    textOnly?: boolean;
   }[] = [
     { value: "secret", label: ui("Passwords & keys"), desc: "passwords, API keys, tokens", always: true },
     { value: "id", label: ui("ID numbers"), desc: "SSNs, credit cards, account & license numbers" },
@@ -620,6 +624,7 @@ export function PrivacySection() {
     { value: "url", label: ui("Links with tokens"), desc: "links carrying tokens or session IDs" },
     { value: "date", label: ui("Dates"), desc: "dates of birth, timestamps" },
     { value: "sensitive", label: ui("Health & financial details"), desc: "health, financial, identity context" },
+    { value: "dollar_amount", label: ui("Dollar amounts in text"), desc: "explicit $ or USD amounts; leaves screenshots and unmarked numbers unchanged", textOnly: true },
   ];
 
   const piiRedactionLabels = useMemo<string[]>(() => {
@@ -654,7 +659,7 @@ export function PrivacySection() {
   };
 
   // Secrets-only scrub of coding-agent (pi) session logs at rest. Distinct
-  // from the screen/audio PII workers above: agents persist full sessions
+  // from the screen PII workers above: agents persist full sessions
   // (bash output, tool args) unredacted, so credentials land in plaintext on
   // disk. Regex secrets-only + on-device; opt-in, default off.
   const redactAgentSessionSecrets = Boolean(
@@ -668,7 +673,7 @@ export function PrivacySection() {
   };
 
   // WHICH captured columns get scrubbed (orthogonal to the categories
-  // above). Typed text / clipboard / transcripts / window titles /
+  // above). Typed text / clipboard / window titles /
   // on-screen text are always redacted; these extra surfaces are opt-in.
   // Stored as the full list of stable column keys in `piiRedactionColumns`
   // (see `RedactColumns` in screenpipe-redact). The core keys are always
@@ -677,7 +682,6 @@ export function PrivacySection() {
     "accessibility_text",
     "accessibility_tree",
     "window_name",
-    "audio_transcription",
     "ui_text_content",
     "ui_element_value",
     "ui_window_title",
@@ -1394,7 +1398,6 @@ export function PrivacySection() {
                 }
               />
             </div>
-            {piiMode === "smart" && <PrivacyProcessingStatus />}
             {piiMode !== "off" && (
               <div className="mt-3 ml-6 space-y-3 border-l-2 border-border pl-3">
                 <div className="space-y-2">
@@ -1458,7 +1461,7 @@ export function PrivacySection() {
                           </span>
                           <span className="text-muted-foreground">
                             {" "}— scrub captured text (OCR, accessibility,
-                            transcripts, typed &amp; clipboard input)
+                            typed &amp; clipboard input)
                           </span>
                         </span>
                       </label>
@@ -1486,11 +1489,16 @@ export function PrivacySection() {
                 </div>
               </div>
             )}
+            <p className="mt-2 text-xs text-muted-foreground">
+              Audio and meeting transcripts are excluded from AI redaction,
+              including when synced. Basic pattern filtering remains available.
+            </p>
+
             {(aiPiiRemovalEnabled || sharingRequiresCloud) && (
               <div id="workflow-cloud-redaction" className="mt-3 ml-6 space-y-2 border-l-2 border-border pl-3">
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
                   <span className="font-medium text-foreground">Where it runs</span>
-                  <label className={`flex items-center gap-1.5 ${managedPiiBackend ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
+                  <label className={`flex items-center gap-1.5 ${managedPiiBackend || sharingRequiresCloud ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
                     <input
                       type="radio"
                       name="piiBackend"
@@ -1505,14 +1513,16 @@ export function PrivacySection() {
                       type="radio"
                       name="piiBackend"
                       checked={piiBackend === "tinfoil"}
-                      disabled={!!managedPiiBackend || sharingRequiresCloud}
+                      disabled={!!managedPiiBackend}
                       onChange={() => handlePiiBackendChange("tinfoil")}
                     />
                     <span className="text-foreground">Cloud (enclave)</span>
                   </label>
                 </div>
                 <p className="text-[11px] text-muted-foreground">
-                  {sharingRequiresCloud && <span className="block font-medium">Required while Workflows sharing is on. Turn off sharing above to change it. Shared chats always redact all sensitive categories; the choices below apply to recordings.</span>}
+                  {sharingRequiresCloud && <span className="block font-medium">{piiBackend === "tinfoil"
+                    ? "Cloud redaction is required while Workflows sharing is on. The choices below control redaction in recordings."
+                    : "Workflows sharing requires Cloud (enclave), but this device is still set to Local. Choose Cloud, then apply the change."}</span>}
                   Local stays on-device — strongest privacy, slower on weak
                   hardware. Cloud uses screenpipe&apos;s attested
                   confidential-compute enclave — fast everywhere; your device
@@ -1532,14 +1542,14 @@ export function PrivacySection() {
                       key={opt.value}
                       className={cn(
                         "flex items-start gap-2 text-xs",
-                        opt.always ? "cursor-default" : "cursor-pointer",
+                        opt.always || (opt.textOnly && !textRedactionOn) ? "cursor-default" : "cursor-pointer",
                       )}
                     >
                       <input
                         type="checkbox"
                         className="mt-0.5"
                         checked={checked}
-                        disabled={opt.always}
+                        disabled={opt.always || (opt.textOnly && !textRedactionOn)}
                         onChange={(e) =>
                           handlePiiLabelToggle(opt.value, e.target.checked)
                         }
@@ -1563,6 +1573,11 @@ export function PrivacySection() {
                 {textRedactionOn && (
                   <RedactionExamplePreview labels={piiRedactionLabels} />
                 )}
+                <p className="text-[11px] text-muted-foreground">
+                  Dollar masking requires Text above. It applies to new text
+                  processed by the background worker; previously processed
+                  history is not changed.
+                </p>
                 <p className="text-[11px] text-muted-foreground pt-0.5">
                   Unselected types stay visible so your timeline remains
                   searchable. Secrets are always removed in both modes.
@@ -1585,7 +1600,7 @@ export function PrivacySection() {
                     <div className="mt-2 space-y-1.5">
                       <p className="text-[11px] text-muted-foreground">
                         We always scan what you type, your clipboard,
-                        transcripts, window titles, and on-screen text. Turn on
+                        window titles, and on-screen text. Turn on
                         any of these extra places the same info can hide —
                         hover a row to see what it covers.
                       </p>
@@ -1620,6 +1635,36 @@ export function PrivacySection() {
                     </span>
                   </span>
                 </label>
+                {piiMode === "smart" && (
+                  <details className="group border-t border-border pt-3">
+                    <summary className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground list-none [&::-webkit-details-marker]:hidden">
+                      <ChevronRight className="h-3 w-3 shrink-0 transition-transform group-open:rotate-90" />
+                      {ui("Optional privacy settings")}
+                      <span className="rounded-sm border border-border px-1.5 py-0.5 text-[10px]">{ui("Experimental")}</span>
+                    </summary>
+                    <div className="mt-3">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="space-y-1">
+                          <label htmlFor="requirePiiCompletion" className="text-xs font-medium text-foreground">
+                            {ui("Wait for AI privacy checks")}
+                          </label>
+                          <p className="max-w-xl text-xs text-muted-foreground">
+                            {settings.requirePiiCompletion
+                              ? ui("Recordings stay unavailable to search, workflows and sync until AI checks finish. Existing history is checked too, which can create a backlog.")
+                              : ui("AI redaction runs in the background. Recordings can be read and synced before AI checks finish.")}
+                          </p>
+                        </div>
+                        <ManagedSwitch
+                          settingKey="requirePiiCompletion"
+                          id="requirePiiCompletion"
+                          checked={settings.requirePiiCompletion ?? false}
+                          onCheckedChange={(checked) => handleSettingsChange({ requirePiiCompletion: checked }, true)}
+                        />
+                      </div>
+                      {settings.requirePiiCompletion && <PrivacyProcessingStatus />}
+                    </div>
+                  </details>
+                )}
               </div>
             )}
           </CardContent>

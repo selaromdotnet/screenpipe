@@ -7,6 +7,7 @@ import { isFrontierModel } from './cost-tracker';
 import { getHostedAiPlan } from './hosted-ai-policy';
 import { GEMINI_ARGON_MODEL, argonPricing } from '../providers/gemini-argon';
 import { SCREENPIPE_GLM_MODEL } from '../providers/screenpipe-glm';
+import { attachExperientialRequestTags, buildExperientialRequestTags } from './experiential-metadata';
 export type HostedChatPlan = 'free' | 'basic' | 'business' | 'business_max' | 'business_ultra' | 'super_admin' | 'internal';
 export type HostedChatLane = 'auto' | 'explicit' | 'frontier';
 export type HostedChatRequestLane = Exclude<HostedChatLane, 'frontier'>;
@@ -39,6 +40,8 @@ export interface HostedChatAllowance {
 }
 
 export class HostedChatAllowanceExceededError extends Error {
+	gateway?: 'cloudflare' | 'experiential';
+	gatewayReason?: string;
 	status = 429;
 	code = 'hosted_ai_allowance_exceeded';
 	transient = false;
@@ -108,7 +111,7 @@ export async function buildHostedChatGatewayContext(
 ): Promise<HostedChatGatewayContext> {
 	const userId = await hostedChatActorId(auth);
 	const plan = collapsePlan(auth);
-	return {
+	return attachExperientialRequestTags({
 		user_id: userId,
 		plan: userId === SUPER_ADMIN_ACTOR_ID ? 'super_admin' : plan,
 		lane: hostedChatLaneForModel(
@@ -117,7 +120,7 @@ export async function buildHostedChatGatewayContext(
 		),
 		workload,
 		trial: auth.hostedAiTrial === true,
-	};
+	}, buildExperientialRequestTags(auth));
 }
 
 export function hostedChatLaneForModel(
@@ -162,8 +165,8 @@ function localGatewayProviderUrl(baseUrl: string, gatewayId: string, provider: C
 }
 
 /**
- * Resolve a pre-authenticated provider-native Gateway URL from the Workers AI
- * binding. Provider auth headers are explicitly removed so Cloudflare injects
+ * Resolve a provider-native Gateway URL from the Workers AI binding. getUrl()
+ * supplies an address; native HTTP SDK calls still need Gateway authentication. Provider auth headers are explicitly removed so Cloudflare injects
  * the provider's `default` BYOK key instead of receiving a Worker secret.
  * Vertex instead receives a short-lived OAuth token minted by the Worker.
  */

@@ -81,7 +81,7 @@ mod enterprise;
 #[cfg(any(
     test,
     all(
-        feature = "enterprise-build",
+        feature = "enterprise-support",
         any(target_os = "macos", target_os = "windows")
     )
 ))]
@@ -89,6 +89,7 @@ mod enterprise_autostart;
 mod enterprise_config_file;
 mod enterprise_host_identity;
 mod enterprise_install_metadata;
+mod app_mode;
 mod enterprise_policy;
 mod enterprise_recording_access;
 mod enterprise_sync;
@@ -476,6 +477,11 @@ macro_rules! define_specta_builder {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = screenpipe_audio::core::vpio_process::run_hidden_mode().await {
+        std::process::exit(code);
+    }
+
     // Invoked by the scoped video tool, before any application side effects.
     let arguments: Vec<String> = std::env::args().collect();
     if arguments.get(1).is_some_and(|arg| arg == "--render-workflow-video") {
@@ -985,7 +991,7 @@ async fn main() {
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
         wants_recording: Arc::new(AtomicBool::new(false)),
         deferred_account_start: Default::default(),
-        #[cfg(feature = "enterprise-build")]
+        #[cfg(feature = "enterprise-support")]
         authorization_recovery: Default::default(),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
         cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token))),
@@ -1234,6 +1240,25 @@ async fn main() {
             // kAEOpenApplication event (including Apple's `lgit` login-item
             // reason parameter) is still the current Apple event.
             let from_autostart = launched_from_autostart();
+
+            // Website-to-app attribution arrives as `screenpipe://attribution`.
+            // The plugin delivers macOS open-URL events and single-instance
+            // forwards; launch arguments are read once below. Accepting the
+            // same URL twice is harmless: the first saved grant wins.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        acquisition_handoff::accept_deep_link(&handle, url.as_str());
+                    }
+                });
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    for url in urls {
+                        acquisition_handoff::accept_deep_link(app.handle(), url.as_str());
+                    }
+                }
+            }
 
             #[cfg(windows)]
             {
@@ -2332,7 +2357,7 @@ async fn main() {
             );
 
             #[cfg(all(
-                feature = "enterprise-build",
+                feature = "enterprise-support",
                 any(target_os = "macos", target_os = "windows")
             ))]
             enterprise_autostart::spawn(&app_handle);
@@ -2525,9 +2550,8 @@ async fn main() {
             // Enterprise accounts out while allowing Screenpipe's own org.
             data_sync::spawn(&app_handle);
 
-            // Standard builds: authenticated, default-enabled support logs.
-            // Enterprise builds compile this as a no-op because their managed
-            // license-authenticated collector above is mandatory.
+            // Personal mode uses authenticated support-log consent. Managed
+            // mode uses the license-authenticated collector above.
             remote_support_logs::spawn(&app_handle);
 
             // Disable removed Storage cloud backends if old settings enabled them.

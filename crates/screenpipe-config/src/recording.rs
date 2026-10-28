@@ -686,6 +686,12 @@ pub struct RecordingSettings {
     #[serde(rename = "asyncPiiRedaction", default = "default_ai_pii_redaction")]
     pub async_pii_redaction: bool,
 
+    /// Wait for AI privacy completion before making recordings available.
+    /// Off by default: redaction runs in the background and records may be
+    /// read or synced before AI processing finishes.
+    #[serde(rename = "requirePiiCompletion", default)]
+    pub require_pii_completion: bool,
+
     /// Strip secrets from coding-agent (pi) session logs at rest. The
     /// agent persists full sessions — bash output, file reads, tool
     /// results — unredacted, so any credential it touches lands in
@@ -1000,6 +1006,7 @@ impl Default for RecordingSettings {
             languages: vec![],
             use_pii_removal: default_ai_pii_redaction(),
             async_pii_redaction: default_ai_pii_redaction(),
+            require_pii_completion: false,
             redact_agent_session_secrets: false,
             async_image_pii_redaction: default_ai_pii_redaction(),
             pii_backend: default_pii_backend(),
@@ -1103,7 +1110,6 @@ fn default_pii_redaction_columns() -> Vec<String> {
         "accessibility_text",
         "accessibility_tree",
         "window_name",
-        "audio_transcription",
         "ui_text_content",
         "ui_element_value",
         "ui_window_title",
@@ -1301,6 +1307,13 @@ mod tests {
 
         assert_eq!(settings.aec_mode, AecMode::Off);
         assert_eq!(settings.effective_aec_flags(), (false, false, false));
+    }
+
+    #[test]
+    fn native_macos_aec_selection_preserves_native_echo_cancellation() {
+        let settings: RecordingSettings =
+            serde_json::from_str(r#"{"aecMode":"macos","macosInputVpioEnabled":true}"#).unwrap();
+        assert_eq!(settings.effective_aec_flags(), (false, false, true));
     }
 
     #[test]

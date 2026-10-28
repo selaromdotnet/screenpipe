@@ -6,8 +6,8 @@
 //!
 //! This module deliberately knows nothing about remote requests, users, or
 //! upload endpoints. It builds a small bundle from the app's own logs, including
-//! rotated panic logs, and passes every byte through the shared deterministic
-//! on-device filtering pipeline. The manual "send logs" flow can additionally
+//! rotated panic logs and persisted migration metadata, and passes every byte
+//! through the shared deterministic on-device filtering pipeline. The manual "send logs" flow can additionally
 //! use the Tinfoil enclave, but unattended diagnostics never send raw text to a
 //! third-party redaction service. Because no automated filter can guarantee
 //! removal of every name or path, the consent UI explicitly discloses that
@@ -20,7 +20,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use sysinfo::{System, SystemExt};
-#[cfg(not(feature = "enterprise-build"))]
 use tauri::AppHandle;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -51,22 +50,31 @@ pub(crate) fn device_metadata() -> DiagnosticDeviceMetadata {
 ///
 /// The filtering boundary never returns an entirely unprocessed chunk after
 /// both contextual and deterministic passes fail.
-#[cfg(not(feature = "enterprise-build"))]
 pub async fn collect_redacted(app: &AppHandle) -> Result<String, String> {
     let files = crate::log_files::get_log_files(app.clone())
         .await
         .unwrap_or_default();
-    redact_files(&owned_log_files(files)).await
+    redact_files_with_migration(
+        &owned_log_files(files),
+        Some(crate::db_relaunch::active_data_dir()),
+    )
+    .await
 }
 
 /// Collect from explicit app-owned log directories.
 ///
 /// Enterprise's mandatory collector uses this entry point so both managed and
 /// opted-in builds share one filesystem, size, timeout, and redaction policy.
-#[cfg(any(test, feature = "enterprise-build"))]
 pub async fn collect_redacted_from_dirs(dirs: &[std::path::PathBuf]) -> Result<String, String> {
+    collect_redacted_from_dirs_at_root(dirs, crate::db_relaunch::active_data_dir()).await
+}
+
+async fn collect_redacted_from_dirs_at_root(
+    dirs: &[std::path::PathBuf],
+    root: std::path::PathBuf,
+) -> Result<String, String> {
     let files = crate::log_files::collect_log_files(dirs).await;
-    redact_files(&owned_log_files(files)).await
+    redact_files_with_migration(&owned_log_files(files), Some(root)).await
 }
 
 fn owned_log_files(files: Vec<LogFile>) -> Vec<LogFile> {
@@ -135,8 +143,26 @@ fn is_dated_rolling_log(name: &str, prefix: &str) -> bool {
             })
 }
 
+#[cfg(test)]
 async fn redact_files(files: &[LogFile]) -> Result<String, String> {
-    let raw = build_bundle(files).await;
+    redact_files_with_migration(files, None).await
+}
+
+async fn redact_files_with_migration(
+    files: &[LogFile],
+    data_root: Option<std::path::PathBuf>,
+) -> Result<String, String> {
+    // Persistent evidence goes first so rolling logs cannot displace it at the
+    // existing redacted-bundle boundary. Reuse the manual support reader and
+    // send all bytes through the same local redaction as unattended logs.
+    let mut raw = match data_root {
+        Some(root) => format!(
+            "=== Storage migration diagnostics ===\n{}\n",
+            crate::feedback_upload::collect_migration_diagnostics_from_root(root).await
+        ),
+        None => String::new(),
+    };
+    raw.push_str(&build_bundle(files).await);
     let redacted = tokio::time::timeout(
         REDACTION_TIMEOUT,
         crate::feedback_redact::redact_diagnostics_locally(raw),
@@ -236,15 +262,31 @@ async fn build_bundle(files: &[LogFile]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "enterprise-build")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsed_backlog_failure_and_recovery_survive_collected_support_upload() {
+        let logs = tempfile::tempdir().unwrap();
+        let report =
+            crate::enterprise::sync::tests::check_parsed_backlog_restart(logs.path()).await;
+        assert!(report.contains("ingest server error: status 503"));
+        assert!(report.contains("pending data retained"));
+        assert!(report.contains("pushed 0 frames, 101 parsed"));
+        assert!(report.contains("across 2 page(s)"));
+        assert!(!report.contains("hunter2"));
+    }
+
     #[tokio::test]
     async fn enterprise_retention_failure_survives_support_redaction() {
         let root = tempfile::tempdir().unwrap();
         let emitted = include_str!(
             "../../../../crates/screenpipe-engine/tests/fixtures/retention-failure-diagnostic.txt"
         );
+        let bulk = include_str!(
+            "../../../../crates/screenpipe-engine/tests/fixtures/retention-bulk-failure-diagnostic.txt"
+        );
         tokio::fs::write(
             root.path().join("screenpipe.2026-10-21.log"),
-            format!("{emitted}\npassword=hunter2\n"),
+            format!("{emitted}\n{bulk}\npassword=hunter2\n"),
         )
         .await
         .unwrap();
@@ -253,6 +295,10 @@ mod tests {
             .unwrap();
         assert!(bundle.contains("retention: batch delete failed"));
         assert!(bundle.contains("no such table: video_chunks"));
+        assert!(bundle.contains("retention fixture interrupted after index mutation"));
+        assert!(bundle.contains("(code: 1811)"));
+        assert!(bundle.contains("range remains pending"));
+        assert!(bundle.contains("retention: batch deleted frames=1"));
         assert!(bundle.contains("2026-10-12 20:00:00"));
         assert!(!bundle.contains("hunter2"));
     }
@@ -285,6 +331,86 @@ mod tests {
             path.exists(),
             "support collection must preserve pending events"
         );
+    }
+
+    #[tokio::test]
+    async fn unattended_migration_evidence_survives_missing_logs_and_redaction() {
+        use screenpipe_db::{storage, DatabaseManager};
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+            .await
+            .unwrap();
+        db.close().await;
+        let descriptor = storage::StorageDescriptor::read(root.path())
+            .unwrap()
+            .unwrap();
+        let receipt = serde_json::json!({
+            "database_id": descriptor.database_id, "generation": descriptor.generation,
+            "frames": 0, "tables": [], "source_bytes": 4096,
+            "index_bytes": 2048, "payload_bytes": 0,
+        });
+        let receipt_path = root.path().join("storage-migration-complete.json");
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        // No rolling logs: a later process must still expose the matching
+        // durable receipt without reading the recording database.
+        let report = collect_redacted_from_dirs_at_root(&[], root.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(report.contains("\"receipt_matches_active_storage\": true"));
+        assert!(report.contains("\"pending\": false"));
+        assert!(report.contains(&descriptor.database_id));
+
+        // Interrupted/failed work must remain diagnosable even with a receipt
+        // from another generation and enough log text to fill the old bundle.
+        let mut mismatched = receipt;
+        mismatched["generation"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        std::fs::write(&receipt_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        std::fs::write(root.path().join("storage-migration.json"), "{}").unwrap();
+        std::fs::write(root.path().join("storage-migration-error.txt"),
+            "archive verification failed; pending data retained; contact private.person@example.com").unwrap();
+        let logs = root.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        for day in 10..17 {
+            std::fs::write(
+                logs.join(format!("screenpipe.2026-10-{day}.log")),
+                "INFO normal recording resumed\n".repeat(8192),
+            )
+            .unwrap();
+        }
+        let report = collect_redacted_from_dirs_at_root(&[logs], root.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(report.contains("\"receipt_matches_active_storage\": false"));
+        assert!(report.contains("\"pending\": true"));
+        assert!(report.contains("archive verification failed"));
+        assert!(report.contains("pending data retained"));
+        assert!(!report.contains("private.person@example.com"));
+
+        // Verify the exact redacted bytes received by the support upload port,
+        // rather than only an unredacted snapshot or local tracing line.
+        use wiremock::{
+            matchers::{body_string_contains, method},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let support = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(body_string_contains("archive verification failed"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&support)
+            .await;
+        reqwest::Client::new()
+            .put(support.uri())
+            .body(report)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let uploads = support.received_requests().await.unwrap();
+        let received = String::from_utf8_lossy(&uploads[0].body);
+        assert!(received.contains("\"pending\": true"));
+        assert!(!received.contains("private.person@example.com"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -451,6 +577,98 @@ mod tests {
         assert!(report.contains("query remains pending"));
         assert!(report.contains("recorder restarted"));
         assert!(!report.contains("private-person@example.com"));
+    }
+
+    #[cfg(feature = "enterprise-build")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_source_revocation_and_recovery_survive_support_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = screenpipe_db::DatabaseManager::new(
+            dir.path().join("db.sqlite").to_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        db.configure_release(&screenpipe_db::privacy_release::ReleasePolicy {
+            identity: "image-test-v1".into(),
+            text: false,
+            images: true,
+        })
+        .await
+        .unwrap();
+        db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,snapshot_path) VALUES(1,'2026-10-16','private-person@example.com.jpg')").await.unwrap();
+        let job = db.release_pending("image", 1).await.unwrap().remove(0);
+        assert!(db.publish_image_release(&job).await.unwrap());
+        let export = db.storage_export_token().await.unwrap();
+        db.execute_raw_sql_write("UPDATE frames SET snapshot_path='replacement.jpg' WHERE id=1")
+            .await
+            .unwrap();
+        let error = export.admit(&db.pool).await.unwrap_err();
+        let job = db.release_pending("image", 1).await.unwrap().remove(0);
+        // Send the real database failure through the production sync worker,
+        // retry retention, recovery acknowledgement and support upload path.
+        let uploaded = crate::enterprise::sync::tests::check_sync_retry_failure_with_cause(
+            dir.path(),
+            Some(&error.to_string()),
+        )
+        .await;
+        assert!(uploaded.contains("privacy revision changed"));
+        assert!(uploaded.contains("pending data retained"));
+        let current = dir.path().join("screenpipe-app.log");
+        drop(export);
+        db.close().await;
+        tokio::fs::rename(&current, dir.path().join("screenpipe-app.2026-10-23.1.log"))
+            .await
+            .unwrap();
+        let db = screenpipe_db::DatabaseManager::new(
+            dir.path().join("db.sqlite").to_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(db.publish_image_release(&job).await.unwrap());
+        let export = db.storage_export_token().await.unwrap();
+        drop(export.admit(&db.pool).await.unwrap());
+        drop(export);
+        db.close().await;
+        tokio::fs::write(
+            &current,
+            "INFO recorder restarted contact=private-person@example.com\n",
+        )
+        .await
+        .unwrap();
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("privacy revision changed"));
+        assert!(report.contains("pending data retained"));
+        assert!(report.contains("recorder restarted"));
+        assert!(!report.contains("private-person@example.com"));
+    }
+
+    #[cfg(feature = "enterprise-support")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_upload_revocation_survives_collected_support_redaction() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::enterprise_sync::check_protected_upload_revocations(dir.path()).await;
+        let path = dir.path().join("screenpipe-app.2026-10-23.log");
+        std::fs::rename(&path, dir.path().join("screenpipe-app.2026-10-23.1.log")).unwrap();
+        std::fs::write(
+            path,
+            "INFO recorder restarted contact=private-person@example.com\n",
+        )
+        .unwrap();
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("privacy revision changed"));
+        assert!(report.contains("certified survivors retained; stale selections excluded"));
+        assert!(report.contains("selected_records="));
+        assert!(report.contains("retained_records="));
+        assert!(report.contains("recorder restarted"));
+        assert!(!report.contains("private-person@example.com"));
+        assert!(!report.contains("PRIVATE_ORIGINAL"));
+        assert!(!report.contains("UNPROCESSED_PRIVATE_EDIT"));
     }
 
     #[tokio::test]

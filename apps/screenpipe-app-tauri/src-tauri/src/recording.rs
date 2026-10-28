@@ -23,7 +23,7 @@ use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-#[cfg(feature = "enterprise-build")]
+#[cfg(feature = "enterprise-support")]
 mod authorized_start;
 
 pub const DEFAULT_LOCAL_API_PORT: u16 = 3030;
@@ -124,14 +124,6 @@ fn configured_local_api_port(app: &tauri::AppHandle) -> u16 {
         .unwrap_or(DEFAULT_LOCAL_API_PORT)
 }
 
-/// True when this build should skip the sign-in / billing gate entirely.
-/// Mirrors the frontend's NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS flag.
-/// Debug builds get this automatically; release builds opt in via the
-/// `dev-billing-bypass` Cargo feature (see scripts/local-build/build.ps1).
-fn dev_billing_bypass_active() -> bool {
-    cfg!(debug_assertions) || cfg!(feature = "dev-billing-bypass")
-}
-
 fn recording_access_policy(
     is_enterprise_build: bool,
     dev_bypass: bool,
@@ -182,14 +174,11 @@ fn server_access_policy(
 }
 
 pub(crate) fn server_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
-    if dev_billing_bypass_active() {
-        return true;
-    }
     let startup_authentication = app
         .try_state::<crate::startup_auth::AuthenticationStatus>()
         .map(|status| *status)
         .unwrap_or(crate::startup_auth::AuthenticationStatus::LoggedOut);
-    let authenticated_after_startup = if cfg!(feature = "enterprise-build") {
+    let authenticated_after_startup = if crate::app_mode::for_settings(store) {
         crate::enterprise_policy::recording_authorized()
     } else {
         store.has_cloud_authentication()
@@ -201,21 +190,17 @@ pub(crate) fn server_access_allowed(app: &tauri::AppHandle, store: &SettingsStor
     }
 
     server_access_policy(
-        cfg!(feature = "enterprise-build"),
-        dev_billing_bypass_active(),
+        crate::app_mode::for_settings(store),
+        cfg!(debug_assertions),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
         crate::enterprise_policy::recording_authorized(),
         !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
     )
 }
 
-/// Consumer builds allow signed-in accounts to record on the free plan.
-/// Enterprise builds keep their native entitlement guard, and consumer builds
-/// still reject accounts that are required to use an enterprise binary.
+/// Personal accounts may record on a verified free plan. Managed accounts and
+/// deployments require native organization policy and seat authorization.
 pub(crate) fn recording_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
-    if dev_billing_bypass_active() {
-        return true;
-    }
     let trial_activation_paywall = !crate::should_skip_onboarding()
         && OnboardingStore::get(app)
             .ok()
@@ -232,7 +217,7 @@ pub(crate) fn recording_access_allowed(app: &tauri::AppHandle, store: &SettingsS
     // authorities used by the runtime guards.
     let authentication_status = if resolved_authentication
         == crate::startup_auth::AuthenticationStatus::LoggedOut
-        && if cfg!(feature = "enterprise-build") {
+        && if crate::app_mode::for_settings(store) {
             crate::enterprise_policy::recording_authorized()
         } else {
             store.has_cloud_authentication()
@@ -242,8 +227,8 @@ pub(crate) fn recording_access_allowed(app: &tauri::AppHandle, store: &SettingsS
         resolved_authentication
     };
     recording_access_policy(
-        cfg!(feature = "enterprise-build"),
-        dev_billing_bypass_active(),
+        crate::app_mode::for_settings(store),
+        cfg!(debug_assertions),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
         crate::enterprise_policy::recording_authorized(),
         !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
@@ -366,7 +351,7 @@ pub struct RecordingState {
     /// — it's reset to 0 on a failed spawn too, and never sees the tray toggle.
     pub wants_recording: Arc<AtomicBool>,
     pub(crate) deferred_account_start: crate::startup_auth::DeferredAccountStart,
-    #[cfg(feature = "enterprise-build")]
+    #[cfg(feature = "enterprise-support")]
     pub(crate) authorization_recovery: authorized_start::Recovery,
     /// Recently active meeting to revive when capture is immediately restarted.
     pub(crate) interrupted_meeting: Arc<Mutex<Option<InterruptedMeeting>>>,
@@ -406,7 +391,7 @@ impl RecordingState {
         // An explicit start owns the lifecycle now; an explicit stop must not
         // be undone by a later background account refresh.
         self.deferred_account_start.cancel();
-        #[cfg(feature = "enterprise-build")]
+        #[cfg(feature = "enterprise-support")]
         self.authorization_recovery.cancel();
         self.wants_recording.store(
             on && !crate::search_only::capture_paused() && !crate::search_only::is_active(),
@@ -425,7 +410,7 @@ pub(crate) fn refresh_history_access_policy(
     settings: &SettingsStore,
 ) {
     policy.set_last_24_hours(history_access_restricted(
-        cfg!(feature = "enterprise-build"),
+        crate::app_mode::for_settings(settings),
         settings.is_free_or_unattributed_user(),
     ));
 }
@@ -1113,9 +1098,9 @@ pub(crate) fn resume_deferred_account_start(app: tauri::AppHandle) {
     });
 }
 
-/// Schedule one bounded native recovery request for this intent generation.
+/// Schedule one paced native recovery request for this intent generation.
 /// Policy refresh remains free to revoke access while startup is retrying.
-#[cfg(feature = "enterprise-build")]
+#[cfg(feature = "enterprise-support")]
 pub(crate) async fn resume_enterprise_recording(app: &tauri::AppHandle) {
     let generation = app
         .state::<RecordingState>()
@@ -1138,37 +1123,50 @@ pub(crate) async fn resume_enterprise_recording(app: &tauri::AppHandle) {
                 generation,
                 allowed,
                 || async {
-                    // Settings failures belong to the same retry budget. Do not
-                    // abandon first login or start from the previous policy.
-                    crate::enterprise::managed_settings::apply(&app).await?;
-                    authorized_start::attempt(&state.server_lifecycle, allowed, || async {
-                        // Drop each slot guard before acquiring the other;
-                        // capture teardown can itself need the server slot.
-                        let server_running = state.server.lock().await.is_some();
-                        let capture_running = state.capture.lock().await.is_some();
-                        if server_running && capture_running {
-                            return Ok(());
-                        }
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let last = state.last_spawn_epoch.load(Ordering::SeqCst);
-                        if last > 0 && now.saturating_sub(last) < RESTART_COOLDOWN_SECS {
-                            // The general spawn command defers through a webview event.
-                            // Keep ownership here when no webview exists.
-                            return Err("recording restart cooldown is still active".into());
-                        }
-                        spawn_screenpipe_inner(&state, app.clone()).await?;
-                        let server_running = state.server.lock().await.is_some();
-                        let capture_running = state.capture.lock().await.is_some();
-                        if allowed() && (!server_running || !capture_running) {
-                            return Err(
-                                "native startup completed without an active capture session".into(),
-                            );
-                        }
-                        Ok(())
-                    })
+                    retry::run(
+                        &crate::db_relaunch::active_data_dir(),
+                        &state.wants_recording,
+                        async {
+                            // Settings failures belong to the same retry cadence. Do not
+                            // abandon first login or start from the previous policy.
+                            crate::enterprise::managed_settings::apply(&app).await?;
+                            authorized_start::attempt(
+                                &state.server_lifecycle,
+                                allowed,
+                                || async {
+                                    // Drop each slot guard before acquiring the other;
+                                    // capture teardown can itself need the server slot.
+                                    let server_running = state.server.lock().await.is_some();
+                                    let capture_running = state.capture.lock().await.is_some();
+                                    if server_running && capture_running {
+                                        return Ok(());
+                                    }
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let last = state.last_spawn_epoch.load(Ordering::SeqCst);
+                                    if last > 0
+                                        && now.saturating_sub(last) < RESTART_COOLDOWN_SECS
+                                    {
+                                        // The general spawn command defers through a webview event.
+                                        // Keep ownership here when no webview exists.
+                                        return Err(
+                                            "recording restart cooldown is still active".into()
+                                        );
+                                    }
+                                    spawn_screenpipe_inner(&state, app.clone()).await?;
+                                    let server_running = state.server.lock().await.is_some();
+                                    let capture_running = state.capture.lock().await.is_some();
+                                    if allowed() && (!server_running || !capture_running) {
+                                        return Err("native startup completed without an active capture session".into());
+                                    }
+                                    Ok(())
+                                },
+                            )
+                            .await
+                        },
+                    )
                     .await
                 },
                 &delays,
