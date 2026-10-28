@@ -104,6 +104,9 @@ pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 const PI_INSTALL_ARGS: [&str; 3] = ["install", "--force", "--ignore-scripts"];
 const CUSTOM_PROVIDER_USER_AGENT: &str = "screenpipe";
 const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+/// Pi API served by `assets/extensions/gemini.ts`; must match `GEMINI_OPENAI_API`
+/// in `assets/extensions/lib/gemini-transport.ts`.
+const GEMINI_OPENAI_API: &str = "screenpipe-gemini-openai";
 const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
 
 /// Apply compatibility settings required by OpenAI-compatible custom endpoints.
@@ -123,6 +126,11 @@ const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// request field. Pi otherwise sends `store: false` for standard-compatible
 /// providers, so disable that capability on each Gemini model while preserving
 /// any other explicit compatibility overrides.
+///
+/// Gemini 3+ also rejects tool-call history that lacks the thought signature it
+/// attached to each call, which Pi's OpenAI transport drops. Route Gemini models
+/// through the `gemini.ts` extension, which carries those signatures across
+/// turns and surfaces Gemini's array-shaped error bodies.
 pub fn apply_custom_provider_compat(provider: &mut serde_json::Value) {
     let normalized_base_url = provider
         .get("baseUrl")
@@ -183,6 +191,7 @@ pub fn apply_custom_provider_compat(provider: &mut serde_json::Value) {
             .as_object_mut()
             .expect("custom provider model compat was initialized as an object")
             .insert("supportsStore".to_string(), json!(false));
+        model_object.insert("api".to_string(), json!(GEMINI_OPENAI_API));
     }
 }
 
@@ -1312,6 +1321,24 @@ impl PiExecutor {
         Ok(())
     }
 
+    pub fn ensure_gemini_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(ext_dir.join("lib"))?;
+        let package_json = crate::paths::default_screenpipe_data_dir()
+            .join("pi-agent")
+            .join("package.json");
+        let source = include_str!("../../assets/extensions/gemini.ts").replace(
+            "__SCREENPIPE_PI_PACKAGE_JSON__",
+            &serde_json::to_string(&package_json.to_string_lossy())?,
+        );
+        std::fs::write(ext_dir.join("gemini.ts"), source)?;
+        std::fs::write(
+            ext_dir.join("lib").join("gemini-transport.ts"),
+            include_str!("../../assets/extensions/lib/gemini-transport.ts"),
+        )?;
+        Ok(())
+    }
+
     pub fn ensure_context_pruning_extension(project_dir: &Path) -> Result<()> {
         let ext_dir = project_dir.join(".pi").join("extensions");
         std::fs::create_dir_all(&ext_dir)?;
@@ -2302,6 +2329,7 @@ impl AgentExecutor for PiExecutor {
         )?;
         Self::ensure_context_pruning_extension(working_dir)?;
         Self::ensure_tinfoil_extension(working_dir)?;
+        Self::ensure_gemini_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
         Self::ensure_self_improvement_extension(working_dir)?;
         Self::ensure_mcp_bridge_extension(working_dir)?;
@@ -2484,6 +2512,7 @@ impl AgentExecutor for PiExecutor {
         )?;
         Self::ensure_context_pruning_extension(working_dir)?;
         Self::ensure_tinfoil_extension(working_dir)?;
+        Self::ensure_gemini_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
         Self::ensure_self_improvement_extension(working_dir)?;
         Self::ensure_mcp_bridge_extension(working_dir)?;
@@ -6459,6 +6488,8 @@ mod tests {
             "max_tokens"
         );
         assert_eq!(provider["models"][1]["compat"]["supportsStore"], false);
+        assert_eq!(provider["models"][0]["api"], GEMINI_OPENAI_API);
+        assert_eq!(provider["models"][1]["api"], GEMINI_OPENAI_API);
         assert_eq!(provider["headers"]["User-Agent"], "screenpipe");
     }
 
@@ -6476,6 +6507,7 @@ mod tests {
         assert_eq!(provider["headers"]["x-tenant"], "tenant-1");
         assert_eq!(provider["headers"].as_object().unwrap().len(), 2);
         assert!(provider["models"][0].get("compat").is_none());
+        assert!(provider["models"][0].get("api").is_none());
     }
 
     #[tokio::test]
