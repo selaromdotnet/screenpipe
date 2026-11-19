@@ -19,6 +19,7 @@ import {
 import { handleChatCompletions } from './handlers/chat';
 import { autoRouteScope } from './services/auto-route';
 import { handleStudioVoice } from './handlers/studio-voice';
+import { handleContentDecisions } from './handlers/content-decisions';
 import { handleModelListing } from './handlers/models';
 import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
 import { handleRealtimeTranscriptionUpgrade } from './handlers/realtime-transcription';
@@ -93,6 +94,7 @@ import {
 	type HostedChatGatewayContext,
 } from './services/cloudflare-ai-gateway';
 import { getCloudflareHostedChatUsage } from './services/cloudflare-ai-gateway-usage';
+import { attachHostedTrainingConsent, loadHostedTrainingConsent } from './services/hosted-chat-training';
 import { buildBackgroundPipeAllowanceAdvisory } from './services/background-pipe-advisory';
 import { logApiAuthAudit, logApiRouteAudit } from './services/api-audit';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
@@ -329,6 +331,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 		// Dedicated backend credential; never send it to Clerk JWT verification.
 		if (path === '/v1/admin/studio-voice') return handleStudioVoice(request, env);
+		if (path === '/v1/admin/content-decisions') return handleContentDecisions(request, env);
 
 		console.log('path', path);
 
@@ -594,7 +597,10 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			}
 
 			const latency = resolveLatencyClass(request, body, env);
-			const gatewayContext = await buildHostedChatGatewayContext(authResult, body.model, latency);
+			const gatewayContext = attachHostedTrainingConsent(
+				await buildHostedChatGatewayContext(authResult, body.model, latency),
+				await loadHostedTrainingConsent(request, authResult),
+			);
 
 			let leaseReleased = false;
 			const releaseLease = async () => {
@@ -662,8 +668,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 					served_tier: response.headers.get('x-screenpipe-served-tier'),
 					router_tier: routerTier,
 					workload: latency,
-					gateway_mode: response.headers.has('x-screenpipe-background-fallback') ? 'direct'
-						: response.headers.get('x-screenpipe-gateway') === 'experiential' ? 'experiential' : 'cloudflare',
+					gateway_mode: response.headers.get('x-screenpipe-gateway') === 'experiential' ? 'experiential'
+						: response.headers.has('x-screenpipe-background-fallback') ? 'direct' : 'cloudflare',
 					gateway_reason: response.headers.get('x-screenpipe-gateway-reason'),
 					fallback_model: response.headers.get('x-screenpipe-background-fallback'),
 					fallback_reason: response.headers.get('x-screenpipe-background-fallback-reason'),

@@ -20,9 +20,11 @@ e2e = []
 
 [dependencies]
 screenpipe-fs = { path = "../screenpipe-fs" }
+screenpipe-config = { path = "../screenpipe-config" }
 screenpipe-a11y = { path = "../screenpipe-a11y" }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 
 # async
 tokio = { workspace = true }
@@ -54,6 +56,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 criterion = { workspace = true }
 strsim = { workspace = true }
 memory-stats = "1.2.0"
@@ -116,6 +119,7 @@ windows = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Direct3D",
   "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dwm",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
@@ -130,6 +134,7 @@ windows = { workspace = true, features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xcap = { workspace = true }
+xcb = { version = "1.7", features = ["composite"] }
 ashpd = { version = "0.10.3", default-features = false, features = ["async-std"] }
 pipewire = "0.9"
 libc = { workspace = true }

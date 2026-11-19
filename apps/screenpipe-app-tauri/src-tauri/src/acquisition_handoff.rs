@@ -164,6 +164,7 @@ fn carrier() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn carrier_from(directory: &std::path::Path) -> Option<String> {
+    report_windows_installer_diagnostic(directory);
     // The installer writes this once. Keep the read bounded so an untrusted or
     // corrupt install directory cannot turn startup into an unbounded read.
     let path = directory.join("acquisition-grant");
@@ -177,11 +178,194 @@ fn carrier_from(directory: &std::path::Path) -> Option<String> {
     uuid4(&grant).then_some(grant)
 }
 
+#[cfg(target_os = "windows")]
+fn report_windows_installer_diagnostic(directory: &std::path::Path) {
+    let path = directory.join("acquisition-grant-diagnostic");
+    // This maximum is derived from the closed v1 grammar below: longest cause,
+    // u32 measurement, longest unit-labelled expectation, source and outcome.
+    // Open once and read at most one byte beyond it; unknown user-writable data
+    // is discarded without ever entering a log message.
+    const MAX_RECORD: usize = "v1;embedded-duplicate;actual-extensions=4294967295;expected-extensions=1;fallback=certificate;persistence=not-attempted".len();
+    use std::io::Read;
+    let record = std::fs::File::open(&path).ok().and_then(|file| {
+        let mut bytes = Vec::with_capacity(MAX_RECORD + 1);
+        file.take((MAX_RECORD + 1) as u64).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= MAX_RECORD).then(|| String::from_utf8(bytes).ok()).flatten()
+    });
+    if let Some(record) = record.as_deref().and_then(parse_windows_installer_diagnostic) {
+        tracing::warn!(
+            cause = record.cause,
+            fallback = record.fallback,
+            persistence = record.persistence,
+            windows_error = record.windows_error,
+            actual_chars = record.actual_chars,
+            threshold_chars = record.threshold_chars,
+            actual_bytes = record.actual_bytes,
+            expected_bytes = record.expected_bytes,
+            actual_extensions = record.actual_extensions,
+            expected_extensions = record.expected_extensions,
+            "Windows acquisition origin metadata unavailable; installer attribution fallback completed"
+        );
+    }
+    // A valid record is single-use; unknown data is also discarded silently.
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsInstallerDiagnostic<'a> {
+    cause: &'a str,
+    fallback: &'a str,
+    persistence: &'a str,
+    windows_error: Option<u32>,
+    actual_chars: Option<u32>,
+    threshold_chars: Option<u32>,
+    actual_bytes: Option<u32>,
+    expected_bytes: Option<u32>,
+    actual_extensions: Option<u32>,
+    expected_extensions: Option<u32>,
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_installer_diagnostic(record: &str) -> Option<WindowsInstallerDiagnostic<'_>> {
+    let fields: Vec<_> = record.split(';').collect();
+    let common = |fallback: &str, persistence: &str| {
+        matches!(fallback, "certificate" | "origin" | "filename" | "none")
+            && matches!(persistence, "saved" | "failed" | "not-attempted")
+    };
+    match fields.as_slice() {
+        ["v1", cause @ ("duplicate-host-url" | "malformed-host-url"), fallback, persistence] => {
+            let fallback = fallback.strip_prefix("fallback=")?;
+            let persistence = persistence.strip_prefix("persistence=")?;
+            common(fallback, persistence).then_some(WindowsInstallerDiagnostic {
+                cause, fallback, persistence, windows_error: None,
+                actual_chars: None, threshold_chars: None,
+                actual_bytes: None, expected_bytes: None,
+                actual_extensions: None, expected_extensions: None,
+            })
+        }
+        ["v1", cause @ ("origin-open-failed" | "origin-read-failed"), error, fallback, persistence] => {
+            let windows_error = error.strip_prefix("windows-error=")?.parse().ok()?;
+            let fallback = fallback.strip_prefix("fallback=")?;
+            let persistence = persistence.strip_prefix("persistence=")?;
+            common(fallback, persistence).then_some(WindowsInstallerDiagnostic {
+                cause, fallback, persistence, windows_error: Some(windows_error),
+                actual_chars: None, threshold_chars: None,
+                actual_bytes: None, expected_bytes: None,
+                actual_extensions: None, expected_extensions: None,
+            })
+        }
+        ["v1", cause @ "host-url-overflow", actual, threshold, fallback, persistence] => {
+            let actual_chars = actual.strip_prefix("actual-chars=")?.parse().ok()?;
+            let threshold_chars = threshold.strip_prefix("threshold-chars=")?.parse().ok()?;
+            let fallback = fallback.strip_prefix("fallback=")?;
+            let persistence = persistence.strip_prefix("persistence=")?;
+            (common(fallback, persistence) && actual_chars > threshold_chars && threshold_chars == 1023)
+                .then_some(WindowsInstallerDiagnostic {
+                    cause, fallback, persistence, windows_error: None,
+                    actual_chars: Some(actual_chars), threshold_chars: Some(threshold_chars),
+                    actual_bytes: None, expected_bytes: None,
+                    actual_extensions: None, expected_extensions: None,
+                })
+        }
+        ["v1", cause @ "embedded-length", actual, expected, fallback, persistence] => {
+            let actual_bytes = actual.strip_prefix("actual-bytes=")?.parse().ok()?;
+            let expected_bytes = expected.strip_prefix("expected-bytes=")?.parse().ok()?;
+            let fallback = fallback.strip_prefix("fallback=")?;
+            let persistence = persistence.strip_prefix("persistence=")?;
+            (common(fallback, persistence) && actual_bytes != expected_bytes && expected_bytes == 71)
+                .then_some(WindowsInstallerDiagnostic {
+                    cause, fallback, persistence, windows_error: None,
+                    actual_chars: None, threshold_chars: None,
+                    actual_bytes: Some(actual_bytes), expected_bytes: Some(expected_bytes),
+                    actual_extensions: None, expected_extensions: None,
+                })
+        }
+        ["v1", cause @ "embedded-duplicate", actual, expected, fallback, persistence] => {
+            let actual_extensions = actual.strip_prefix("actual-extensions=")?.parse().ok()?;
+            let expected_extensions = expected.strip_prefix("expected-extensions=")?.parse().ok()?;
+            let fallback = fallback.strip_prefix("fallback=")?;
+            let persistence = persistence.strip_prefix("persistence=")?;
+            (common(fallback, persistence) && actual_extensions > 1 && expected_extensions == 1)
+                .then_some(WindowsInstallerDiagnostic {
+                    cause, fallback, persistence, windows_error: None,
+                    actual_chars: None, threshold_chars: None,
+                    actual_bytes: None, expected_bytes: None,
+                    actual_extensions: Some(actual_extensions), expected_extensions: Some(expected_extensions),
+                })
+        }
+        ["v1", cause @ ("embedded-critical" | "embedded-der" | "embedded-marker" | "embedded-grant"), fallback, persistence] => {
+            let fallback = fallback.strip_prefix("fallback=")?;
+            let persistence = persistence.strip_prefix("persistence=")?;
+            common(fallback, persistence).then_some(WindowsInstallerDiagnostic {
+                cause, fallback, persistence, windows_error: None,
+                actual_chars: None, threshold_chars: None,
+                actual_bytes: None, expected_bytes: None,
+                actual_extensions: None, expected_extensions: None,
+            })
+        }
+        ["v1", cause @ "embedded-decode", error, fallback, persistence] => {
+            let windows_error = error.strip_prefix("windows-error=")?.parse().ok()?;
+            let fallback = fallback.strip_prefix("fallback=")?;
+            let persistence = persistence.strip_prefix("persistence=")?;
+            common(fallback, persistence).then_some(WindowsInstallerDiagnostic {
+                cause, fallback, persistence, windows_error: Some(windows_error),
+                actual_chars: None, threshold_chars: None,
+                actual_bytes: None, expected_bytes: None,
+                actual_extensions: None, expected_extensions: None,
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn carrier() -> Option<String> {
     // AppImages execute from a temporary mount; APPIMAGE is the original file.
     let path = std::path::PathBuf::from(std::env::var_os("APPIMAGE")?);
-    grant_from_filename(path.file_name()?.to_str()?, ".AppImage")
+    linux_carrier_from(&path)
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn linux_carrier_from(path: &std::path::Path) -> Option<String> {
+    linux_xattr_grant(path)
+        .or_else(|| grant_from_filename(path.file_name()?.to_str()?, ".AppImage"))
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn linux_xattr_grant(path: &std::path::Path) -> Option<String> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = c"user.screenpipe.acquisition-grant";
+    // The protocol carries exactly one canonical UUID (36 ASCII bytes).
+    let mut bytes = [0u8; 36];
+    let read = |buffer: *mut libc::c_void, length: usize| {
+        #[cfg(target_os = "linux")]
+        unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), buffer, length) }
+        #[cfg(target_os = "macos")]
+        unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), buffer, length, 0, 0) }
+    };
+    let size = read(bytes.as_mut_ptr().cast(), bytes.len());
+    if size < 0 {
+        let error = std::io::Error::last_os_error();
+        #[cfg(target_os = "linux")]
+        let absent = error.raw_os_error() == Some(libc::ENODATA);
+        #[cfg(target_os = "macos")]
+        let absent = error.raw_os_error() == Some(libc::ENOATTR);
+        if !absent {
+            // On ERANGE the read returns no length; query it without allocating.
+            let actual_bytes = if error.raw_os_error() == Some(libc::ERANGE) {
+                Some(read(std::ptr::null_mut(), 0))
+            } else { None };
+            tracing::warn!(%error, ?actual_bytes, expected_bytes = bytes.len(), "Linux acquisition xattr unreadable; trying filename attribution");
+        }
+        return None;
+    }
+    let grant = std::str::from_utf8(&bytes).ok();
+    if size != bytes.len() as isize || !grant.is_some_and(uuid4) {
+        tracing::warn!(actual_bytes = size, expected_bytes = bytes.len(), "Linux acquisition xattr invalid; trying filename attribution");
+        return None;
+    }
+    grant.map(str::to_owned)
 }
 
 // Retirement never waits for the optional credential store. A late credential
@@ -357,6 +541,79 @@ async fn send(client: &reqwest::Client, origin: &reqwest::Url, action: &str, p: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn set_linux_xattr(path: &std::path::Path, value: &[u8]) {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = c"user.screenpipe.acquisition-grant";
+        #[cfg(target_os = "linux")]
+        let result = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        #[cfg(target_os = "macos")]
+        let result = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_xattr_survives_rename_and_preserves_filename_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = "12345678-1234-4234-8234-123456789012";
+        let path = dir.path().join(format!("screenpipe-{grant}.AppImage"));
+        std::fs::write(&path, b"unchanged AppImage bytes").unwrap();
+        assert_eq!(linux_carrier_from(&path), Some(grant.into()));
+        let xattr_grant = "abcdefab-cdef-4abc-9def-abcdefabcdef";
+        set_linux_xattr(&path, xattr_grant.as_bytes());
+        assert_eq!(linux_carrier_from(&path), Some(xattr_grant.into()));
+        let renamed = dir.path().join("renamed.AppImage");
+        std::fs::rename(&path, &renamed).unwrap();
+        assert_eq!(linux_carrier_from(&renamed), Some(xattr_grant.into()));
+        for invalid in [
+            PLACEHOLDER.as_bytes(), &grant.as_bytes()[..35],
+            b"12345678-1234-4234-8234-123456789012\n",
+            b"12345678-1234-4234-7234-123456789012",
+            b"12345678-1234-4234-8234-12345678901X", &[0xff; 36],
+        ] {
+            set_linux_xattr(&renamed, invalid);
+            assert!(linux_carrier_from(&renamed).is_none());
+        }
+        // A broken attribute does not invalidate older personalized downloads.
+        std::fs::rename(&renamed, &path).unwrap();
+        assert_eq!(linux_carrier_from(&path), Some(grant.into()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"unchanged AppImage bytes");
+        let ordinary = dir.path().join("screenpipe.AppImage");
+        std::fs::write(&ordinary, b"ordinary download").unwrap();
+        assert!(linux_carrier_from(&ordinary).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn linux_xattr_failures_survive_support_collection_and_rotation_without_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("screenpipe-app.2026-11-02.log");
+        let artifact = dir.path().join("private-person@example.com.AppImage");
+        std::fs::write(&artifact, b"AppImage fixture").unwrap();
+        let grant = "12345678-1234-4234-8234-123456789012";
+        let subscriber = tracing_subscriber::fmt().with_ansi(false)
+            .with_writer(std::fs::File::create(&current).unwrap()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            set_linux_xattr(&artifact, &grant.as_bytes()[..35]);
+            assert!(linux_carrier_from(&artifact).is_none());
+            set_linux_xattr(&artifact, format!("{grant}\n").as_bytes());
+            assert!(linux_carrier_from(&artifact).is_none());
+        });
+        std::fs::rename(&current, dir.path().join("screenpipe-app.2026-11-02.1.log")).unwrap();
+        std::fs::write(&current, b"after rotation\n").unwrap();
+        let report = crate::diagnostic_logs::collect_redacted_from_dirs_at_root(
+            &[dir.path().to_path_buf()], dir.path().to_path_buf()
+        ).await.unwrap();
+        for expected in ["Linux acquisition xattr invalid", "actual_bytes=35", "expected_bytes=36",
+                         "Linux acquisition xattr unreadable", "Some(37)", "trying filename attribution"] {
+            assert!(report.contains(expected), "missing {expected}: {report}");
+        }
+        assert!(!report.contains(grant));
+        assert!(!report.contains("private-person@example.com"));
+    }
+
     #[test]
     fn portable_filenames_reject_placeholders_and_ambiguous_names() {
         let grant = "12345678-1234-4234-8234-123456789012";
@@ -387,6 +644,216 @@ mod tests {
         }
         std::fs::write(&path, format!("{grant}\n")).unwrap();
         assert!(carrier_from(dir.path()).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_diagnostic_protocol_is_closed_and_requires_boundary_facts() {
+        for valid in [
+            "v1;duplicate-host-url;fallback=filename;persistence=saved",
+            "v1;malformed-host-url;fallback=none;persistence=not-attempted",
+            "v1;origin-open-failed;windows-error=5;fallback=filename;persistence=failed",
+            "v1;origin-read-failed;windows-error=23;fallback=none;persistence=not-attempted",
+            "v1;host-url-overflow;actual-chars=1024;threshold-chars=1023;fallback=filename;persistence=saved",
+            "v1;embedded-length;actual-bytes=70;expected-bytes=71;fallback=none;persistence=not-attempted",
+            "v1;embedded-length;actual-bytes=72;expected-bytes=71;fallback=origin;persistence=saved",
+            "v1;embedded-duplicate;actual-extensions=2;expected-extensions=1;fallback=filename;persistence=saved",
+            "v1;embedded-critical;fallback=none;persistence=not-attempted",
+            "v1;embedded-decode;windows-error=13;fallback=origin;persistence=saved",
+        ] {
+            assert!(parse_windows_installer_diagnostic(valid).is_some(), "rejected {valid}");
+        }
+        for invalid in [
+            "invalid-origin-metadata",
+            "v1;host-url-overflow;fallback=filename;persistence=saved",
+            "v1;host-url-overflow;actual-chars=1023;threshold-chars=1023;fallback=filename;persistence=saved",
+            "v1;origin-read-failed;windows-error=private-path;fallback=none;persistence=not-attempted",
+            "v1;malformed-host-url;fallback=filename;persistence=saved\nforged log line",
+            "v1;arbitrary-marker;fallback=filename;persistence=saved",
+            "v1;embedded-length;actual-bytes=71;expected-bytes=71;fallback=none;persistence=not-attempted",
+            "v1;embedded-duplicate;actual-extensions=1;expected-extensions=1;fallback=none;persistence=not-attempted",
+        ] {
+            assert!(parse_windows_installer_diagnostic(invalid).is_none(), "accepted {invalid}");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_ads_failure_survives_support_rotation_without_private_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture.nsi");
+        let hooks = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("windows/hooks.nsh");
+        let hooks = hooks.display().to_string().replace('/', "\\");
+        std::fs::write(
+            &fixture,
+            format!(
+                r#"; screenpipe — AI that knows everything you've seen, said, or heard
+; https://screenpipe.com
+Unicode true
+SilentInstall silent
+RequestExecutionLevel user
+!include "{}"
+Name "Screenpipe acquisition diagnostic fixture"
+OutFile "fixture.exe"
+InstallDir "$TEMP\screenpipe-acquisition-diagnostic-fixture"
+Section
+  CreateDirectory "$INSTDIR"
+  !insertmacro _SP_SaveAcquisitionGrant
+SectionEnd
+"#,
+                hooks
+            ),
+        )
+        .unwrap();
+        let compiled = std::process::Command::new("makensis.exe")
+            .args(["/V2", fixture.to_str().unwrap()])
+            .current_dir(dir.path())
+            .status()
+            .expect("makensis.exe is required by the Windows native fixture");
+        assert!(compiled.success());
+
+        let current = dir.path().join("screenpipe-app.2026-11-02.log");
+        let grant = "12345678-1234-4234-8234-123456789012";
+        let installer = dir.path().join(format!("screenpipe-{grant}.exe"));
+        std::fs::copy(dir.path().join("fixture.exe"), &installer).unwrap();
+        let private_grant = "abcdefab-cdef-4abc-9def-abcdefabcdef";
+        let prefix = "HostUrl=https://downloads.test/private/";
+        let suffix = format!("/screenpipe-{private_grant}.exe");
+        let host_url = format!("{prefix}{}{suffix}", "x".repeat(1024 - prefix.len() - suffix.len()));
+        std::fs::write(
+            format!("{}:Zone.Identifier", installer.display()),
+            format!("[ZoneTransfer]\r\nZoneId=3\r\n{host_url}\r\n"),
+        )
+        .unwrap();
+        let installed = dir.path().join("installed");
+        let status = std::process::Command::new(&installer)
+            .args(["/S", &format!("/D={}", installed.display())])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(installed.join("acquisition-grant")).unwrap(), grant);
+        assert!(std::fs::read_to_string(installed.join("acquisition-grant-diagnostic"))
+            .unwrap().starts_with("v1;host-url-overflow;actual-chars=1024;threshold-chars=1023;"));
+
+        // Build signed producer fixtures from this checkout and replace only
+        // the appended untrusted carrier certificate for each boundary case.
+        let evidence = dir.path().join("final-producer");
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors().nth(3).unwrap();
+        let prepared = std::process::Command::new("pwsh.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(repository.join("scripts/test_windows_browser_ads.ps1"))
+            .arg("-EvidenceDirectory").arg(&evidence).arg("-PrepareOnly")
+            .status().expect("PowerShell is required by the Windows producer fixture");
+        assert!(prepared.success());
+        let signed = evidence.join("signed-carrier-template.exe");
+        let oid = "2.25.190389607246623950780965390285594181377";
+        let marker = "urn:screenpipe:acquisition-grant:";
+        let certificates = dir.path().join("certificates");
+        std::fs::create_dir(&certificates).unwrap();
+        for (length, value) in [(35, &grant[..35]), (36, grant),
+            (37, "12345678-1234-4234-8234-123456789012x")] {
+            let certificate = certificates.join(format!("grant-{length}.der"));
+            let key = certificates.join(format!("grant-{length}.key"));
+            let generated = std::process::Command::new("openssl.exe")
+                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+                .arg(&key).arg("-out").arg(&certificate)
+                .args(["-outform", "DER", "-days", "1", "-subj",
+                       "/CN=Screenpipe attribution fixture", "-addext"])
+                .arg(format!("{oid}=ASN1:UTF8String:{marker}{value}"))
+                .status().expect("OpenSSL is required by the Windows producer fixture");
+            assert!(generated.success());
+            std::fs::write(&key, []).unwrap();
+        }
+        let finalizer = dir.path().join("finalize_fixture.py");
+        std::fs::write(&finalizer, r#"# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+import importlib.util, pathlib, struct, sys
+spec = importlib.util.spec_from_file_location('carrier', sys.argv[1])
+c = importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
+source, cert, value, output = map(pathlib.Path, sys.argv[2:]); extra = cert.read_bytes()
+def insert(pkcs7):
+    _, ov, oe = c._der_tlv(pkcs7); outer=[]; cursor=ov
+    while cursor < oe:
+        child=c._der_tlv(pkcs7,cursor); outer.append(pkcs7[cursor:child[2]]); cursor=child[2]
+    _, ev, ee=c._der_tlv(outer[1]); signed=outer[1][ev:ee]
+    _, sv, se=c._der_tlv(signed); children=[]; cursor=sv
+    while cursor < se:
+        child=c._der_tlv(signed,cursor); children.append(signed[cursor:child[2]]); cursor=child[2]
+    indexes=[i for i,x in enumerate(children) if x[0] == 0xa0]
+    if len(indexes) != 1: raise ValueError('PKCS7 certificate set')
+    i=indexes[0]; _, cv, ce=c._der_tlv(children[i]); certs=children[i][cv:ce]
+    kept=[]; cursor=0
+    while cursor < len(certs):
+        item=c._der_tlv(certs,cursor); encoded=certs[cursor:item[2]]
+        if not c._matching_extensions(encoded): kept.append(encoded)
+        cursor=item[2]
+    children[i]=c._der_wrap(0xa0,b''.join(sorted(kept+[extra])))
+    return c._der_wrap(0x30,outer[0]+c._der_wrap(0xa0,c._der_wrap(0x30,b''.join(children))))
+c.WINDOWS_DUMMY_CERT=extra; c.PLACEHOLDER=value.read_text(); c._insert_dummy_certificate=insert
+with source.open('rb') as stream:
+    offset,size_offset,table,_=c._prepare_windows_certificate(stream,source.stat().st_size)
+    stream.seek(0); prefix=bytearray(stream.read(offset))
+struct.pack_into('<I',prefix,size_offset,len(table)); output.write_bytes(prefix+table)
+"#).unwrap();
+        let packager = repository.join("scripts/package-attribution-carrier.py");
+        let mut produced = Vec::new();
+        for length in [35, 36, 37] {
+            let value = dir.path().join(format!("value-{length}"));
+            std::fs::write(&value, match length { 35 => &grant[..35], 36 => grant,
+                _ => "12345678-1234-4234-8234-123456789012x" }).unwrap();
+            let output = dir.path().join(format!("grant-{length}.exe"));
+            let finalized = std::process::Command::new("python.exe").arg(&finalizer)
+                .arg(&packager).arg(&signed)
+                .arg(certificates.join(format!("grant-{length}.der")))
+                .arg(&value).arg(&output).status().unwrap();
+            assert!(finalized.success());
+            let destination = dir.path().join(format!("installed-{length}"));
+            let status = std::process::Command::new(&output)
+                .args(["/S", &format!("/D={}", destination.display())]).status().unwrap();
+            assert!(status.success());
+            assert_eq!(std::fs::read_to_string(destination.join("caller-state")).unwrap(),
+                "c0|c1|c2|c3|c4|c5|c6|c7|c8|c9|r0|r1|r2|r3|r4|r5|r6|r7|1");
+            println!("producer {length}: {}", std::fs::read_to_string(
+                destination.join("acquisition-grant-diagnostic")
+            ).unwrap_or_else(|_| "accepted".into()));
+            produced.push((length, destination));
+        }
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::fs::File::create(&current).unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(carrier_from(&installed), Some(grant.into()));
+            assert!(carrier_from(&produced[0].1).is_none());
+            assert_eq!(carrier_from(&produced[1].1), Some(grant.into()));
+            assert!(carrier_from(&produced[2].1).is_none());
+        });
+        assert!(!installed.join("acquisition-grant-diagnostic").exists());
+        std::fs::rename(
+            &current,
+            dir.path().join("screenpipe-app.2026-11-02.1.log"),
+        )
+        .unwrap();
+        std::fs::write(&current, b"after rotation\n").unwrap();
+        let report = crate::diagnostic_logs::collect_redacted_from_dirs_at_root(
+            &[dir.path().to_path_buf()],
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        println!("redacted Windows acquisition installer report:\n{report}");
+        for expected in ["cause=\"host-url-overflow\"", "fallback=\"filename\"",
+                         "persistence=\"saved\"", "actual_chars=1024",
+                         "threshold_chars=1023", "cause=\"embedded-length\"",
+                         "actual_bytes=70", "actual_bytes=72", "expected_bytes=71"] {
+            assert!(report.contains(expected), "missing {expected}: {report}");
+        }
+        for private in [grant, private_grant, "https://downloads.test/private", "user_private", "acquisition-grant"] {
+            assert!(!report.contains(private), "support report leaked {private}: {report}");
+        }
     }
 
     #[tokio::test]

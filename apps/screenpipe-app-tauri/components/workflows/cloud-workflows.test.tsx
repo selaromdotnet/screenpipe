@@ -24,8 +24,8 @@ it("renders cloud detail and search without any local analysis controls", async 
   expect(within(breadcrumb).getByText('Review a draft')).toHaveAttribute('aria-current', 'page');
   expect(screen.queryByRole('button', { name: 'All workflows' })).toBeNull();
   fireEvent.click(within(breadcrumb).getByRole('button', { name: 'Workflows', exact: true }));
-  fireEvent.change(screen.getByRole('textbox', { name: 'Search workflows' }), { target: { value: 'missing' } });
-  expect(screen.getByText('No workflows match your search')).toBeVisible();
+  fireEvent.change(screen.getByRole('combobox', { name: 'Search workflows' }), { target: { value: 'missing' } });
+  expect(screen.getByText('No workflows match these filters')).toBeVisible();
 });
 it("never stops local jobs on mount, refresh, a later visit or a timer", async () => {
   const service = api(); const view = render(<CloudWorkflows {...props} api={service} />);
@@ -118,7 +118,7 @@ it("uses the local navigation shell, collapse control and command palette", asyn
   fireEvent.click(screen.getByRole('button', { name: 'Collapse left sidebar' }));
   expect(screen.getByRole('button', { name: 'Open left sidebar' })).toHaveAttribute('aria-expanded', 'false');
   fireEvent.click(screen.getByRole('button', { name: 'Open left sidebar' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Open command palette' }));
+  fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
   expect(screen.getByText('Go to Home')).toBeVisible();
 });
 it("does not invent captured observations for cloud procedures", async () => {

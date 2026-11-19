@@ -2130,3 +2130,31 @@ fixtures appear only at grading; no dependency links or installation are needed.
 This does not execute React lifecycle, browser CORS, native HTTP/audio, live
 providers, or model trials. Current source uses native transport; that command is
 a synthetic port in the grader.
+
+### Fable tool-result continuations
+
+`gateway-fable-tool-continuation` runs the real provider factory and adapters
+against synthetic transport responses. Fifty-six outcomes cover streamed and JSON
+completion after tool results, single dispatch, output budgets, policy headers,
+reported usage, unchanged inputs, ordinary turns and explicit native rollback.
+The parent fails two completion outcomes while preserving the other 54; the
+historical fix passes all 56.
+
+Run `bun test evals/coding-agent/calibrate-fable-tool-continuation.test.js` for
+eleven correct/broken/bypass/preserved/equivalent controls. Third-party dependencies
+and the hidden fixture appear only at grading. These checks exclude live model
+quality, provider availability, billing settlement, deployment, enforced agent
+isolation and model performance.
+
+### One-shot pipe stdin lifecycle
+
+`app-orphan-guard-one-shot-stdin` executes the actual orphan-guard extension
+with synthetic process, event and timer ports. Eight outcomes preserve one-shot
+work after stdin closes, RPC stdin termination, healthy-parent work and
+changed/missing-parent termination. Parent: six pass and two intended failures;
+reference and current source: eight pass. Run
+`bun test evals/coding-agent/calibrate-orphan-guard-stdin.test.js` for ten
+controls including unused fixes, no-op behavior, missing safeguards and equivalent
+implementations. The fixture appears only at grading, with no dependency links.
+This does not prove real Pi startup, OS process death, enforced agent isolation
+or model performance. Timer reference counting is outside these checks.

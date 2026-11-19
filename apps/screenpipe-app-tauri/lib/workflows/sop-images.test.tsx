@@ -2,17 +2,33 @@
 // https://screenpipe.com
 import React from "react";
 import { it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { act, render, screen, fireEvent, cleanup } from "@testing-library/react";
 import { SopDocument } from "@screenpipe/workflows-ui/sop-document";
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const path = `/api/sops/images/${"a".repeat(64)}/${"b".repeat(64)}`;
 it("renders a hosted screenshot and persists removal with undo", () => {
+  const createRange = document.createRange.bind(document);
+  vi.spyOn(document, "createRange").mockImplementation(() => {
+    const range = createRange();
+    range.getClientRects = () => [] as unknown as DOMRectList;
+    range.getBoundingClientRect = () => new DOMRect();
+    return range;
+  });
   const save = vi.fn();
   render(<SopDocument title="Review" content={`Check the form.\n\n![Form](<${path}>)`} onContentChange={save} imageUrl={src => src} />);
   expect(screen.getByRole("img", { name: "Form" })).toHaveAttribute("src", path);
   fireEvent.click(screen.getByRole("button", { name: "Remove image: Form" }));
   expect(save.mock.lastCall![0]).not.toContain(path);
   expect(screen.queryByRole("img")).toBeNull();
+  const editor = screen.getByRole("textbox", { name: "SOP text" });
+  act(() => {
+    editor.focus();
+    const range = document.createRange();
+    range.selectNodeContents(editor.querySelector("p")!);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+  });
+  fireEvent(document, new Event("selectionchange"));
   fireEvent.click(screen.getByRole("button", { name: "Undo" }));
   expect(screen.getByRole("img", { name: "Form" })).toBeVisible();
   expect(save.mock.lastCall![0]).toContain(path);

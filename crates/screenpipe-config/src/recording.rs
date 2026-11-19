@@ -6,6 +6,29 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Low-rate screenshot acquisition default; independent of HD's encoded fps.
+pub const DEFAULT_SCREENSHOT_FRAME_RATE: u32 = 2;
+/// Positive CMTime timescales use signed 32-bit integers.
+pub const MAX_SCREENSHOT_FRAME_RATE: u32 = i32::MAX as u32;
+
+fn default_screenshot_frame_rate() -> u32 {
+    DEFAULT_SCREENSHOT_FRAME_RATE
+}
+
+fn deserialize_screenshot_frame_rate<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let fps = u32::deserialize(deserializer)?;
+    // CMTime's timescale is a positive signed 32-bit integer. These are native
+    // representation boundaries, not a product capture-rate ceiling.
+    if fps == 0 || fps > MAX_SCREENSHOT_FRAME_RATE {
+        return Err(serde::de::Error::custom(format!(
+            "screenshotFrameRate {fps} fps is outside the native range 1..={MAX_SCREENSHOT_FRAME_RATE} fps; select a positive whole frame rate in that range"
+        )));
+    }
+    Ok(fps)
+}
+
 /// The auth-token migration scrubs a JWT-shaped legacy `userId` by persisting
 /// JSON `null`. Keep the historical empty-string sentinel when that store is
 /// read back without accepting nulls for unrelated recording settings.
@@ -428,6 +451,11 @@ pub struct RecordingSettings {
     #[serde(rename = "disableScreenshots", default)]
     pub disable_screenshots: bool,
 
+    /// Black out screenshot pixels outside the focused window area, preserving
+    /// monitor dimensions and text coordinates. Off preserves desktop context.
+    #[serde(rename = "focusedWindowScreenshots", default)]
+    pub focused_window_screenshots: bool,
+
     /// Build normalized semantic context from captured accessibility trees.
     /// Experimental and opt-in. False preserves the historical capture path
     /// without starting a parser worker or writing semantic tables.
@@ -464,6 +492,16 @@ pub struct RecordingSettings {
     /// always capture native.
     #[serde(rename = "captureMaxWidth", default)]
     pub capture_max_width: u32,
+
+    /// Background screenshot acquisition fps, independent of snapshot save
+    /// cadence and HD video fps. Activity-triggered screenshots may request a
+    /// fresh frame. Persisted across recording restarts and applied live.
+    #[serde(
+        rename = "screenshotFrameRate",
+        default = "default_screenshot_frame_rate",
+        deserialize_with = "deserialize_screenshot_frame_rate"
+    )]
+    pub screenshot_frame_rate: u32,
 
     /// Maximum width for stored snapshots. Images wider than this are downscaled
     /// (preserving aspect ratio) before JPEG encoding. 0 = no limit (store at
@@ -969,6 +1007,7 @@ impl Default for RecordingSettings {
             vocabulary: vec![],
             disable_vision: false,
             disable_screenshots: false,
+            focused_window_screenshots: false,
             enable_semantic_context: false,
             semantic_context_mode: SemanticContextMode::Memory,
             disable_timeline: false,
@@ -976,6 +1015,7 @@ impl Default for RecordingSettings {
             use_all_monitors: true,
             video_quality: "balanced".to_string(),
             capture_max_width: 0,
+            screenshot_frame_rate: DEFAULT_SCREENSHOT_FRAME_RATE,
             max_snapshot_width: default_max_snapshot_width(),
             disable_snapshot_compaction: false,
             disable_meeting_detector: false,
@@ -1347,6 +1387,22 @@ mod tests {
     }
 
     #[test]
+    fn focused_window_screenshots_default_off_and_round_trip() {
+        let legacy: RecordingSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.focused_window_screenshots);
+        for value in [true, false] {
+            let settings: RecordingSettings =
+                serde_json::from_value(serde_json::json!({"focusedWindowScreenshots": value}))
+                    .unwrap();
+            assert_eq!(settings.focused_window_screenshots, value);
+            assert_eq!(
+                serde_json::to_value(settings).unwrap()["focusedWindowScreenshots"],
+                value
+            );
+        }
+    }
+
+    #[test]
     fn deserializes_legacy_extra_fields() {
         // These fields used to live in SettingsStore.extra HashMap
         let json = r#"{
@@ -1673,5 +1729,46 @@ mod recording_detail_tests {
             serde_json::json!({"recordingDetail": "unbounded"})
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod screenshot_frame_rate_tests {
+    use super::*;
+
+    #[test]
+    fn old_stores_use_the_sampling_default_and_hd_settings_round_trip_independently() {
+        let old: RecordingSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.screenshot_frame_rate, DEFAULT_SCREENSHOT_FRAME_RATE);
+        let configured: RecordingSettings = serde_json::from_value(serde_json::json!({
+            "screenshotFrameRate": 30, "hdRecordingIntervalMs": 100,
+        }))
+        .unwrap();
+        assert_eq!(configured.screenshot_frame_rate, 30);
+        assert_eq!(configured.hd_recording_interval_ms, 100);
+        let saved = serde_json::to_value(&configured).unwrap();
+        let restored: RecordingSettings = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.screenshot_frame_rate, 30);
+        assert_eq!(restored.hd_recording_interval_ms, 100);
+    }
+
+    #[test]
+    fn frame_rate_respects_native_timescale_representation() {
+        for fps in [1_u32, DEFAULT_SCREENSHOT_FRAME_RATE, i32::MAX as u32] {
+            let settings: RecordingSettings =
+                serde_json::from_value(serde_json::json!({"screenshotFrameRate": fps})).unwrap();
+            assert_eq!(settings.screenshot_frame_rate, fps);
+        }
+        for fps in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(i32::MAX as u32 + 1),
+        ] {
+            assert!(serde_json::from_value::<RecordingSettings>(
+                serde_json::json!({"screenshotFrameRate": fps})
+            )
+            .is_err());
+        }
     }
 }

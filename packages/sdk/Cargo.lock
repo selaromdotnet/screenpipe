@@ -6888,7 +6888,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-config"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "dirs 6.0.0",
  "screenpipe-cpu-features",
@@ -6900,7 +6900,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-connect"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -6924,6 +6924,7 @@ dependencies = [
  "objc2-event-kit",
  "objc2-foundation",
  "once_cell",
+ "percent-encoding",
  "reqwest",
  "russh",
  "russh-sftp",
@@ -6946,7 +6947,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-core"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "accessibility",
  "accessibility-sys",
@@ -6991,15 +6992,16 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-cpu-features"
-version = "0.4.52"
+version = "0.4.58"
 
 [[package]]
 name = "screenpipe-db"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "chrono",
  "criterion",
+ "dunce",
  "fs2",
  "futures",
  "image",
@@ -7034,7 +7036,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-events"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7050,7 +7052,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-fs"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "libc",
 ]
@@ -7079,7 +7081,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-resource"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "serde",
  "sysinfo",
@@ -7088,7 +7090,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-screen"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "accessibility-sys",
  "anyhow",
@@ -7110,6 +7112,7 @@ dependencies = [
  "rusty-tesseract",
  "sck-rs",
  "screenpipe-a11y",
+ "screenpipe-config",
  "screenpipe-connect",
  "screenpipe-core",
  "screenpipe-db",
@@ -7120,8 +7123,10 @@ dependencies = [
  "tracing",
  "uiautomation",
  "url",
+ "uuid",
  "windows 0.58.0",
  "xcap",
+ "xcb",
  "zbus",
 ]
 
@@ -7167,7 +7172,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sqlite-coordinator"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "fs2",
  "libsqlite3-sys",
@@ -7198,7 +7203,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-vault"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "argon2 0.5.3",
  "chacha20poly1305",

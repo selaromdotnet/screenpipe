@@ -698,8 +698,9 @@ describe("Workflows model selection", () => {
     expect(mocks.updateSettings).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Workflows AI" })).not.toBeDisabled());
     fireEvent.click(screen.getByRole("combobox", { name: "Workflows AI" }));
-    fireEvent.click(screen.getByRole("option", { name: "Private (Beta)" }));
-    await waitFor(() => expect(preference.save).toHaveBeenLastCalledWith("private"));
+    expect(screen.queryByRole("option", { name: /Private/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: /^Intelligent/ }));
+    await waitFor(() => expect(preference.save).toHaveBeenLastCalledWith("intelligent"));
   });
 
   it("offers model presets without unsupported agents in the workflow create dialog", async () => {
@@ -720,7 +721,7 @@ describe("Workflows model selection", () => {
     render(<WorkflowModelSelector preference={preference} />);
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Workflows AI" })).toHaveTextContent("Intelligent"));
     fireEvent.click(screen.getByRole("combobox", { name: "Workflows AI" }));
-    fireEvent.click(screen.getByRole("option", { name: "Private (Beta)" }));
+    fireEvent.click(screen.getByRole("option", { name: new RegExp(originalPreset.id) }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not save");
     expect(screen.getByRole("combobox", { name: "Workflows AI" })).toHaveTextContent("Intelligent");
   });

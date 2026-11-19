@@ -7,6 +7,8 @@ import { fixtureWorkflowAnalysis } from "@screenpipe/workflows-ui/fixture";
 import { WorkflowAgentActions } from "./workflow-agent-actions";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { performAgentHandoff } from "@/lib/first-run/agent-handoff";
+import { captureWorkflowUsage } from "@/lib/workflows/usage";
+vi.mock("@/lib/workflows/usage", () => ({ captureWorkflowUsage: vi.fn() }));
 import { toast } from "@/components/ui/use-toast";
 vi.mock("@/lib/chat-utils", () => ({ showChatWithPrefill: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
@@ -28,7 +30,10 @@ describe("workflow agent handoff", () => {
     expect(screen.getByRole("button", { name: "Open in agent" })).toBeEnabled();
   });
   it("prefills the existing Screenpipe flow without sending or enabling a schedule", async () => {
+    vi.mocked(captureWorkflowUsage).mockClear();
     render(<WorkflowAgentActions workflow={workflow} />); await choose("Screenpipe");
+    await waitFor(() => expect(captureWorkflowUsage).toHaveBeenLastCalledWith({ event: "workflow_agent_handoff_result", runner: "screenpipe", outcome: "prefilled" }));
+    expect(captureWorkflowUsage).toHaveBeenCalledWith({ event: "workflow_agent_handoff_requested", runner: "screenpipe" });
     expect(showChatWithPrefill).toHaveBeenCalledWith(expect.objectContaining({ autoSend: false, useHomeChat: true, prompt: expect.stringContaining("Help me carry it out") }));
     expect(vi.mocked(showChatWithPrefill).mock.calls.at(-1)?.[0]?.prompt).not.toContain("recurring");
   });
@@ -47,5 +52,13 @@ describe("workflow agent handoff", () => {
     render(<WorkflowAgentActions workflow={workflow} />); await choose("Codex");
     await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: "Prompt copied" })));
     expect(screen.getByRole("button", { name: "Open in agent" })).toBeEnabled();
+    expect(captureWorkflowUsage).toHaveBeenLastCalledWith({ event: "workflow_agent_handoff_result", runner: "codex", outcome: "copied" });
+  });
+  it("records a failed handoff without workflow content", async () => {
+    vi.mocked(captureWorkflowUsage).mockClear();
+    vi.mocked(performAgentHandoff).mockRejectedValueOnce(new Error("private provider failure"));
+    render(<WorkflowAgentActions workflow={workflow} />); await choose("Codex");
+    await waitFor(() => expect(captureWorkflowUsage).toHaveBeenLastCalledWith({ event: "workflow_agent_handoff_result", runner: "codex", outcome: "failed" }));
+    expect(JSON.stringify(vi.mocked(captureWorkflowUsage).mock.calls)).not.toContain("wf-source");
   });
 });

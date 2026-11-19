@@ -344,6 +344,25 @@ jobs:
           cmd /c mklink /J $targetDir $shortDir
           Write-Host "Created junction: $targetDir -> $shortDir"
 
+      - name: Set up Python for Windows packaging
+        if: matrix.os_type == 'windows'
+        shell: pwsh
+        run: |
+          # The packager uses only the standard library. An application-local
+          # runtime also works under the persistent runner's service account.
+          $pythonRoot = Join-Path $env:RUNNER_TEMP 'screenpipe-python'
+          $archive = Join-Path $env:RUNNER_TEMP 'screenpipe-python.zip'
+          Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.13.17/python-3.13.17-embeddable-amd64.zip' -OutFile $archive
+          # SHA-256 from Python's windows-3.13.17.json release manifest.
+          $expected = '0ba1ee4bfcbdc3a559d27e2e9ce76d04a7839947a23f46375872c755c0d463b8'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Windows packaging Python archive SHA-256 mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $pythonRoot -Force
+          & "$pythonRoot\python.exe" -c "import argparse, hashlib, json, pathlib, plistlib, struct, subprocess, tarfile, tempfile, zipfile; import sys; print(sys.version)"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging Python runtime verification failed' }
+          $pythonRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Setup Bun
         if: runner.environment != 'self-hosted' || (matrix.os_type != 'windows' && matrix.os_type != 'linux')
         uses: oven-sh/setup-bun@v2
@@ -692,6 +711,8 @@ jobs:
           "ORT_STRATEGY=system"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ORT_LIB_LOCATION=$libDir"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ORT_PREFER_DYNAMIC_LINK=1"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # The audio build script's legacy 1.22.0 download is unnecessary with the staged runtime.
+          "SCREENPIPE_SKIP_ONNX_DOWNLOAD=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "$libDir"                    | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           Write-Host "${arch}: ORT_LIB_LOCATION=$libDir (dynamic import link)"
           Get-ChildItem "$extractDir/lib"
@@ -909,6 +930,8 @@ jobs:
           CMAKE_ARGS: -DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF
           NO_STRIP: true
         run: |
+          set -euo pipefail
+
           # Wrap ldd so linuxdeploy doesn't crash on the statically-linked bun sidecar.
           # bun is built with musl and ldd exits 1 on it, which kills linuxdeploy's GTK plugin.
           # Persistent runners may already have this wrapper from a prior job.
@@ -972,8 +995,8 @@ jobs:
           # Install appimagetool for repacking
           curl -fsSL -o /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x /tmp/appimagetool
-          find src-tauri/target/${{ matrix.target }}/release/bundle/appimage/ -name "*.AppImage" -exec bash -c '
-            APPIMAGE="$1"
+          for APPIMAGE in src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage; do
+            [ -f "$APPIMAGE" ] || continue
             echo "Patching $APPIMAGE to remove bundled GLib"
             chmod +x "$APPIMAGE"
             "$APPIMAGE" --appimage-extract
@@ -989,6 +1012,7 @@ jobs:
                   squashfs-root/usr/lib/libavif.so*
             install -m 0755 src-tauri/bun-x86_64-unknown-linux-gnu squashfs-root/usr/bin/bun
             echo "Removed bundled GLib libs, repacking AppImage..."
+            chmod -R a+rX squashfs-root
             ARCH=x86_64 /tmp/appimagetool squashfs-root "$APPIMAGE"
             rm -rf squashfs-root
             echo "AppImage repacked successfully"
@@ -1001,10 +1025,9 @@ jobs:
             rm -f "$APPIMAGE.sig"
             bunx tauri signer sign "$APPIMAGE"
             echo "Updater signature regenerated for repacked AppImage"
-          ' _ {} \;
+          done
 
-          # find -exec does not propagate failures from the inner bash, so fail the
-          # build hard if any AppImage ends up without a signature newer than itself -
+          # Require a signature newer than the final repacked AppImage;
           # a stale (pre-repack) .sig bricks auto-update for every Linux user.
           for f in src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage; do
             [ -f "$f" ] || continue
@@ -1618,6 +1641,79 @@ jobs:
             "$GITHUB_WORKSPACE/apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos" \
             "$GITHUB_WORKSPACE/apps/screenpipe-app-tauri"
 
+      - name: Prepare personalized DMG template (macOS)
+        if: matrix.os_type == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOL_ROOT=$(mktemp -d "$RUNNER_TEMP/attribution-libdmg.XXXXXX")
+          trap 'rm -rf "$TOOL_ROOT"' EXIT
+          TOOL_SOURCE="$TOOL_ROOT/source"
+          TOOL_BUILD="$TOOL_ROOT/build"
+          git clone https://github.com/mozilla/libdmg-hfsplus.git "$TOOL_SOURCE"
+          git -C "$TOOL_SOURCE" checkout --detach e18579b391950589b9ed16ee630c54ce4319bb29
+          cmake -S "$TOOL_SOURCE" -B "$TOOL_BUILD" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build "$TOOL_BUILD" --parallel
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle"
+          VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          PLATFORM=macos-intel
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then PLATFORM=macos-arm; fi
+          for dmg in "$BUNDLE_DIR"/dmg/*.dmg; do
+            python3 scripts/package-attribution-dmg.py --source "$dmg" \
+              --output "$BUNDLE_DIR/attribution" --dmg-tool "$TOOL_BUILD/dmg/dmg" \
+              --platform "$PLATFORM" --release "$VERSION"
+          done
+
+      - name: Prepare Linux xattr download carrier
+        if: matrix.os_type == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Recovery builds can select app source from before this carrier.
+          # Only prepare metadata when the matching app revision supports it.
+          if [[ ! -f scripts/package-attribution-carrier.py ]] || ! grep -q -- '--linux-xattr' scripts/package-attribution-carrier.py; then
+            echo "Linux app revision predates xattr carriers; retaining ordinary AppImage"
+            exit 0
+          fi
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle"
+          VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          for appimage in "$BUNDLE_DIR"/appimage/*.AppImage; do
+            python3 scripts/package-attribution-carrier.py --artifact "$appimage" \
+              --output "$BUNDLE_DIR/attribution" --platform linux --release "$VERSION" --linux-xattr
+          done
+
+      - name: Prepare Windows certificate download carrier
+        if: matrix.os_type == 'windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path scripts/package-attribution-carrier.py) -or
+              -not (Select-String -Quiet -LiteralPath scripts/package-attribution-carrier.py -Pattern '--windows-release-carriers' -SimpleMatch)) {
+            Write-Host 'Windows app revision predates certificate carriers; retaining ordinary installer'
+            exit 0
+          }
+          $bundle = "apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle"
+          $version = (Select-String '^version = "(.*)"' apps/screenpipe-app-tauri/src-tauri/Cargo.toml).Matches[0].Groups[1].Value
+          $platform = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'windows-arm' } else { 'windows' }
+          $installer = Get-ChildItem "$bundle/nsis/*.exe" -ErrorAction Stop | Select-Object -First 1
+          python scripts/package-attribution-carrier.py --artifact $installer.FullName `
+            --output "$bundle/attribution" --platform $platform --release $version --windows-release-carriers
+          if ($LASTEXITCODE -ne 0) { throw "Windows attribution preparation failed with exit $LASTEXITCODE" }
+          $prepared = Get-Item "$bundle/attribution/screenpipe-attribution-windows.exe"
+          if ((Get-AuthenticodeSignature $prepared.FullName).Status -ne 'Valid') {
+            throw 'prepared Windows attribution installer lost its Authenticode validity'
+          }
+
+      - name: Upload Linux dry-run artifacts
+        if: matrix.os_type == 'linux' && github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: consumer-linux-${{ matrix.target }}
+          path: |
+            apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/attribution/*
+          if-no-files-found: error
+          compression-level: 0
+
       - name: Upload macOS dry-run artifacts
         if: matrix.os_type == 'macos' && github.event.inputs.dry_run == 'true'
         uses: actions/upload-artifact@v4
@@ -1625,6 +1721,7 @@ jobs:
           name: consumer-macos-${{ matrix.target }}
           path: |
             apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/attribution/*
             apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
             apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
           if-no-files-found: error
@@ -1638,6 +1735,7 @@ jobs:
           path: |
             apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
             apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.sig
+            apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/attribution/*
           if-no-files-found: error
           compression-level: 0
 
@@ -1651,8 +1749,9 @@ jobs:
           VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           TARGET="${{ matrix.target }}"
           BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
-          .github/scripts/upload-release-artifacts.sh consumer "$VERSION" "$TARGET" \
+          .release-workflow/.github/scripts/upload-release-artifacts.sh consumer "$VERSION" "$TARGET" \
             "${BUNDLE_DIR}"/dmg/*.dmg \
+            "${BUNDLE_DIR}"/attribution/* \
             "${BUNDLE_DIR}"/macos/*.tar.gz \
             "${BUNDLE_DIR}"/macos/*.sig
 
@@ -1666,10 +1765,11 @@ jobs:
           VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           TARGET="${{ matrix.target }}"
           BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
-          .github/scripts/upload-release-artifacts.sh consumer "$VERSION" "$TARGET" \
+          .release-workflow/.github/scripts/upload-release-artifacts.sh consumer "$VERSION" "$TARGET" \
             "${BUNDLE_DIR}"/nsis/*.exe \
             "${BUNDLE_DIR}"/nsis/*.nsis.zip \
-            "${BUNDLE_DIR}"/nsis/*.sig
+            "${BUNDLE_DIR}"/nsis/*.sig \
+            "${BUNDLE_DIR}"/attribution/*
 
       - name: Upload to Cloudflare R2 (Linux)
         if: matrix.os_type == 'linux' && github.event.inputs.dry_run != 'true'
@@ -1681,10 +1781,11 @@ jobs:
           VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           TARGET="${{ matrix.target }}"
           BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
-          .github/scripts/upload-release-artifacts.sh consumer "$VERSION" "$TARGET" \
+          .release-workflow/.github/scripts/upload-release-artifacts.sh consumer "$VERSION" "$TARGET" \
             "${BUNDLE_DIR}"/appimage/*.AppImage \
             "${BUNDLE_DIR}"/appimage/*.tar.gz \
             "${BUNDLE_DIR}"/appimage/*.sig \
+            "${BUNDLE_DIR}"/attribution/* \
             "${BUNDLE_DIR}"/deb/*.deb
 
       # Sentry uploads run AFTER R2 so they don't delay release artifacts

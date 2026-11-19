@@ -5,6 +5,14 @@ use screenpipe_db::storage::{migrate, MigrationOptions, PrivacyPolicy, Projectio
 use screenpipe_db::{ContentType, DatabaseManager};
 use sqlx::Connection;
 
+#[cfg(windows)]
+fn smb_scratch_root() -> (tempfile::TempDir, std::path::PathBuf) {
+    let local = tempfile::tempdir_in("C:\\").unwrap();
+    let relative = local.path().strip_prefix("C:\\").unwrap();
+    let root = std::path::PathBuf::from(r"\\localhost\c$").join(relative);
+    (local, root)
+}
+
 async fn seed(db: &DatabaseManager, id: i64, text: Option<&str>, accessibility: Option<&str>) {
     let mut tx = db.begin_immediate_with_retry().await.unwrap();
     sqlx::query("INSERT INTO frames(id,timestamp,full_text,accessibility_text,text_json,accessibility_tree_json,app_name,window_name,device_name) VALUES(?,'2026-09-11T12:00:00Z',?,?,'[{\"text\":\"hello\",\"left\":0.5}]','{\"text\":\"hello\"}','Editor','notes','display')")
@@ -37,6 +45,111 @@ async fn search(db: &DatabaseManager, query: &str) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::to_value(results).unwrap()
+}
+
+#[tokio::test]
+async fn consumer_sync_sources_survive_restart_and_separate_recreated_histories() {
+    let device = "same-computer";
+    let root = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+        .await
+        .unwrap();
+    seed(&db, 1, Some("original history"), None).await;
+    let source = db.consumer_sync_source_id(device).await.unwrap();
+    assert_ne!(source, device);
+    db.save_upload_checkpoint("consumer", "acknowledged")
+        .await
+        .unwrap();
+    db.close().await;
+
+    let reopened = DatabaseManager::new(
+        root.path().join("db.sqlite").to_str().unwrap(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.consumer_sync_source_id(device).await.unwrap(),
+        source
+    );
+    assert_eq!(
+        reopened
+            .upload_checkpoint("consumer")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("acknowledged")
+    );
+    assert_eq!(
+        reopened
+            .frame_payloads(&[1], Projection::All)
+            .await
+            .unwrap()[&1]
+            .full_text
+            .as_deref(),
+        Some("original history")
+    );
+    reopened.close().await;
+
+    let replacement = tempfile::tempdir().unwrap();
+    let db =
+        DatabaseManager::new_hybrid(replacement.path(), Default::default(), Default::default())
+            .await
+            .unwrap();
+    seed(&db, 1, Some("replacement history"), None).await;
+    assert_ne!(db.consumer_sync_source_id(device).await.unwrap(), source);
+    assert!(db.upload_checkpoint("consumer").await.unwrap().is_none());
+    db.close().await;
+
+    let legacy = tempfile::tempdir().unwrap();
+    let path = legacy.path().join("db.sqlite");
+    let db = DatabaseManager::new(path.to_str().unwrap(), Default::default())
+        .await
+        .unwrap();
+    seed(&db, 1, Some("legacy history"), None).await;
+    assert_eq!(db.consumer_sync_source_id(device).await.unwrap(), device);
+    db.close().await;
+    migrate(legacy.path(), Default::default(), Default::default())
+        .await
+        .unwrap();
+    let migrated = DatabaseManager::new(path.to_str().unwrap(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        migrated.consumer_sync_source_id(device).await.unwrap(),
+        device
+    );
+    migrated.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn consumer_sync_source_reopens_on_smb() {
+    let (_scratch, root) = smb_scratch_root();
+    let db = DatabaseManager::new_hybrid(&root, Default::default(), Default::default())
+        .await
+        .unwrap();
+    seed(&db, 1, Some("history on a shared drive"), None).await;
+    let source = db.consumer_sync_source_id("computer").await.unwrap();
+    db.close().await;
+    let reopened =
+        DatabaseManager::new(root.join("db.sqlite").to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+    assert_eq!(
+        reopened.consumer_sync_source_id("computer").await.unwrap(),
+        source
+    );
+    assert_eq!(
+        reopened
+            .frame_payloads(&[1], Projection::All)
+            .await
+            .unwrap()[&1]
+            .full_text
+            .as_deref(),
+        Some("history on a shared drive")
+    );
+    reopened.close().await;
 }
 
 #[tokio::test]
@@ -96,6 +209,39 @@ async fn staged_sealed_reopened_search_and_full_payloads_match() {
         "{}",
         String::from_utf8_lossy(&relative.stderr)
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires writable C:\\ and administrative access to \\\\localhost\\c$"]
+async fn windows_smb_fresh_hybrid_init_reopens_same_generation() {
+    let (_local, root) = smb_scratch_root();
+    let db = DatabaseManager::new_hybrid(&root, Default::default(), Default::default())
+        .await
+        .unwrap();
+    let expected = screenpipe_db::storage::StorageDescriptor::read(&root)
+        .unwrap()
+        .unwrap();
+    seed(&db, 1, Some("windows publication survives reopen"), None).await;
+    db.close().await;
+
+    let reopened =
+        DatabaseManager::new(root.join("db.sqlite").to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+    let active = screenpipe_db::storage::StorageDescriptor::read(&root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.generation, expected.generation);
+    assert_eq!(
+        reopened
+            .frame_payloads(&[1], Projection::Search)
+            .await
+            .unwrap()[&1]
+            .text(),
+        "windows publication survives reopen"
+    );
+    reopened.close().await;
 }
 
 #[tokio::test]
@@ -648,11 +794,10 @@ async fn archive_record_budget_keeps_large_captures_resident_and_archives_later_
             .unwrap(),
         0
     );
-    assert!(db
-        .admit_consumer_sync()
-        .unwrap_err()
-        .to_string()
-        .contains("binding unavailable"));
+    assert_eq!(
+        db.consumer_sync_source_id("device").await.unwrap(),
+        db.upload_source_id().await.unwrap()
+    );
     db.close().await;
 }
 
@@ -762,6 +907,134 @@ async fn interrupted_initialization_resumes_its_recorded_generation() {
         seed(&db, 1, Some("ready after interruption"), None).await;
         db.close().await;
     }
+}
+
+#[cfg(feature = "storage-fault-injection")]
+#[tokio::test]
+async fn reserve_probe_failure_resumes_same_generation_and_persists_recording() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("履歴 storage");
+    std::fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let failed = std::process::Command::new(env!("CARGO_BIN_EXE_screenpipe-storage"))
+        .arg("init")
+        .arg(&root)
+        .env("SCREENPIPE_STORAGE_AVAILABLE_SPACE", "error")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let error = String::from_utf8_lossy(&failed.stderr);
+    assert!(error.contains("disk-space probe failed"), "{error}");
+    assert!(error.contains("raw_os_error=Some(5)"), "{error}");
+    assert!(
+        error.contains("source retained; outcome=recording_blocked"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "recovery=restore access to the storage drive or data folder, then retry startup"
+        ),
+        "{error}"
+    );
+    assert!(!error.contains("available_bytes=0"), "{error}");
+
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("storage-init.json")).unwrap()).unwrap();
+    let generation = journal["generation"].as_str().unwrap().to_owned();
+    let generation_path = root.join("storage").join(&generation);
+    assert!(generation_path.exists());
+
+    let db = DatabaseManager::new_hybrid(&root, Default::default(), Default::default())
+        .await
+        .unwrap();
+    let active = screenpipe_db::storage::StorageDescriptor::read(&root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.generation, generation);
+    seed(&db, 1, Some("recording after probe restoration"), None).await;
+    db.close().await;
+
+    let reopened =
+        DatabaseManager::new(root.join("db.sqlite").to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+    assert_eq!(
+        reopened
+            .frame_payloads(&[1], Projection::Search)
+            .await
+            .unwrap()[&1]
+            .text(),
+        "recording after probe restoration"
+    );
+    reopened.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_default_fresh_bootstrap_supports_canonical_unicode_path() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("画面 履歴");
+    std::fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let available = fs2::available_space(&root).expect("Windows free-space probe");
+    assert!(available > 0, "Windows probe returned no usable bytes");
+
+    let db = DatabaseManager::new_hybrid(&root, Default::default(), Default::default())
+        .await
+        .expect("default fresh bootstrap on canonical Unicode path");
+    seed(&db, 1, Some("unicode bootstrap recording"), None).await;
+    db.close().await;
+}
+
+#[cfg(all(windows, feature = "storage-fault-injection"))]
+#[tokio::test]
+#[ignore = "requires writable C:\\ and administrative access to \\\\localhost\\c$"]
+async fn windows_smb_interrupted_init_resumes_same_generation_and_history() {
+    let (_local, root) = smb_scratch_root();
+    let killed = std::process::Command::new(env!("CARGO_BIN_EXE_screenpipe-storage"))
+        .arg("init")
+        .arg(&root)
+        .env("SCREENPIPE_STORAGE_CRASH_AT", "initialization_ready")
+        .output()
+        .unwrap();
+    assert_eq!(
+        killed.status.code(),
+        Some(86),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    let expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("storage-init.json")).unwrap()).unwrap();
+
+    let db = DatabaseManager::new_hybrid(&root, Default::default(), Default::default())
+        .await
+        .unwrap();
+    let active = screenpipe_db::storage::StorageDescriptor::read(&root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.generation, expected["generation"].as_str().unwrap());
+    seed(
+        &db,
+        1,
+        Some("history retained after interrupted init"),
+        None,
+    )
+    .await;
+    db.close().await;
+
+    let reopened =
+        DatabaseManager::new(root.join("db.sqlite").to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+    assert_eq!(
+        reopened
+            .frame_payloads(&[1], Projection::Search)
+            .await
+            .unwrap()[&1]
+            .text(),
+        "history retained after interrupted init"
+    );
+    reopened.close().await;
 }
 
 #[cfg(feature = "storage-fault-injection")]
@@ -1588,4 +1861,107 @@ async fn pending_sqlx_migration_rolls_back_and_retries_on_compressed_storage() {
         1
     );
     db.close().await;
+}
+
+#[tokio::test]
+async fn hybrid_index_is_opened_by_a_plain_path() {
+    // SQLite 3.51 treats every path starting with `\` as a network share,
+    // including the `\?\C:\` form `canonicalize` returns on Windows. It then
+    // shares one -shm lock handle across connections, which can leak a WAL
+    // read lock and stop checkpoints for the life of the process.
+    let root = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+        .await
+        .unwrap();
+    let file: String =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name='main'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    db.close().await;
+    assert!(file.ends_with("index.sqlite"), "{file}");
+    assert!(
+        !file.starts_with(r"\\"),
+        "SQLite would use UNC locking for {file}"
+    );
+}
+
+/// Reproduces #7850 on Windows. With the verbatim index path, roughly one run
+/// in seven froze PASSIVE checkpoints within eight seconds of continuous
+/// writes. Run: `cargo test -p screenpipe-db --test hybrid_storage
+/// hybrid_checkpoints_keep_up -- --ignored`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing stress test, about 8 seconds"]
+async fn hybrid_checkpoints_keep_up_with_continuous_writes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+            .await
+            .unwrap(),
+    );
+    db.set_frame_privacy_policy(&Default::default())
+        .await
+        .unwrap();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (db, stop) = (db.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut n = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let events: Vec<_> = (0..10)
+                    .map(|i| screenpipe_db::InsertUiEvent {
+                        timestamp: chrono::Utc::now(),
+                        session_id: None,
+                        relative_ms: n * 10 + i,
+                        event_type: screenpipe_db::UiEventType::Text,
+                        x: None,
+                        y: None,
+                        delta_x: None,
+                        delta_y: None,
+                        button: None,
+                        click_count: None,
+                        key_code: None,
+                        modifiers: None,
+                        text_content: Some(format!("typed text {n} {i}")),
+                        app_name: None,
+                        app_pid: None,
+                        window_title: None,
+                        browser_url: None,
+                        element_role: None,
+                        element_name: None,
+                        element_value: None,
+                        element_description: None,
+                        element_automation_id: None,
+                        element_bounds: None,
+                        element_ancestors: None,
+                        frame_id: None,
+                    })
+                    .collect();
+                db.insert_ui_events_batch(&events).await.unwrap();
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    let mut behind_since: Option<Instant> = None;
+    let mut longest = Duration::ZERO;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (_, log, checkpointed) = db.wal_checkpoint().await.unwrap();
+        if checkpointed < log {
+            longest = longest.max(behind_since.get_or_insert_with(Instant::now).elapsed());
+        } else {
+            behind_since = None;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.await.unwrap();
+    db.close().await;
+    assert!(
+        longest < Duration::from_secs(3),
+        "PASSIVE checkpoints stayed behind the WAL for {longest:?}"
+    );
 }

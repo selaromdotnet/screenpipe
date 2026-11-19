@@ -1,5 +1,5 @@
-# screenpipe - AI that knows everything you've seen, said, or heard
-# https://screenpi.pe
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
 #
 # Manual SDK npm release workflow. This workflow defaults to dry-run packaging.
 # To publish public npm packages, a human must set publish_npm=true and provide
@@ -301,23 +301,33 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create Swift mirror token
+        id: swift-app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ vars.SWIFT_MIRROR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SWIFT_MIRROR_APP_PRIVATE_KEY }}
+          owner: screenpipe
+          repositories: screenpipe-sdk-swift
+          permission-contents: write
       - name: Sync Swift sources into screenpipe-sdk-swift mirror
         env:
-          # PAT must have `repo` scope on screenpipe/screenpipe-sdk-swift.
-          # We reuse the existing PAT secret (already used by release-app)
-          # rather than minting a separate one — same trust boundary, one
-          # less secret to rotate.
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ steps.swift-app-token.outputs.token }}
+          GH_CONFIG_DIR: ${{ runner.temp }}/swift-mirror-gh
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::error::PAT secret is required to push to the Swift mirror"
+            echo "::error::Swift mirror App installation token is required"
             exit 1
           fi
 
           work=$(mktemp -d)
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/screenpipe/screenpipe-sdk-swift.git" "$work/mirror"
+          trap 'rm -rf "$work" "$GH_CONFIG_DIR"' EXIT
+          gh auth setup-git
+          git clone https://github.com/screenpipe/screenpipe-sdk-swift.git "$work/mirror"
 
           # Per-directory rsync (not a root mirror) so the mirror's
           # Swift-specific README.md / LICENSE.md aren't clobbered by the

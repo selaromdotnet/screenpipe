@@ -150,6 +150,12 @@ fn recording_access_policy(
     if authentication_status == crate::startup_auth::AuthenticationStatus::NotRequired {
         return true;
     }
+    // Debug builds may bypass consumer billing while developing locally, but
+    // managed recording policy remains authoritative in every build. Keep the
+    // local read server available; only capture admission is closed here.
+    if is_enterprise_build && !enterprise_authorized {
+        return false;
+    }
     server_access_policy(
         is_enterprise_build,
         dev_bypass,
@@ -345,7 +351,7 @@ pub struct RecordingState {
     pub server: Arc<Mutex<Option<ServerCore>>>,
     pub(crate) server_shutdown: ServerShutdown,
     /// Current capture session. None when recording is stopped/paused.
-    /// Self-contained — `CaptureSession::stop()` needs no external references.
+    /// Self-contained — `CaptureSession::stop_with_reason()` needs no external references.
     pub capture: Arc<Mutex<Option<CaptureSession>>>,
     /// True while a server start is in progress (prevents race between main.rs boot and frontend)
     pub is_starting: Arc<AtomicBool>,
@@ -570,19 +576,31 @@ pub async fn stop_capture(
     state: State<'_, RecordingState>,
     _app: tauri::AppHandle,
 ) -> Result<(), String> {
+    stop_capture_with_reason(state, _app, "manual_pause").await
+}
+
+pub(crate) async fn stop_capture_with_reason(
+    state: State<'_, RecordingState>, _app: tauri::AppHandle, reason: &'static str,
+) -> Result<(), String> {
     info!("Stopping capture session (server stays alive)");
 
     // The tray/shortcut "stop recording" lands here (server stays up, capture
     // off). Clear the intent so a later engine crash doesn't get auto-respawned
     // — which would resurrect capture the user deliberately stopped.
     state.set_capture_intent(false);
+    #[cfg(feature = "enterprise-support")]
+    crate::enterprise::recording_events::record_reason(
+        crate::enterprise::recording_events::State::Stopping,
+        reason,
+    );
+
     screenpipe_engine::meeting_watcher::set_capture_stopped(true);
 
     remember_active_meeting_for_capture_restart(&state).await;
 
     let mut capture_guard = state.capture.lock().await;
     if let Some(session) = capture_guard.take() {
-        session.stop_checked().await?;
+        session.stop_checked_with_reason(reason).await?;
         info!("Capture session stopped");
     } else {
         debug!("No capture session running");
@@ -926,11 +944,15 @@ pub async fn stop_screenpipe(
 }
 
 pub(crate) async fn stop_screenpipe_inner(state: &RecordingState) -> Result<(), String> {
+    stop_screenpipe_inner_with_reason(state, "restart").await
+}
+
+pub(crate) async fn stop_screenpipe_inner_with_reason(state: &RecordingState, reason: &'static str) -> Result<(), String> {
     info!("stop_screenpipe: stopping capture and server");
 
     // Stop capture first
     {
-        // Must run BEFORE `session.stop()`: the meeting watcher's shutdown hook
+        // Must run BEFORE `session.stop_with_reason()`: the meeting watcher's shutdown hook
         // closes the row (`MEETING_END_REASON_SHUTDOWN`), and the next start
         // closes anything still open via `close_orphaned_meetings`. After that
         // there is no active meeting left to find, which is exactly how a
@@ -942,7 +964,7 @@ pub(crate) async fn stop_screenpipe_inner(state: &RecordingState) -> Result<(), 
         remember_active_meeting_for_capture_restart(state).await;
         let mut capture_guard = state.capture.lock().await;
         if let Some(session) = capture_guard.take() {
-            session.stop().await;
+            session.stop_with_reason(reason).await;
             info!("Capture stopped");
         } else {
             debug!("No capture session to stop");
@@ -991,7 +1013,7 @@ where
 /// Hard ceiling on capture/server teardown that runs *immediately before* the
 /// process restarts or exits.
 ///
-/// A wedged `session.stop()` must never hold the process hostage: it's about to
+/// A wedged `session.stop_with_reason()` must never hold the process hostage: it's about to
 /// be replaced or killed, so a perfectly clean teardown is best-effort only
 /// (`server.rs` retries the port bind if the next boot races teardown). The
 /// macOS `VisionManager` shutdown only self-aborts after 10s, and audio-device
@@ -1125,7 +1147,6 @@ pub(crate) async fn resume_enterprise_recording(app: &tauri::AppHandle) {
         let state = app.state::<RecordingState>();
         let allowed = || {
             state.authorization_recovery.is_current(generation)
-                && state.capture_intended()
                 && crate::enterprise_policy::recording_authorized()
                 && !crate::process_exit::QUIT_REQUESTED.load(Ordering::SeqCst)
                 && !crate::db_relaunch::manual_recovery_required()
@@ -1146,7 +1167,7 @@ pub(crate) async fn resume_enterprise_recording(app: &tauri::AppHandle) {
                             crate::enterprise::managed_settings::apply(&app).await?;
                             authorized_start::attempt(
                                 &state.server_lifecycle,
-                                allowed,
+                                || allowed() && state.capture_intended(),
                                 || async {
                                     // Drop each slot guard before acquiring the other;
                                     // capture teardown can itself need the server slot.
@@ -1211,7 +1232,9 @@ pub async fn retry_screenpipe(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let Some(_lifecycle_guard) = retry::admit(
+    let data_dir = crate::db_relaunch::active_data_dir();
+    let Some(_lifecycle_guard) = retry::admit_logged(
+        &data_dir,
         &state.server_lifecycle,
         &state.wants_recording,
         &crate::process_exit::QUIT_REQUESTED,
@@ -1221,7 +1244,7 @@ pub async fn retry_screenpipe(
         return Ok(());
     };
     retry::run(
-        &crate::db_relaunch::active_data_dir(),
+        &data_dir,
         &state.wants_recording,
         spawn_screenpipe_inner(&state, app),
     )
@@ -1499,7 +1522,7 @@ async fn spawn_screenpipe_after_migration(
     // --- Full start: server + capture ---
     // Stop any existing capture first (self-contained, no server lock needed)
     if let Some(session) = state.capture.lock().await.take() {
-        session.stop().await;
+        session.stop_with_reason("session_replaced").await;
     }
     // Shutdown existing server if any
     if let Err(error) = shutdown_server(
@@ -2389,6 +2412,28 @@ mod recording_access_tests {
         assert!(recording_access_policy(
             true,
             false,
+            false,
+            true,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
+    }
+
+    #[test]
+    fn managed_debug_build_cannot_bypass_recording_policy() {
+        assert!(!recording_access_policy(
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
+        assert!(recording_access_policy(
+            true,
+            true,
             false,
             true,
             false,

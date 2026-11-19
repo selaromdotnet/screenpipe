@@ -48,10 +48,21 @@ mod backfill;
 mod diagnostics;
 #[path = "frame_context.rs"]
 pub(crate) mod frame_context;
+#[path = "screenshot_delivery.rs"]
+pub(crate) mod screenshot_delivery;
+pub(crate) use enterprise_upload::EnterpriseUploadMode;
 use enterprise_upload::{
     upload_direct_readable_batch, upload_direct_write_only_batch, DirectUploadRecordCounts,
-    EnterpriseUploadMode,
 };
+
+#[cfg(test)]
+pub(super) fn direct_write_only_for_test() -> EnterpriseUploadMode {
+    EnterpriseUploadMode::DirectWriteOnly(enterprise_upload::DirectUploadConfig {
+        ticket_url: "https://storage.example/ticket".into(),
+        complete_url: "https://storage.example/complete".into(),
+        pinned_hosts: vec![],
+    })
+}
 
 /// How often we wake up and try to sync.
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -82,7 +93,7 @@ const RETRY_WHILE_WAITING_FOR_ACCOUNT: Duration = Duration::from_secs(60);
 
 /// Admin-triggered log collection runs independently of telemetry work and
 /// its retry cycle, so a failing upload cannot hold up support diagnostics.
-const LOG_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
+pub(super) const LOG_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default endpoint. Overridable via `SCREENPIPE_ENTERPRISE_INGEST_URL` for
 /// staging / on-prem.
@@ -212,13 +223,26 @@ impl EnterpriseSyncConfig {
         }
         Ok(())
     }
+
+    /// Resolve fresh authorization for hosted diagnostics and recovery. Archive
+    /// destination admission belongs to uploads, not the support read posture.
+    /// Never reuse a readable policy after a failed refresh.
+    pub(super) async fn resolve_support_mode(&mut self) -> Result<(), EnterpriseSyncError> {
+        self.upload_mode = EnterpriseUploadMode::Blocked("support policy unresolved".into());
+        if let Some(mode) =
+            EnterpriseUploadMode::resolve_for_support(&self.license_key, &self.ingest_url).await?
+        {
+            self.upload_mode = mode;
+        }
+        Ok(())
+    }
 }
 
 // ─── Cursor (last-synced timestamp) ─────────────────────────────────────────
 
 /// What we persist between runs. RFC3339 string for human-readability + cross-
 /// language portability if we ever read it from JS.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Cursor {
     #[serde(default)]
     pub privacy: std::collections::BTreeMap<String, PrivacyCursor>,
@@ -254,7 +278,7 @@ pub struct Cursor {
     boundary: CursorBoundary,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CursorBoundary {
     #[serde(default)]
     starred_sequence: i64,
@@ -320,7 +344,7 @@ impl Cursor {
     }
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PrivacyCursor {
     pub sequence: i64,
     pub cutoff: String,
@@ -356,6 +380,13 @@ pub use export_filter::{ExportFilterReport, ExportRows};
 
 #[async_trait::async_trait]
 pub trait LocalApiClient: Send + Sync {
+    /// A page acknowledgement wakes idle screenshot discovery without
+    /// cancelling a JPEG read or bypassing retry deadlines.
+    fn screenshot_work_accepted(&self) {}
+    async fn wait_for_screenshot_work(&self) {
+        std::future::pending::<()>().await;
+    }
+
     async fn release_replay_pending(
         &self,
         _request_id: &str,
@@ -1926,6 +1957,7 @@ async fn run_one_sync_page(
     }
 
     // Advance cursor only on success — partial failure must not skip records.
+    local.screenshot_work_accepted();
     *cursor = next_cursor;
     // The backfill caller commits an image-only cursor with its parent (or
     // its standalone continuation); it must never overwrite telemetry here.
@@ -2106,9 +2138,9 @@ pub async fn run_sync_burst(
 /// screenshots). Keeps a tick bounded even when a pipe requests the manifest
 /// cap; the rest drains on subsequent ticks.
 const FRAME_BATCH_MAX_CITED: usize = 20;
-/// Per-tick batch in "all" mode — the org chose to centralize every frame,
-/// so the device drains its (server-auto-cited) manifest much faster:
-/// 200/tick x ~288 ticks/day far exceeds a busy device's daily frame count.
+/// Existing per-turn work budget in "all" mode. The independent owner
+/// immediately starts another turn after durable progress; this is not a queue
+/// cap or an idle interval between accepted screenshot batches.
 const FRAME_BATCH_MAX_ALL: usize = 200;
 /// The frame-upload route accepts at most 20 entries and Vercel accepts at
 /// most 4.5 MB. Split the 200-frame drain into lossless request envelopes.
@@ -2140,15 +2172,6 @@ pub fn control_plane_base(ingest_url: &str) -> Option<String> {
     }
     let origin = url.origin().ascii_serialization();
     (origin != "null").then_some(origin)
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct FrameRequestsResponse {
-    #[serde(default)]
-    pub frame_ids: Vec<i64>,
-    /// Server signals the stream is off by policy — don't bother uploading.
-    #[serde(default)]
-    pub disabled: bool,
 }
 
 /// One upload entry. Exactly one of `image_b64` / `error` is set; error
@@ -2311,9 +2334,9 @@ async fn upload_frame_batch(
         {
             warn!(frame_id = entry.frame_id, bytes = bytes.len(), error = %error,
                 "full-quality screenshot upload failed; screenshot remains pending");
-            return Err(EnterpriseSyncError::BackfillImages(
-                "screenshot_upload_failed",
-            ));
+            return Err(EnterpriseSyncError::Ingest(format!(
+                "screenshot_upload_failed: {error}"
+            )));
         }
         return Ok(FrameUploadAck {
             stored: vec![entry.frame_id],
@@ -2330,13 +2353,14 @@ async fn upload_frame_batch(
         .await
         .map_err(|error| {
             warn!(%error, "frame fulfillment: upload failed; screenshots remain pending");
-            EnterpriseSyncError::BackfillImages("screenshot_upload_failed")
+            EnterpriseSyncError::Ingest(http_error_detail("screenshot_upload_failed", error))
         })?;
     if !response.status().is_success() {
         warn!(status = %response.status(), "frame fulfillment: POST failed; screenshots remain pending; retry next sync");
-        return Err(EnterpriseSyncError::BackfillImages(
-            "screenshot_upload_failed",
-        ));
+        return Err(EnterpriseSyncError::Ingest(format!(
+            "screenshot_upload_failed: POST HTTP {}",
+            response.status()
+        )));
     }
     response.json().await.map_err(|error| {
         warn!(%error, "frame fulfillment: invalid acknowledgement; screenshots remain pending");
@@ -2359,152 +2383,7 @@ pub async fn fulfill_frame_requests(
     local: &dyn LocalApiClient,
     http: &reqwest::Client,
 ) -> FrameFulfillReport {
-    let report = FrameFulfillReport::default();
-
-    // Fail-closed gates, cheapest first. The policy default is Off; the
-    // server enforces the same gate on the upload route (defense in depth).
-    // The mode also sizes the per-tick batch: "cited" trickles SOP
-    // screenshots, "all" (org chose to centralize every frame) drains the
-    // server-auto-cited manifest in larger batches.
-    let mode = crate::enterprise_policy::current_sync_streams().frame_images;
-    if mode == crate::enterprise_policy::FrameImagesMode::Off {
-        return report;
-    }
-    if !matches!(
-        cfg.upload_mode,
-        EnterpriseUploadMode::HostedIngest | EnterpriseUploadMode::DirectReadable(_)
-    ) {
-        debug!("frame fulfillment skipped: storage mode does not permit hosted processing");
-        return report;
-    }
-    let prepared = match prepare_upload_identity(cfg, local, http).await {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            warn!("frame source registration unavailable: {error}");
-            return report;
-        }
-    };
-    let cfg = &prepared;
-    let Some(base) = control_plane_base(&cfg.ingest_url) else {
-        warn!(
-            "frame fulfillment: cannot derive control plane base from ingest url {}",
-            cfg.ingest_url
-        );
-        return report;
-    };
-
-    let guard_source = cfg.stable_device_id.is_some()
-        || uuid::Uuid::parse_str(&cfg.device_id).is_ok_and(|id| id.get_version_num() == 4);
-    if guard_source
-        && local.upload_source_id().await.ok().as_deref() != Some(cfg.device_id.as_str())
-    {
-        return report;
-    }
-    let requests_url = format!("{base}/api/enterprise/frame-requests");
-    let resp = match http
-        .get(&requests_url)
-        .header("X-License-Key", &cfg.license_key)
-        .header("X-Device-Id", &cfg.device_id)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("frame fulfillment: requests fetch failed: {e}");
-            return report;
-        }
-    };
-    if !resp.status().is_success() {
-        warn!(
-            "frame fulfillment: GET {} -> {}",
-            requests_url,
-            resp.status()
-        );
-        return report;
-    }
-    let pending: FrameRequestsResponse = match resp.json().await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("frame fulfillment: bad requests payload: {e}");
-            return report;
-        }
-    };
-    if pending.disabled || pending.frame_ids.is_empty() {
-        return report;
-    }
-
-    let ids: Vec<i64> = pending
-        .frame_ids
-        .into_iter()
-        .filter(|id| *id > 0)
-        .take(frame_batch_max(mode))
-        .collect();
-    if ids.is_empty() {
-        return report;
-    }
-
-    let mut entries: Vec<FrameUploadEntry> = Vec::with_capacity(FRAME_UPLOAD_ENTRIES_PER_REQUEST);
-    let requested = ids.len();
-    let mut uploaded = 0usize;
-    let mut buffered_bytes = 0usize;
-    for (index, id) in ids.iter().copied().enumerate() {
-        let entry = match local.fetch_frame_jpeg(id).await {
-            Ok(Some(bytes)) => {
-                // Validate the JPEG off the async runtime; preserve its bytes.
-                match tokio::task::spawn_blocking(move || prepare_frame_jpeg(&bytes)).await {
-                    Ok(Ok(jpeg)) => FrameUploadEntry::image(id, &jpeg),
-                    Ok(Err(reason)) => {
-                        warn!("frame fulfillment: frame {id} {reason}");
-                        FrameUploadEntry::err(id, reason)
-                    }
-                    Err(_) => FrameUploadEntry::err(id, "encode_panicked"),
-                }
-            }
-            Ok(None) => FrameUploadEntry::err(id, "not_found"),
-            Err(e) => {
-                warn!("frame fulfillment: fetch frame {id} failed: {e}");
-                FrameUploadEntry::err(id, "fetch_failed")
-            }
-        };
-        buffered_bytes += entry.image_b64.as_ref().map_or(0, |image| image.len());
-        entries.push(entry);
-        // Bound retained work, not the image: large originals are uploaded
-        // immediately instead of buffering the entire pending screenshot list.
-        if entries.len() == FRAME_UPLOAD_ENTRIES_PER_REQUEST
-            || buffered_bytes >= FRAME_UPLOAD_REQUEST_BYTES
-            || index + 1 == requested
-        {
-            if guard_source
-                && local.upload_source_id().await.ok().as_deref() != Some(cfg.device_id.as_str())
-            {
-                warn!("frame fulfillment: database changed while fetching images; retry next tick");
-                return FrameFulfillReport {
-                    requested,
-                    uploaded,
-                    failed: requested.saturating_sub(uploaded),
-                };
-            }
-            for batch in split_frame_upload_requests(std::mem::take(&mut entries)) {
-                match upload_frame_batch(cfg, http, &batch).await {
-                    Ok(ack) => uploaded += ack.stored.len(),
-                    Err(error) => {
-                        warn!(%error, "frame fulfillment failed; screenshots remain pending");
-                        return FrameFulfillReport {
-                            requested,
-                            uploaded,
-                            failed: requested.saturating_sub(uploaded),
-                        };
-                    }
-                }
-            }
-            buffered_bytes = 0;
-        }
-    }
-    FrameFulfillReport {
-        requested,
-        uploaded,
-        failed: requested.saturating_sub(uploaded),
-    }
+    screenshot_delivery::once(cfg, local, http).await
 }
 
 // ─── Long-running task ──────────────────────────────────────────────────────
@@ -2679,7 +2558,7 @@ async fn fulfill_log_requests(
     // This worker owns a separate config from the recording sync loop. Resolve
     // its policy before polling: the startup clone is Blocked, and later policy
     // changes must also reach this worker while recording is unavailable.
-    if let Err(error) = cfg.resolve_upload_mode().await {
+    if let Err(error) = cfg.resolve_support_mode().await {
         debug!("log-requests: policy resolution failed: {error}");
         return None;
     }
@@ -2751,11 +2630,35 @@ async fn run_log_request_loop(
     mut cfg: EnterpriseSyncConfig,
     http: reqwest::Client,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut updates: tokio::sync::watch::Receiver<EnterpriseSyncConfig>,
+    local: Arc<dyn LocalApiClient>,
 ) {
+    let mut last_screenshot_diagnostic: Option<String> = None;
     let mut last_log_req: Option<String> = None;
     let mut last_diagnostic: Option<String> = None;
 
     loop {
+        let latest = updates.borrow_and_update().clone();
+        if cfg.license_key != latest.license_key
+            || cfg.device_id != latest.device_id
+            || cfg.ingest_url != latest.ingest_url
+        {
+            cfg = latest;
+        }
+        match screenshot_delivery::report(
+            &cfg,
+            &http,
+            local.as_ref(),
+            last_screenshot_diagnostic.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(at)) => last_screenshot_diagnostic = Some(at),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(%error,"Screenshot diagnostic retained; support reporting will retry")
+            }
+        }
         match diagnostics::report(&cfg, &http, last_diagnostic.as_deref()).await {
             Ok(Some(at)) => last_diagnostic = Some(at),
             Ok(None) => {}
@@ -2766,7 +2669,12 @@ async fn run_log_request_loop(
             last_log_req = Some(handled);
         }
 
-        if sleep_or_shutdown(LOG_REQUEST_INTERVAL, &mut shutdown).await {
+        tokio::select! {
+            _=tokio::time::sleep(LOG_REQUEST_INTERVAL)=>{},
+            changed=updates.changed()=>{ if changed.is_err(){break;} },
+            _=screenshot_delivery::stopped(&mut shutdown)=>break,
+        }
+        if *shutdown.borrow() {
             break;
         }
     }
@@ -2959,11 +2867,22 @@ pub async fn run(
 
     let mut cursor = Cursor::load(&cfg.cursor_path);
     let recovery = SavedOrAccountLicenseKeyRecovery;
-    let mut log_request_loop = tokio::spawn(run_log_request_loop(
+    let (screenshot_config, screenshot_updates) = tokio::sync::watch::channel(cfg.clone());
+    let _screenshot_worker = screenshot_delivery::Worker(tokio::spawn(screenshot_delivery::run(
+        cfg.clone(),
+        Arc::clone(&local),
+        http.clone(),
+        screenshot_updates.clone(),
+        screenshot_config.clone(),
+        shutdown.clone(),
+    )));
+    let mut log_request_loop = screenshot_delivery::Worker(tokio::spawn(run_log_request_loop(
         cfg.clone(),
         http.clone(),
         shutdown.clone(),
-    ));
+        screenshot_updates.clone(),
+        Arc::clone(&local),
+    )));
 
     loop {
         // The independent native policy watcher and support-log poller remain
@@ -2985,12 +2904,15 @@ pub async fn run(
         if cfg.license_key != license_key_before_tick || cfg.device_id != device_id_before_tick {
             // The log poller owns a cloned config, so restart it with the
             // recovered key. Fulfillment state lives server-side.
-            log_request_loop.abort();
-            log_request_loop = tokio::spawn(run_log_request_loop(
+            screenshot_delivery::publish_config(&screenshot_config, &cfg);
+            log_request_loop.0.abort();
+            log_request_loop = screenshot_delivery::Worker(tokio::spawn(run_log_request_loop(
                 cfg.clone(),
                 http.clone(),
                 shutdown.clone(),
-            ));
+                screenshot_updates.clone(),
+                Arc::clone(&local),
+            )));
         }
 
         match &result {
@@ -3018,6 +2940,7 @@ pub async fn run(
             Ok(_) => {}
         }
 
+        let mut continue_backfill = false;
         match result {
             Ok(report) => {
                 let total = &report.total;
@@ -3046,21 +2969,9 @@ pub async fn run(
                 }
                 // Historical recovery has its own cursor and a bounded work budget.
                 // Live syncing always runs first. Failure here never rewinds it.
-                if let Err(error) =
-                    backfill::fulfill_requests(&cfg, local.as_ref(), &http, &shutdown).await
-                {
-                    warn!("enterprise backfill: will retry: {}", error);
-                }
-
-                // On-demand frame fulfillment — best-effort, gated on the
-                // frame_images stream + hosted mode inside; never affects
-                // the sync cursor or retry cycle.
-                let fr = fulfill_frame_requests(&cfg, local.as_ref(), &http).await;
-                if fr.requested > 0 {
-                    info!(
-                        "enterprise sync: frame fulfillment uploaded {}/{} requested ({} failed)",
-                        fr.uploaded, fr.requested, fr.failed
-                    );
+                match backfill::fulfill_requests(&cfg, local.as_ref(), &http, &shutdown).await {
+                    Ok(more_pending) => continue_backfill = more_pending,
+                    Err(error) => warn!("enterprise backfill: will retry: {}", error),
                 }
             }
             Err(EnterpriseSyncError::IngestAuthRejected) => {
@@ -3075,12 +2986,21 @@ pub async fn run(
             Err(_) => {}
         }
 
+        if continue_backfill {
+            if *shutdown.borrow() {
+                break;
+            }
+            // Start the next turn with live sync and fresh policy/source checks.
+            // Keep page checkpoints, transport sizes and failure retries intact.
+            tokio::task::yield_now().await;
+            continue;
+        }
         if sleep_or_shutdown(SYNC_INTERVAL, &mut shutdown).await {
             break;
         }
     }
 
-    log_request_loop.abort();
+    log_request_loop.0.abort();
     info!("enterprise sync: shutdown signal received, exiting cleanly");
 }
 
@@ -3279,14 +3199,132 @@ pub(crate) mod tests {
         assert!(handled.is_none());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn pin_failure_is_collected_without_uploading_recordings() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _mode_env = UploadModeEnvGuard::clear();
+        std::env::set_var(
+            "SCREENPIPE_ENTERPRISE_UPLOAD_MODE",
+            "direct_upload_readable",
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path(
+            "/api/enterprise/storage-binding/mode",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"desired_mode":"direct_upload"})),
+        )
+        .mount(&server)
+        .await;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&dir, format!("{}/api/enterprise/ingest", server.uri()));
+        let mut cursor = initialized_cursor();
+        cursor.save(&cfg.cursor_path).unwrap();
+        let checkpoint = std::fs::read(&cfg.cursor_path).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let local = counting_local(
+            reads.clone(),
+            vec![vec![frame(
+                1,
+                "2026-08-04T00:01:00Z",
+                "private-app",
+                "private-recording",
+            )]],
+        );
+        let recovery = TestLicenseKeyRecovery::unavailable(reads.clone());
+        let http = enterprise_http_client();
+        let error = run_reported_sync_burst(&mut cfg, &mut cursor, &local, &http, &recovery)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("upload destination pin not configured"));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        wiremock::Mock::given(wiremock::matchers::path("/api/enterprise/upload-status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(diagnostics::report(&cfg, &http, None)
+            .await
+            .unwrap()
+            .is_some());
+
+        let requested_at = "2026-08-04T00:02:00Z";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/enterprise/log-requests"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"requested":true,"requested_at":requested_at}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/logs"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"data":{
+                    "signedUrl":format!("{}/support-upload",server.uri()),
+                    "path":"logs/machine/enterprise-auto-dev-1/pin-failure.log"
+                }}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (method, path) in [
+            ("PUT", "/support-upload"),
+            ("POST", "/api/logs/confirm"),
+            ("POST", "/api/enterprise/log-requests"),
+        ] {
+            wiremock::Mock::given(wiremock::matchers::method(method))
+                .and(wiremock::matchers::path(path))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        assert_eq!(
+            fulfill_log_requests(&mut cfg, &http, None).await.as_deref(),
+            Some(requested_at)
+        );
+        let requests = server.received_requests().await.unwrap();
+        let report = requests
+            .iter()
+            .find(|r| r.url.path() == "/support-upload")
+            .unwrap();
+        let collected = String::from_utf8(report.body.clone()).unwrap();
+        assert!(collected.contains("upload destination pin not configured"));
+        assert!(collected.contains("pending data retained"));
+        assert!(!collected.contains("private-recording"));
+        assert!(requests.iter().all(|r| !matches!(
+            r.url.path(),
+            "/api/enterprise/upload-ticket"
+                | "/api/enterprise/upload-complete"
+                | "/api/enterprise/ingest"
+        )));
+        // A support refresh cannot turn the upload pin failure into admission.
+        assert!(
+            run_reported_sync_burst(&mut cfg, &mut cursor, &local, &http, &recovery)
+                .await
+                .is_err()
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&cfg.cursor_path).unwrap(), checkpoint);
+    }
+
     #[tokio::test]
-    async fn log_requests_recover_initially_blocked_policy_after_lookup_failure() {
+    async fn log_requests_revoke_stale_readable_policy_and_recover_after_lookup_failure() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let _mode_env = UploadModeEnvGuard::clear();
         let server = wiremock::MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let mut cfg = test_cfg(&dir, format!("{}/api/enterprise/ingest", server.uri()));
-        cfg.upload_mode = EnterpriseUploadMode::Blocked("startup policy unresolved".to_string());
+        cfg.upload_mode = EnterpriseUploadMode::HostedIngest;
         let http = enterprise_http_client();
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -4013,6 +4051,7 @@ pub(crate) mod tests {
         let prior_license = std::env::var("SCREENPIPE_ENTERPRISE_LICENSE_KEY").ok();
         let prior_url = std::env::var("SCREENPIPE_ENTERPRISE_INGEST_URL").ok();
         let prior_mode = std::env::var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE").ok();
+        let prior_pin = std::env::var("SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS").ok();
 
         // Case 1: no license env → None.
         std::env::remove_var("SCREENPIPE_ENTERPRISE_LICENSE_KEY");
@@ -4053,7 +4092,12 @@ pub(crate) mod tests {
         assert_eq!(cfg.ingest_url, "https://staging/ingest");
 
         // Case 5: write-only direct upload needs no local key material and
-        // derives sibling control-plane URLs from the ingest URL.
+        // derives sibling control-plane URLs from the ingest URL. Direct
+        // modes fail closed without an MDM destination pin, so deploy one.
+        std::env::set_var(
+            "SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS",
+            "storage.customer.example.com",
+        );
         std::env::set_var(
             "SCREENPIPE_ENTERPRISE_UPLOAD_MODE",
             "direct_upload_write_only",
@@ -4118,6 +4162,21 @@ pub(crate) mod tests {
         )
         .is_none());
 
+        // Case 9: an explicit direct upload mode without a destination pin
+        // (and without the escape hatch) refuses to start sync — the
+        // fail-closed default for plaintext batches.
+        std::env::remove_var("SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS");
+        std::env::set_var(
+            "SCREENPIPE_ENTERPRISE_UPLOAD_MODE",
+            "direct_upload_write_only",
+        );
+        let dir = TempDir::new().unwrap();
+        assert!(
+            EnterpriseSyncConfig::from_env(dir.path().to_path_buf(), "dev".into(), "host".into())
+                .is_none(),
+            "direct upload without a destination pin must refuse to start sync"
+        );
+
         // Restore prior state so we don't pollute other tests / the process.
         match prior_license {
             Some(v) => std::env::set_var("SCREENPIPE_ENTERPRISE_LICENSE_KEY", v),
@@ -4130,6 +4189,10 @@ pub(crate) mod tests {
         match prior_mode {
             Some(v) => std::env::set_var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE", v),
             None => std::env::remove_var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE"),
+        }
+        match prior_pin {
+            Some(v) => std::env::set_var("SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS", v),
+            None => std::env::remove_var("SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS"),
         }
     }
 
@@ -5273,13 +5336,26 @@ pub(crate) mod tests {
         assert!(!apply_rotated_device_config(&mut cfg, &remote));
     }
 
-    struct UploadModeEnvGuard(Option<String>);
+    struct UploadModeEnvGuard(Option<String>, Option<String>);
 
     impl UploadModeEnvGuard {
         fn clear() -> Self {
             let prior = std::env::var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE").ok();
             std::env::remove_var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE");
-            Self(prior)
+            Self(prior, None)
+        }
+
+        /// Like `clear`, but also deploys a destination pin for tests using
+        /// an explicit MDM upload-mode override.
+        fn pin() -> Self {
+            let prior = std::env::var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE").ok();
+            std::env::remove_var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE");
+            let prior_pin = std::env::var("SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS").ok();
+            std::env::set_var(
+                "SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS",
+                "storage.customer.example.com",
+            );
+            Self(prior, prior_pin)
         }
     }
 
@@ -5288,6 +5364,12 @@ pub(crate) mod tests {
             match self.0.take() {
                 Some(value) => std::env::set_var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE", value),
                 None => std::env::remove_var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE"),
+            }
+            match self.1.take() {
+                Some(value) => {
+                    std::env::set_var("SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS", value)
+                }
+                None => std::env::remove_var("SCREENPIPE_ENTERPRISE_UPLOAD_PINNED_HOSTS"),
             }
         }
     }
@@ -5807,7 +5889,7 @@ pub(crate) mod tests {
     async fn sync_diagnostic_reports_failed_tick_independently_and_retries_after_restart() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let _policy_guard = crate::enterprise_policy::sync_streams_test_lock();
-        let _mode_env = UploadModeEnvGuard::clear();
+        let _mode_env = UploadModeEnvGuard::pin();
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
@@ -6275,7 +6357,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn explicit_mdm_mode_resolves_without_calling_the_control_plane() {
         let _env_lock = ENV_LOCK.lock().unwrap();
-        let _mode_env = UploadModeEnvGuard(std::env::var("SCREENPIPE_ENTERPRISE_UPLOAD_MODE").ok());
+        let _mode_env = UploadModeEnvGuard::pin();
         std::env::set_var(
             "SCREENPIPE_ENTERPRISE_UPLOAD_MODE",
             "direct_upload_write_only",
@@ -8502,6 +8584,89 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn screenshots_progress_while_metadata_read_is_stalled() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, ResponseTemplate,
+        };
+        let _guard = crate::enterprise_policy::sync_streams_test_lock();
+        let _restore = RestoreDefaultSyncStreams;
+        crate::enterprise_policy::set_sync_streams(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            "off".into(),
+            "all".into(),
+        );
+        struct Stalled;
+        #[async_trait::async_trait]
+        impl LocalApiClient for Stalled {
+            async fn fetch_frames_since(
+                &self,
+                _: Option<&str>,
+                _: u32,
+                _: u32,
+            ) -> Result<Vec<FrameRow>, EnterpriseSyncError> {
+                std::future::pending().await
+            }
+            async fn fetch_audio_since(
+                &self,
+                _: Option<&str>,
+                _: u32,
+                _: u32,
+            ) -> Result<Vec<AudioRow>, EnterpriseSyncError> {
+                Ok(vec![])
+            }
+            async fn fetch_frame_jpeg(
+                &self,
+                _: i64,
+            ) -> Result<Option<Vec<u8>>, EnterpriseSyncError> {
+                Ok(Some(synth_jpeg(16, 16)))
+            }
+        }
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/enterprise/storage-binding/mode"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"desired_mode":"hosted_ingest"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/enterprise/frame-requests"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"frame_ids":[1]})),
+            )
+            .mount(&server)
+            .await;
+        let uploaded = Arc::new(tokio::sync::Notify::new());
+        let receipt = Arc::clone(&uploaded);
+        Mock::given(method("POST"))
+            .and(path("/api/enterprise/frame-uploads"))
+            .respond_with(move |_: &wiremock::Request| {
+                receipt.notify_one();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"stored":[1]}))
+            })
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let cfg = frame_test_cfg(&server.uri(), &dir);
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run(cfg, Arc::new(Stalled), shutdown, None));
+        let result = tokio::time::timeout(Duration::from_secs(3), uploaded.notified()).await;
+        worker.abort();
+        let _ = worker.await;
+        assert!(
+            result.is_ok(),
+            "accepted screenshot was stranded behind a pending metadata read"
+        );
+    }
+
+    #[tokio::test]
     async fn fulfill_frame_requests_end_to_end() {
         for readable in [false, true] {
             for frame_mode in ["cited", "all"] {
@@ -8542,7 +8707,7 @@ pub(crate) mod tests {
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "stored": [1], "failed": [] })),
             )
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -8571,12 +8736,16 @@ pub(crate) mod tests {
         // and the two failure modes reported so the server can
         // drop those ids from the manifest.
         let reqs = server.received_requests().await.unwrap();
-        let upload = reqs
+        let frames: Vec<serde_json::Value> = reqs
             .iter()
-            .find(|r| r.url.path() == "/api/enterprise/frame-uploads")
-            .expect("upload request was made");
-        let body: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
-        let frames = body["frames"].as_array().unwrap();
+            .filter(|r| r.url.path() == "/api/enterprise/frame-uploads")
+            .flat_map(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["frames"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0]["frame_id"], 1);
         assert_eq!(frames[0]["mime"], "image/jpeg");

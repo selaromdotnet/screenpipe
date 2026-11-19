@@ -7044,6 +7044,82 @@
         ],
         "command": "bun test apps/screenpipe-app-tauri/components/settings/hooks/eval-hidden-custom-headers.test.js"
       }
+    },
+    {
+      "id": "gateway-fable-tool-continuation",
+      "name": "Complete Fable tool-result continuations without replay",
+      "source": {
+        "kind": "git_regression",
+        "fix_commit": "34c8d0939c8865dd04e20fddf3c61adf2c7db9a5"
+      },
+      "base_ref": "b44633101f62d14427a8ef9b18640cd3808b4af5",
+      "oracle_ref": "34c8d0939c8865dd04e20fddf3c61adf2c7db9a5",
+      "oracle_paths": [
+        "packages/ai-gateway/src/providers/index.ts",
+        "packages/ai-gateway/src/providers/experiential-fable.ts"
+      ],
+      "gate": "advisory",
+      "trigger_paths": [
+        "packages/ai-gateway/src/providers"
+      ],
+      "tags": [
+        "regression",
+        "gateway",
+        "preserved-behavior"
+      ],
+      "prompt": "A hosted Fable conversation can end with no assistant content after a tool result when further tool use is disabled. Repair streamed and JSON continuations so the available provider response reaches the caller. Select a working request before dispatch; do not replay a paid request to hide an empty response. Preserve the requested output-token budget, server policy headers, reported input/output token usage and supplied input objects. Ordinary tool-choice turns must still complete and explicit native-provider rollback must keep using its requested native protocol. Keep existing provider interfaces usable. Add focused tests using synthetic transport responses, with no live model or customer requests.",
+      "agent_timeout_seconds": 900,
+      "grader": {
+        "timeout_seconds": 60,
+        "fixtures": [
+          {
+            "local_path": "graders/fable-tool-continuation.test.ts.txt",
+            "destination_path": "evals/coding-agent/graders/fable-tool-continuation.test.ts"
+          }
+        ],
+        "command": "\"${BUN_BIN:-bun}\" test evals/coding-agent/graders/fable-tool-continuation.test.ts"
+      },
+      "grader_dependency_links": [
+        {
+          "source_path": "node_modules",
+          "destination_path": "node_modules"
+        }
+      ]
+    },
+    {
+      "id": "app-orphan-guard-one-shot-stdin",
+      "name": "Keep one-shot work alive after prompt stdin closes",
+      "source": {
+        "kind": "git_regression",
+        "fix_commit": "686a2c9058f702ae9f6acfbf97c306281272d7b8"
+      },
+      "base_ref": "3aea8df68f66d3a20e19093be47432b3bee476cf",
+      "oracle_ref": "686a2c9058f702ae9f6acfbf97c306281272d7b8",
+      "oracle_paths": [
+        "crates/screenpipe-core/assets/extensions/orphan-guard.ts"
+      ],
+      "gate": "advisory",
+      "trigger_paths": [
+        "crates/screenpipe-core/assets/extensions/orphan-guard.ts"
+      ],
+      "prompt": "One-shot pipe runs terminate before producing work when their prompt input closes. Preserve one-shot work after stdin end or close. RPC sessions must still exit when their stdin ends or closes. In both modes preserve work while the original parent remains healthy, and exit when the parent PID changes or the parent no longer exists.",
+      "grader": {
+        "timeout_seconds": 60,
+        "fixtures": [
+          {
+            "local_path": "graders/orphan-guard-stdin.test.ts.txt",
+            "destination_path": "eval-hidden-orphan.test.ts"
+          }
+        ],
+        "command": "bun test ./eval-hidden-orphan.test.ts"
+      },
+      "tags": [
+        "regression",
+        "escaped-failure",
+        "pipes",
+        "lifecycle",
+        "stdin"
+      ]
     }
   ]
 }

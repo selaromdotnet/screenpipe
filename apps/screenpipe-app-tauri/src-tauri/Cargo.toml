@@ -7,7 +7,7 @@ members = ["wer-dump-helper", "windows/persistence-supervisor", "release-router-
 
 [package]
 name = "screenpipe-app"
-version = "2.7.128"
+version = "2.7.153"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -298,6 +298,7 @@ e2e = [
   "screenpipe-screen/e2e",
   "screenpipe-engine/e2e",
 ]
+storage-fault-injection = ["screenpipe-db/storage-fault-injection"]
 
 # Local personal builds only (see scripts/local-build/build.ps1): mirrors the
 # frontend's NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS flag on the Rust side
@@ -355,7 +356,7 @@ tauri = { version = "=2.11.2", features = ["test"] }
 minisign = "0.7"
 
 [target.'cfg(windows)'.dev-dependencies]
-audiopipe = { git = "https://github.com/EzraEllette/audiopipe.git", rev = "b099a2e589d0dc4d8f22e3e8351efea9e1a359ac", default-features = false, features = ["parakeet", "directml"] }
+audiopipe = { git = "https://github.com/EzraEllette/audiopipe.git", rev = "eb660d74867a6492ebf68ad4798bdc74d3902fd7", default-features = false, features = ["parakeet", "directml"] }
 whisper-rs = { git = "https://github.com/EzraEllette/whisper-rs.git", rev = "b649c3fccc8dcee4512c2778b049e64aa2d15978", features = ["tracing_backend"] }
 
 

@@ -410,12 +410,7 @@ export type Settings = SettingsStore & {
 	openaiCompatibleHeaders?: Record<string, string>;
 	/** Send raw WAV audio instead of MP3 to OpenAI-compatible endpoint */
 	openaiCompatibleRawAudio?: boolean;
-	/** Let Pi / Claude Code call the confidential cloud enclave
-	 * (Gemma 4 E4B inside an attested Tinfoil CVM) to analyze audio,
-	 * video frames, and images from screenpipe data. Default true. When
-	 * false, the "Cloud audio + video + image analysis" section is
-	 * stripped from `~/.claude/skills/screenpipe-api/SKILL.md` so agents
-	 * literally cannot see the endpoint and won't try to call it. */
+	/** @deprecated Retained only to read old settings. Cloud media analysis is retired. */
 	cloudMediaAnalysisEnabled?: boolean;
 	/** Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise) */
 	filterMusic?: boolean;
@@ -827,6 +822,7 @@ let DEFAULT_SETTINGS: Settings = {
 			starSessionShortcut: "Control+Super+B",
 			disableVision: false,
 			disableScreenshots: false,
+			focusedWindowScreenshots: false,
 			enableSemanticContext: true,
 			remoteControlPreferences: {
 				...NEW_INSTALL_REMOTE_CONTROL_PREFERENCES,
@@ -927,7 +923,9 @@ export function normalizeSettingsArrays(settings: Settings): boolean {
 	};
 	let changed = false;
 	const presets = settings.aiPresets;
-	if (!Array.isArray(presets) || presets.length === 0) {
+	const managedAiPolicy = settings.enterpriseAiPresetPolicy;
+	const nativeManagedAi = managedAiPolicy && typeof managedAiPolicy === "object" && !Array.isArray(managedAiPolicy) && managedAiPolicy.version === 2;
+	if (!Array.isArray(presets) || (presets.length === 0 && !nativeManagedAi)) {
 		settings.aiPresets = [defaults.aiPresets[0]] as any;
 		changed = true;
 	}
@@ -1119,7 +1117,7 @@ async function activeManagedValues(
 
 // Store utilities similar to Cap's implementation
 function createSettingsStore() {
-	const get = async (): Promise<Settings> => {
+	const get = async (persistMigrations = true): Promise<Settings> => {
 		const store = await getStore();
 		const settings = await store.get<Settings>("settings");
 		// Existing explicit choices do not need a build-identity lookup.
@@ -1470,7 +1468,7 @@ function createSettingsStore() {
 			}
 
 		// Save migrations if needed
-		if (needsUpdate) {
+		if (needsUpdate && persistMigrations) {
 			await setSettingsStripped(store, settings);
 			await saveAndEncrypt(store);
 		}
@@ -1478,17 +1476,21 @@ function createSettingsStore() {
 		// Remove browser-only values only after the durable app setting exists.
 		// This makes the migration one-shot without risking data loss on a failed
 		// settings write.
-		if (shouldMigrateUserGoal) clearLegacyUserGoalCategory();
+		if (shouldMigrateUserGoal && persistMigrations) clearLegacyUserGoalCategory();
 
 		return settings;
 	};
 
-	const set = (value: Partial<Settings>) =>
+	const set = (value: Partial<Settings>, isCurrent = () => true) =>
 		enqueueSettingsStoreWrite(async () => {
+			if (!isCurrent()) return;
 			assertValidAiPresetUpdate(value);
 			const store = await getStore();
-			const current = await get();
+			// Merge first, then persist once. Writing migrations here would mirror
+			// the preceding account token while a sign-out is clearing it.
+			const current = await get(false);
 			const managedValues = await activeManagedValues(current);
+			if (!isCurrent()) return;
 			if (current.workflowSharing && value.workflowSharing !== null && value.piiBackend !== undefined && value.piiBackend !== "tinfoil") {
 				throw new Error("Turn off Workflows sharing before changing cloud redaction.");
 			}
@@ -1936,7 +1938,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		applyFontSize(settings.fontSize);
 	}, [settings.fontSize]);
 
-	const updateSettings = async (updates: Partial<Settings>) => {
+	const updateSettings = async (updates: Partial<Settings>, isCurrent = () => true) => {
+		if (!isCurrent()) return;
 		if (settingsRef.current.workflowSharing && updates.workflowSharing !== null &&
 			updates.piiBackend !== undefined && updates.piiBackend !== "tinfoil") {
 			throw new Error("Turn off Workflows sharing before changing cloud redaction.");
@@ -1975,7 +1978,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			emit("screenpipe-auth-signout").catch(() => {});
 		}
 		try {
-			await settingsStore.set(updates);
+			await settingsStore.set(updates, isCurrent);
 		} catch (error) {
 			// Do not let an older failed write overwrite a newer optimistic click.
 			// The queued newer write (and its store event) owns reconciliation.
@@ -2135,7 +2138,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				// Preserve the authenticated identity so the user can retry, but
 				// replace any cached paid state with this unknown state immediately.
 				// setCloudToken then refreshes the native PipeManager's safe cap.
-				await updateSettings({ user: userData });
+				await updateSettings({ user: userData }, requestStillCurrent);
+				if (!requestStillCurrent()) return;
 				try {
 					await commands.setCloudToken(token);
 				} catch (e) {
@@ -2164,7 +2168,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				}
 			}
 
-			await updateSettings({ user: userData });
+			await updateSettings({ user: userData }, requestStillCurrent);
+			// Persistence can yield while logout invalidates this refresh. Never
+			// re-send its token to native storage after the sign-out deletion.
+			if (!requestStillCurrent()) return;
 
 			// Push the fresh token into the running sidecar so the
 			// `Server.cloud_token` (used by /v1/chat/completions proxy) and

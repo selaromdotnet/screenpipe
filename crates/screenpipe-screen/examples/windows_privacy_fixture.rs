@@ -1,0 +1,251 @@
+// screenpipe — AI that knows everything you've seen, said, or heard
+// https://screenpipe.com
+
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(not(target_os = "windows"), allow(dead_code, unused_imports))]
+
+#[cfg(target_os = "windows")]
+mod windows_harness {
+    use anyhow::Result;
+    use std::{thread, time::Duration};
+    use windows::{
+        core::w,
+        Win32::{
+            Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+            Graphics::Gdi::{
+                BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, SetBkMode,
+                SetTextColor, TextOutW, HDC, PAINTSTRUCT, TRANSPARENT,
+            },
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
+                LoadCursorW, RegisterClassW, SetLayeredWindowAttributes, ShowWindow,
+                TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, LWA_ALPHA, MSG, SW_MAXIMIZE,
+                SW_SHOW, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WM_DESTROY, WM_PAINT, WM_PRINT,
+                WM_PRINTCLIENT, WNDCLASSW, WS_EX_LAYERED, WS_OVERLAPPEDWINDOW, WS_POPUP,
+                WS_VISIBLE,
+            },
+        },
+    };
+
+    const ALLOWED: COLORREF = COLORREF(0x00ff_ff00);
+    const BLOCKED: COLORREF = COLORREF(0x00ff_00ff);
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowPos(
+            hwnd: isize,
+            insert_after: isize,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                let state = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                    hwnd,
+                    WINDOW_LONG_PTR_INDEX(0),
+                );
+                let color = match state {
+                    1 => BLOCKED,
+                    2 => COLORREF(0x0000_00ff),
+                    _ => ALLOWED,
+                };
+                let brush = CreateSolidBrush(color);
+                FillRect(dc, &paint.rcPaint, brush);
+                let label = if state == 1 {
+                    "EXCLUDED VIOLET 8642"
+                } else {
+                    "ALLOWED ORBIT 7319"
+                };
+                let wide: Vec<u16> = label.encode_utf16().collect();
+                let _ = SetBkMode(dc, TRANSPARENT);
+                let _ = SetTextColor(dc, COLORREF(0x00ff_ffff));
+                let _ = TextOutW(dc, 48, 96, &wide);
+                let _ = DeleteObject(brush);
+                let _ = EndPaint(hwnd, &paint);
+                LRESULT(0)
+            }
+            WM_PRINT | WM_PRINTCLIENT => {
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                let state = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                    hwnd,
+                    WINDOW_LONG_PTR_INDEX(0),
+                );
+                let color = match state {
+                    1 => BLOCKED,
+                    2 => COLORREF(0x0000_00ff),
+                    _ => ALLOWED,
+                };
+                let brush = CreateSolidBrush(color);
+                FillRect(HDC(wparam.0 as *mut _), &client, brush);
+                let dc = HDC(wparam.0 as *mut _);
+                let label = if state == 1 {
+                    "EXCLUDED VIOLET 8642"
+                } else {
+                    "ALLOWED ORBIT 7319"
+                };
+                let wide: Vec<u16> = label.encode_utf16().collect();
+                let _ = SetBkMode(dc, TRANSPARENT);
+                let _ = SetTextColor(dc, COLORREF(0x00ff_ffff));
+                let _ = TextOutW(dc, 48, 96, &wide);
+                let _ = DeleteObject(brush);
+                LRESULT(0)
+            }
+            WM_DESTROY => LRESULT(0),
+            _ => DefWindowProcW(hwnd, message, wparam, lparam),
+        }
+    }
+
+    pub fn run_window(kind: &str, x: i32, y: i32) -> Result<()> {
+        unsafe {
+            let blocked = matches!(kind, "blocked" | "blocked-red" | "churn");
+            let module = GetModuleHandleW(None).unwrap_or_default();
+            let class_name = if blocked {
+                w!("PrivacyBlockedFixture")
+            } else {
+                w!("PrivacyAllowedFixture")
+            };
+            let class = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(window_proc),
+                cbWndExtra: std::mem::size_of::<isize>() as i32,
+                hInstance: HINSTANCE(module.0),
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&class);
+            let title = if kind == "blank" {
+                ""
+            } else if blocked {
+                "PrivacyBlocked EXCLUDED VIOLET 8642"
+            } else {
+                "PrivacyAllowed ALLOWED ORBIT 7319"
+            };
+            let title_wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+            let ex_style = if kind == "transparent" {
+                WS_EX_LAYERED
+            } else {
+                WINDOW_EX_STYLE::default()
+            };
+            let style = if kind == "borderless" || kind == "transparent" {
+                WS_POPUP | WS_VISIBLE
+            } else {
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE
+            };
+            let hwnd = CreateWindowExW(
+                ex_style,
+                class_name,
+                windows::core::PCWSTR(title_wide.as_ptr()),
+                style,
+                x,
+                y,
+                520,
+                420,
+                None,
+                None,
+                HINSTANCE(module.0),
+                None,
+            )
+            .unwrap_or_default();
+            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                hwnd,
+                WINDOW_LONG_PTR_INDEX(0),
+                if kind == "blocked-red" {
+                    2
+                } else {
+                    isize::from(blocked)
+                },
+            );
+            if kind == "transparent" {
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 128, LWA_ALPHA);
+            }
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            if kind == "maximized" {
+                let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+            }
+            if matches!(kind, "churn" | "allowed-churn") {
+                let raw = hwnd.0 as usize;
+                let fixed_topmost = kind == "allowed-churn";
+                thread::spawn(move || loop {
+                    // Keep the synthetic fixture above the test runner while
+                    // still exercising both sides of the allowed window's Z order.
+                    for (next_x, next_y, order) in [(220, 210, -1), (360, 300, -2)] {
+                        let order = if fixed_topmost { -1 } else { order };
+                        let _ = SetWindowPos(
+                            raw as isize,
+                            order,
+                            next_x,
+                            next_y,
+                            0,
+                            0,
+                            0x0001 | 0x0010,
+                        );
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                });
+            } else {
+                let _ = SetWindowPos(hwnd.0 as isize, -1, x, y, 0, 0, 0x0001 | 0x0010);
+            }
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let kind = args.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "usage: windows_privacy_fixture <allowed|allowed-churn|blocked|blocked-red|blank|borderless|transparent|maximized|churn> <x> <y>"
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(
+            kind.as_str(),
+            "allowed"
+                | "allowed-churn"
+                | "blocked"
+                | "blocked-red"
+                | "blank"
+                | "borderless"
+                | "transparent"
+                | "maximized"
+                | "churn"
+        ),
+        "unknown fixture window"
+    );
+    let x = args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing x"))?
+        .parse()?;
+    let y = args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing y"))?
+        .parse()?;
+    windows_harness::run_window(&kind, x, y)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("windows_privacy_fixture is Windows-only");
+}

@@ -40,9 +40,9 @@ try {
   await page.getByRole('dialog', { name: 'Turn off local workflow processing?' }).waitFor({ state: 'hidden' });
   assert.equal(await page.getByRole('combobox', { name: 'Workflow source' }).inputValue(), 'cloud',
     'Enterprise entry must default to the cloud catalog without a query-string source override');
-  await page.getByRole('heading', { name: 'Your workflows', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Workflows', exact: true }).waitFor();
   await capture('enterprise-cloud-after');
-  await page.locator('article').filter({ has: page.getByRole('heading', { name: 'Research synthesis', exact: true }) }).getByRole('button', { name: 'Open map' }).click();
+  await page.locator('article').filter({ has: page.getByRole('heading', { name: 'Research synthesis', exact: true }) }).getByRole('button').click();
   await page.getByRole('heading', { name: 'Collect sources', exact: true }).waitFor();
   await page.getByRole('group', {name: 'Switch workspace', exact: true}).getByRole('button', {name: 'Memory', exact: true}).click();
   await page.getByRole('group', { name: 'Switch workspace', exact: true }).waitFor();

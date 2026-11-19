@@ -254,7 +254,8 @@ static REQUIRED_PI_PACKAGE_INSTALL_LOCK: std::sync::OnceLock<Mutex<()>> =
 static PI_EXTENSION_SAFE_MODE_PROJECTS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::OnceLock::new();
 
-const MANAGED_PI_EXTENSION_FILES: [&str; 10] = [
+const MANAGED_PI_EXTENSION_FILES: [&str; 11] = [
+    "answer-recovery.ts",
     "web-search.ts",
     "mcp-bridge.ts",
     "save-artifact.ts",
@@ -1828,6 +1829,13 @@ fn ensure_context_pruning_extension(project_dir: &str) -> Result<(), String> {
 /// makes that class of drift impossible; only the deliberately different
 /// web-search variant stays per-branch.
 fn ensure_shared_pi_extensions(project_dir: &str) -> Result<(), String> {
+    let ext_dir = Path::new(project_dir).join(".pi").join("extensions");
+    std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        ext_dir.join("answer-recovery.ts"),
+        include_str!("../assets/extensions/answer-recovery.ts"),
+    )
+    .map_err(|e| format!("Failed to install answer-recovery extension: {}", e))?;
     ensure_self_improvement_extension(project_dir)?;
     ensure_chat_control_extension(project_dir)?;
     ensure_context_usage_extension(project_dir)?;
@@ -1853,6 +1861,7 @@ fn ensure_shared_pi_extensions(project_dir: &str) -> Result<(), String> {
 /// The files [`ensure_shared_pi_extensions`] writes, for the parity assertion.
 #[cfg(test)]
 const SHARED_PI_EXTENSION_FILES: &[&str] = &[
+    "answer-recovery.ts",
     "self-improvement.ts",
     "chat-control.ts",
     "context-usage.ts",
@@ -5507,24 +5516,6 @@ fn pi_package_source_looks_installed(source: &str) -> bool {
     true
 }
 
-fn ensure_pi_package_manager_settings(bun: &str) -> Result<(), String> {
-    let mut settings = read_pi_settings()?;
-    if !settings.is_object() {
-        settings = json!({});
-    }
-
-    let obj = settings
-        .as_object_mut()
-        .ok_or_else(|| "Pi settings must be a JSON object".to_string())?;
-
-    if !obj.contains_key("npmCommand") {
-        obj.insert("npmCommand".to_string(), json!([bun]));
-        write_pi_settings(&settings)?;
-    }
-
-    Ok(())
-}
-
 fn package_command_failure(action: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5580,7 +5571,11 @@ fn prepend_to_command_path(cmd: &mut Command, path: &Path) {
 
 fn run_pi_package_command_blocking(args: Vec<String>) -> Result<(), String> {
     let (bun, pi_path) = ensure_pi_cli_for_package_command()?;
-    ensure_pi_package_manager_settings(&bun)?;
+    screenpipe_core::agents::pi::ensure_pi_package_manager_settings(
+        &get_pi_config_dir()?,
+        &bun,
+    )
+    .map_err(|error| format!("Failed to update Pi package-manager settings: {error}"))?;
 
     let project_dir = screenpipe_core::paths::default_screenpipe_data_dir().join("pi-chat");
     std::fs::create_dir_all(&project_dir)

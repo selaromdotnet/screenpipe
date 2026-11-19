@@ -14,10 +14,14 @@ use std::sync::{Arc, RwLock};
 mod linux;
 #[cfg(target_os = "linux")]
 mod linux_portal;
+#[cfg(target_os = "linux")]
+mod linux_portal_token;
 #[cfg(any(target_os = "linux", test))]
 mod linux_wayland;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::sck_capture_max_width;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -130,6 +134,12 @@ pub struct SafeMonitor {
     /// Lazy-initialized on first capture_image() call.
     #[cfg(target_os = "windows")]
     persistent_capture: Arc<std::sync::Mutex<Option<crate::wgc_capture::PersistentCapture>>>,
+    /// Display stream owned only by sustained recording and privacy capture.
+    /// Legacy one-shot callers must never drain or close this source.
+    #[cfg(target_os = "windows")]
+    recorder_capture: Arc<std::sync::Mutex<Option<windows::RecorderCapture>>>,
+    #[cfg(target_os = "windows")]
+    privacy_session: Arc<crate::screenshot_privacy::WindowsPrivacySession>,
     /// If true, skip persistent capture and use per-frame fallback for this session.
     #[cfg(target_os = "windows")]
     persistent_capture_disabled: Arc<AtomicBool>,
@@ -273,6 +283,10 @@ mod tests {
             portal_capture: linux_portal::shared_portal_capture(),
             #[cfg(target_os = "windows")]
             persistent_capture: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            recorder_capture: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            privacy_session: Arc::new(crate::screenshot_privacy::WindowsPrivacySession::default()),
             #[cfg(target_os = "windows")]
             persistent_capture_disabled: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "windows")]

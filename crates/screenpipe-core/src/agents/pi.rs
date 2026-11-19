@@ -19,6 +19,25 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 static USER_SKILL_SYNC_LOCK: Mutex<()> = Mutex::new(());
+static PI_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Backend runner accounting only; never infer a tenant from prompts or change auth.
+fn cloud_pipe_headers(enterprise_hash: Option<&str>) -> serde_json::Value {
+    let mut headers = json!({
+        "x-screenpipe-latency": "background",
+        "x-screenpipe-workload": "pipe"
+    });
+    if let Some(hash) = enterprise_hash.filter(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        headers["X-Screenpipe-Enterprise-Id-Hash"] = json!(hash);
+        headers["X-Screenpipe-AI-Operation"] = json!("cloud-pipes");
+    }
+    headers
+}
 
 struct PiPromptInput {
     user_prompt: std::fs::File,
@@ -270,10 +289,71 @@ impl KillOnDropJob {
 }
 
 #[cfg(windows)]
+async fn retain_child_job_or_recover_completion(
+    child: &mut tokio::process::Child,
+    assignment: std::io::Result<KillOnDropJob>,
+    description: &str,
+) -> Result<Option<KillOnDropJob>> {
+    match assignment {
+        Ok(job) => Ok(Some(job)),
+        Err(assignment_error) => {
+            // ACP commands first enter the process guard's own kill-on-close Job.
+            // Therefore a completed guard cannot leave an uncontained wrapped tree.
+            // Non-ACP builds have no equivalent guarantee and always fail closed.
+            #[cfg(feature = "acp")]
+            let observation = match child.try_wait() {
+                Ok(Some(status)) => {
+                    warn!(
+                        "{description} exited with {status} before outer cleanup Job assignment ({assignment_error}); preserving its completed result because the ACP process guard already contained the tree"
+                    );
+                    return Ok(None);
+                }
+                Ok(None) => "live child observed".to_string(),
+                Err(error) => format!("failed: {error}"),
+            };
+
+            #[cfg(not(feature = "acp"))]
+            let observation = "not attempted (ACP process guard unavailable)".to_string();
+
+            let kill_result = child.start_kill();
+            let wait_result = child.wait().await;
+            Err(anyhow!(
+                "failed to contain {description}: {assignment_error}; process-state observation: {}; cleanup request: {}; reap: {}",
+                observation,
+                kill_result
+                    .err()
+                    .map_or_else(|| "accepted".to_string(), |error| error.to_string()),
+                wait_result
+                    .err()
+                    .map_or_else(|| "completed".to_string(), |error| error.to_string())
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn install_live_child_pid(child: &tokio::process::Child, shared_pid: &super::SharedPid) {
+    if let Some(pid) = child.id() {
+        if install_spawned_pid(shared_pid, pid) {
+            let _ = kill_process_group(pid);
+        }
+    }
+}
+
+#[cfg(windows)]
 impl Drop for KillOnDropJob {
     fn drop(&mut self) {
         unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
+            // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE makes CloseHandle the native
+            // termination request for every process still assigned to the job.
+            // Stop remains asynchronous; callers must not treat guard drop as
+            // proof that Windows has finished process teardown.
+            if windows_sys::Win32::Foundation::CloseHandle(self.0) == 0 {
+                error!(
+                    "failed to close Windows process cleanup job: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
     }
 }
@@ -526,6 +606,19 @@ async fn fetch_models_from_gateway(
     Some(json!(models))
 }
 
+fn retired_enclave_model(model: &str) -> bool {
+    matches!(
+        model
+            .trim()
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "glm-5.3-flash-reap50-iq3m" | "gemma4-e4b" | "gemma4-e2b"
+    )
+}
+
 /// Turn the gateway catalog into Pi's provider catalog. The gateway retains
 /// locked models for UI upgrade prompts, while Pi treats every listed model as
 /// selectable. Omit locked entries here so a pipe never appears to select a
@@ -533,6 +626,7 @@ async fn fetch_models_from_gateway(
 fn gateway_models_to_pi_models(data: &[serde_json::Value]) -> Vec<serde_json::Value> {
     data.iter()
         .filter(|m| !m.get("locked").and_then(|v| v.as_bool()).unwrap_or(false))
+        .filter(|m| !retired_enclave_model(m.get("id").and_then(|v| v.as_str()).unwrap_or("")))
         .map(|m| {
             let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let name = m.get("name").and_then(|v| v.as_str()).unwrap_or(id);
@@ -557,9 +651,8 @@ fn gateway_models_to_pi_models(data: &[serde_json::Value]) -> Vec<serde_json::Va
                 "id": id,
                 "name": name,
                 "reasoning": reasoning,
-                // A distinct API fails closed when its secure extension is absent.
-                "api": if id == "glm-5.3-flash-reap50-iq3m" { "screenpipe-tinfoil" } else { "openai-completions" },
-                "input": if id == "glm-5.3-flash-reap50-iq3m" { json!(["text"]) } else { json!(["text", "image"]) },
+                "api": "openai-completions",
+                "input": ["text", "image"],
                 "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 "contextWindow": ctx,
                 "maxTokens": max_tokens,
@@ -702,43 +795,10 @@ impl PiExecutor {
         self
     }
 
-    /// User policy: when the marker file
-    /// `<data_dir>/cloud_media_analysis.disabled` exists, the
-    /// screenpipe-api skill is installed WITHOUT the Gemma 4 E4B
-    /// confidential-enclave block. Default (no marker) = enabled, so
-    /// fresh installs ship the capability documented and Pi knows to
-    /// call `api.screenpipe.com` with `model: "gemma4-e4b"` for audio /
-    /// video / image analysis.
-    ///
-    /// Gating happens at install time (here) rather than by mutating
-    /// the rendered SKILL.md after the fact — those copies get
-    /// overwritten on every Pi run, so post-install edits don't stick.
-    fn cloud_media_analysis_enabled() -> bool {
-        // Data-dir scoped, not `~/.screenpipe` scoped: a dev or relocated
-        // instance must read the marker its own Settings toggle wrote, not
-        // another install's. Identical path for a default install.
-        !crate::paths::default_screenpipe_data_dir()
-            .join("cloud_media_analysis.disabled")
-            .exists()
-    }
-
     fn render_screenpipe_api_skill() -> String {
-        let mut s = String::from(include_str!("../../assets/skills/screenpipe-api/SKILL.md"));
-        if Self::cloud_media_analysis_enabled() {
-            // Trim trailing whitespace before appending so we don't
-            // accumulate blank lines on rebuild.
-            while s.ends_with(char::is_whitespace) {
-                s.pop();
-            }
-            s.push('\n');
-            s.push('\n');
-            s.push_str(
-                include_str!("../../assets/skills/screenpipe-api/cloud_media_analysis_block.md")
-                    .trim_end(),
-            );
-            s.push('\n');
-        }
-        s
+        // The retired Gemma media capability must not be reinstalled, even when
+        // an older settings file still says cloudMediaAnalysisEnabled=true.
+        String::from(include_str!("../../assets/skills/screenpipe-api/SKILL.md"))
     }
 
     /// Install or wipe the `screenpipe-team` enterprise-admin skill under an
@@ -1300,25 +1360,14 @@ impl PiExecutor {
     }
 
     pub fn ensure_tinfoil_extension(project_dir: &Path) -> Result<()> {
-        let ext_dir = project_dir.join(".pi").join("extensions");
-        std::fs::create_dir_all(ext_dir.join("lib"))?;
-        let package_json = crate::paths::default_screenpipe_data_dir()
-            .join("pi-agent")
-            .join("package.json");
-        let source = include_str!("../../assets/extensions/tinfoil.ts").replace(
-            "__SCREENPIPE_PI_PACKAGE_JSON__",
-            &serde_json::to_string(&package_json.to_string_lossy())?,
-        );
-        std::fs::write(ext_dir.join("tinfoil.ts"), source)?;
-        std::fs::write(
-            ext_dir.join("lib").join("tinfoil-transport.ts"),
-            include_str!("../../assets/extensions/lib/tinfoil-transport.ts"),
-        )?;
-        std::fs::write(
-            ext_dir.join("lib").join("glm-protocol.ts"),
-            include_str!("../../assets/extensions/lib/glm-protocol.ts"),
-        )?;
-        Ok(())
+        // Remove only the app-owned entry point from previous installations.
+        // Other extensions and cached libraries are left untouched.
+        let path = project_dir.join(".pi/extensions/tinfoil.ts");
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn ensure_gemini_extension(project_dir: &Path) -> Result<()> {
@@ -1438,6 +1487,13 @@ impl PiExecutor {
         model: Option<&str>,
         provider_url: Option<&str>,
     ) -> Result<()> {
+        if matches!(
+            provider,
+            None | Some("screenpipe" | "screenpipe-cloud" | "pi")
+        ) && model.is_some_and(retired_enclave_model)
+        {
+            anyhow::bail!("model_retired: This confidential AI model is no longer available. Choose another AI model. No request was sent to another provider.");
+        }
         let config_dir = get_pi_config_dir()?;
         std::fs::create_dir_all(&config_dir)?;
 
@@ -1501,10 +1557,7 @@ impl PiExecutor {
                 "api": "openai-completions",
                 "apiKey": api_key_value,
                 "authHeader": true,
-                "headers": {
-                    "x-screenpipe-latency": "background",
-                    "x-screenpipe-workload": "pipe"
-                },
+                "headers": cloud_pipe_headers(std::env::var("SCREENPIPE_ENTERPRISE_ID_HASH").ok().as_deref()),
                 "models": models
             });
 
@@ -1741,7 +1794,7 @@ impl PiExecutor {
         provider: &str,
     ) -> (String, Option<String>) {
         let base = Self::resolve_model(requested, provider);
-        if provider != "screenpipe" {
+        if provider != "screenpipe" || retired_enclave_model(&base) {
             return (base, None);
         }
 
@@ -1811,7 +1864,7 @@ impl PiExecutor {
     fn pick_allowed_model(requested: &str, allowed: &[String]) -> Result<String, String> {
         // Confidential selection is a transport promise. An unavailable model
         // must fail rather than downgrade to a plaintext hosted provider.
-        if requested == "glm-5.3-flash-reap50-iq3m" {
+        if retired_enclave_model(requested) {
             return Ok(requested.to_string());
         }
         // No catalog, or only the gateway fallback sentinel → we
@@ -1871,7 +1924,7 @@ impl PiExecutor {
             user_prompt,
             system_prompt,
         } = prepare_pi_prompt_input(prompt, pipe_system_prompt)?;
-        let mut cmd = build_async_command(pi_path);
+        let mut cmd = build_async_command(pi_path)?;
         cmd.current_dir(working_dir);
         apply_pi_isolation_env(&mut |k, v| {
             cmd.env(k, v);
@@ -1951,24 +2004,24 @@ impl PiExecutor {
         #[cfg(windows)]
         cmd.creation_flags(BACKGROUND_SPAWN_FLAGS);
 
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
         let pid = child.id();
 
         #[cfg(windows)]
-        let _process_tree_guard = match KillOnDropJob::assign(&child) {
-            Ok(job) => Some(job),
-            Err(error) => {
-                warn!(
-                    "failed to assign pi process {} to cleanup job: {}",
-                    pid.unwrap_or_default(),
-                    error
-                );
-                None
-            }
-        };
+        let assignment = KillOnDropJob::assign(&child);
+        #[cfg(windows)]
+        let _process_tree_guard = retain_child_job_or_recover_completion(
+            &mut child,
+            assignment,
+            &format!("pi process {}", pid.unwrap_or_default()),
+        )
+        .await?;
+        #[cfg(windows)]
+        let pid = child.id();
 
         // Set PID synchronously. If a stop was requested before spawn
         // completed, honor it immediately against the fresh process group.
+        #[cfg(unix)]
         if let (Some(ref sp), Some(p)) = (&shared_pid, pid) {
             if install_spawned_pid(sp, p) {
                 // If the child is still entering setsid(), this first TERM can
@@ -1976,6 +2029,10 @@ impl PiExecutor {
                 // SIGKILL pass covers that short window.
                 let _ = kill_process_group(p);
             }
+        }
+        #[cfg(windows)]
+        if let Some(ref sp) = shared_pid {
+            install_live_child_pid(&child, sp);
         }
 
         let output = child.wait_with_output().await?;
@@ -2018,7 +2075,7 @@ impl PiExecutor {
             user_prompt,
             system_prompt,
         } = prepare_pi_prompt_input(prompt, pipe_system_prompt)?;
-        let mut cmd = build_async_command(pi_path);
+        let mut cmd = build_async_command(pi_path)?;
         cmd.current_dir(working_dir);
         apply_pi_isolation_env(&mut |k, v| {
             cmd.env(k, v);
@@ -2127,20 +2184,20 @@ impl PiExecutor {
         let pid = child.id();
 
         #[cfg(windows)]
-        let _process_tree_guard = match KillOnDropJob::assign(&child) {
-            Ok(job) => Some(job),
-            Err(error) => {
-                warn!(
-                    "failed to assign pi process {} to cleanup job: {}",
-                    pid.unwrap_or_default(),
-                    error
-                );
-                None
-            }
-        };
+        let assignment = KillOnDropJob::assign(&child);
+        #[cfg(windows)]
+        let _process_tree_guard = retain_child_job_or_recover_completion(
+            &mut child,
+            assignment,
+            &format!("streaming pi process {}", pid.unwrap_or_default()),
+        )
+        .await?;
+        #[cfg(windows)]
+        let pid = child.id();
 
         // Set PID synchronously. If a stop was requested before spawn
         // completed, honor it immediately against the fresh process group.
+        #[cfg(unix)]
         if let (Some(ref sp), Some(p)) = (&shared_pid, pid) {
             if install_spawned_pid(sp, p) {
                 // If the child is still entering setsid(), this first TERM can
@@ -2148,6 +2205,10 @@ impl PiExecutor {
                 // SIGKILL pass covers that short window.
                 let _ = kill_process_group(p);
             }
+        }
+        #[cfg(windows)]
+        if let Some(ref sp) = shared_pid {
+            install_live_child_pid(&child, sp);
         }
 
         // Take stdout for streaming reads; stderr will be read after exit
@@ -2677,6 +2738,9 @@ impl AgentExecutor for PiExecutor {
         // trusts that tree, so `--force` is required to repair it generically.
         seed_pi_package_json(&install_dir)?;
 
+        #[cfg(all(windows, feature = "acp"))]
+        let mut cmd = guarded_async_command(&bun)?;
+        #[cfg(not(all(windows, feature = "acp")))]
         let mut cmd = tokio_bun_command(&bun);
         // CREATE_NO_WINDOW only covers this Bun process. Lifecycle scripts can
         // launch new consoles, so disable them for this pinned managed install.
@@ -2688,7 +2752,7 @@ impl AgentExecutor for PiExecutor {
             cmd.creation_flags(BACKGROUND_SPAWN_FLAGS);
         }
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             anyhow!(
                 "pi installation failed: could not run bun at {}: {}",
                 bun,
@@ -2696,13 +2760,12 @@ impl AgentExecutor for PiExecutor {
             )
         })?;
         #[cfg(windows)]
-        let _process_tree_guard = match KillOnDropJob::assign(&child) {
-            Ok(job) => Some(job),
-            Err(error) => {
-                warn!("failed to assign pi installer to cleanup job: {}", error);
-                None
-            }
-        };
+        let assignment = KillOnDropJob::assign(&child);
+        #[cfg(windows)]
+        let _process_tree_guard =
+            retain_child_job_or_recover_completion(&mut child, assignment, "pi installer")
+                .await
+                .map_err(|error| anyhow!("pi installation failed: {error}"))?;
         let output = child.wait_with_output().await.map_err(|e| {
             anyhow!(
                 "pi installation failed while waiting for bun at {}: {}",
@@ -2780,9 +2843,100 @@ pub fn pi_config_dir() -> Result<PathBuf> {
 /// skill instructions and a summary on 32k models. Use its standard setting for
 /// both chat and Pipes. Explicit user settings (including disabled compaction)
 /// remain authoritative; no model selection or summarization logic lives here.
+fn managed_bun_command_to_repair(settings: &serde_json::Value) -> Option<&str> {
+    let command = settings.get("npmCommand")?.as_array()?;
+    if command.len() != 1 {
+        return None;
+    }
+    let executable = command.first()?.as_str()?;
+    let path = Path::new(executable);
+    let is_bun = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("bun") || name.eq_ignore_ascii_case("bun.exe")
+        });
+    (path.is_absolute() && is_bun && !path.exists()).then_some(executable)
+}
+
+fn apply_pi_package_manager_settings(
+    settings: &mut serde_json::Value,
+    bun: &str,
+) -> Option<String> {
+    if settings.get("npmCommand").is_none() {
+        settings["npmCommand"] = json!([bun]);
+        return Some(String::new());
+    }
+    let stale = managed_bun_command_to_repair(settings)?.to_string();
+    settings["npmCommand"] = json!([bun]);
+    Some(stale)
+}
+
+fn write_pi_settings_atomic(config_dir: &Path, settings: &serde_json::Value) -> Result<()> {
+    std::fs::create_dir_all(config_dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(config_dir)?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), settings)?;
+    temporary.persist(config_dir.join("settings.json"))?;
+    Ok(())
+}
+
+/// Persist Screenpipe's resolved Bun for fresh profiles and repair a stale
+/// Screenpipe-managed Bun path. Explicit custom package managers and commands
+/// with arguments remain authoritative.
+pub fn ensure_pi_package_manager_settings(config_dir: &Path, bun: &str) -> Result<()> {
+    let _guard = PI_SETTINGS_LOCK
+        .lock()
+        .map_err(|_| anyhow!("pi package-manager settings lock poisoned"))?;
+    let path = config_dir.join("settings.json");
+    let mut settings: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    if !settings.is_object() {
+        return Ok(());
+    }
+    let Some(previous) = apply_pi_package_manager_settings(&mut settings, bun) else {
+        return Ok(());
+    };
+    if let Err(error) = write_pi_settings_atomic(config_dir, &settings) {
+        if !previous.is_empty() {
+            warn!(
+                stale_path = %previous,
+                replacement_path = %bun,
+                reason = "managed Bun executable is missing",
+                outcome = "failed",
+                error = %error,
+                "failed to repair Pi package-manager command"
+            );
+        }
+        return Err(error);
+    }
+    if !previous.is_empty() {
+        info!(
+            stale_path = %previous,
+            replacement_path = %bun,
+            reason = "managed Bun executable is missing",
+            outcome = "repaired",
+            "repaired Pi package-manager command"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_pi_settings_defaults(config_dir: &Path) -> Result<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK
+    let bun = find_bun_executable();
+    ensure_pi_startup_settings_inner(config_dir, bun.as_deref())
+}
+
+/// Apply the settings migration used before scheduled/chat Pi startup with an
+/// already resolved runnable Bun. This is public for the isolated runtime eval.
+pub fn ensure_pi_startup_settings(config_dir: &Path, bun: &str) -> Result<()> {
+    ensure_pi_startup_settings_inner(config_dir, Some(bun))
+}
+
+fn ensure_pi_startup_settings_inner(config_dir: &Path, bun: Option<&str>) -> Result<()> {
+    let _guard = PI_SETTINGS_LOCK
         .lock()
         .map_err(|_| anyhow!("pi settings lock poisoned"))?;
     let path = config_dir.join("settings.json");
@@ -2799,6 +2953,7 @@ fn ensure_pi_settings_defaults(config_dir: &Path) -> Result<()> {
         return Ok(());
     };
     let mut changed = false;
+    let mut repaired_bun = None;
     let compaction = object.entry("compaction").or_insert_with(|| json!({}));
     if let Some(compaction) = compaction.as_object_mut() {
         if !compaction.contains_key("keepRecentTokens") {
@@ -2819,20 +2974,40 @@ fn ensure_pi_settings_defaults(config_dir: &Path) -> Result<()> {
         })
     {
         changed |= normalize_required_pi_extension_setting(&mut settings)?;
-        if settings.get("npmCommand").is_none() {
-            if let Some(bun) = find_bun_executable() {
-                settings["npmCommand"] = json!([bun]);
+        if let Some(bun) = bun {
+            if let Some(previous) = apply_pi_package_manager_settings(&mut settings, bun) {
                 changed = true;
+                if !previous.is_empty() {
+                    repaired_bun = Some((previous, bun.to_string()));
+                }
             }
         }
     }
     if !changed {
         return Ok(());
     }
-    std::fs::create_dir_all(config_dir)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(config_dir)?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), &settings)?;
-    temporary.persist(path)?;
+    if let Err(error) = write_pi_settings_atomic(config_dir, &settings) {
+        if let Some((previous, bun)) = repaired_bun.as_ref() {
+            warn!(
+                stale_path = %previous,
+                replacement_path = %bun,
+                reason = "managed Bun executable is missing",
+                outcome = "failed",
+                error = %error,
+                "failed to repair Pi package-manager command"
+            );
+        }
+        return Err(error);
+    }
+    if let Some((previous, bun)) = repaired_bun {
+        info!(
+            stale_path = %previous,
+            replacement_path = %bun,
+            reason = "managed Bun executable is missing",
+            outcome = "repaired",
+            "repaired Pi package-manager command"
+        );
+    }
     Ok(())
 }
 
@@ -3823,7 +3998,7 @@ pub fn find_pi_executable() -> Option<String> {
 /// shell metacharacters (`|`, `&`, `>`, `<`, `^`), which breaks multi-line
 /// prompts passed via `-p`. To avoid this we resolve the JS entry point
 /// from the `.cmd` shim and run it directly — no cmd.exe involved.
-fn build_async_command(path: &str) -> tokio::process::Command {
+fn build_async_command(path: &str) -> Result<tokio::process::Command> {
     #[cfg(windows)]
     {
         // Try to resolve the JS entry point from .cmd shim to avoid cmd.exe.
@@ -3836,12 +4011,12 @@ fn build_async_command(path: &str) -> tokio::process::Command {
         let mut cmd = if let Some(ref js_path) = js_entry {
             // Run JS entry point directly with bun (preferred) or node.
             if let Some(bun) = find_bun_executable() {
-                let mut c = tokio_bun_command(&bun);
+                let mut c = guarded_async_command(&bun)?;
                 c.arg(js_path);
                 debug!("bypassing cmd.exe, running pi via bun: {} {}", bun, js_path);
                 c
             } else {
-                let mut c = crate::no_window::no_window_command_async("node");
+                let mut c = guarded_async_command("node")?;
                 c.arg(js_path);
                 debug!("bypassing cmd.exe, running pi via node: {}", js_path);
                 c
@@ -3852,23 +4027,23 @@ fn build_async_command(path: &str) -> tokio::process::Command {
                 "could not resolve JS entry from {}, falling back to cmd.exe /C",
                 path
             );
-            let mut c = crate::no_window::no_window_command_async("cmd.exe");
+            let mut c = guarded_async_command("cmd.exe")?;
             c.args(["/C", path]);
             c
         } else if path.ends_with(".js") {
             // Local install returns a .js entrypoint — run with bun
             if let Some(bun) = find_bun_executable() {
-                let mut c = tokio_bun_command(&bun);
+                let mut c = guarded_async_command(&bun)?;
                 c.arg(path);
                 debug!("running pi JS entrypoint via bun: {} {}", bun, path);
                 c
             } else {
-                let mut c = crate::no_window::no_window_command_async("node");
+                let mut c = guarded_async_command("node")?;
                 c.arg(path);
                 c
             }
         } else {
-            crate::no_window::no_window_command_async(path)
+            guarded_async_command(path)?
         };
 
         // Inject bundled bun directory into PATH so node_modules resolve correctly.
@@ -3904,7 +4079,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
         // Prevent console window flash on Windows
         cmd.creation_flags(0x08000000);
 
-        cmd
+        Ok(cmd)
     }
     #[cfg(not(windows))]
     {
@@ -3917,7 +4092,20 @@ fn build_async_command(path: &str) -> tokio::process::Command {
             tokio::process::Command::new(path)
         };
         apply_pi_child_path(&mut cmd);
-        cmd
+        Ok(cmd)
+    }
+}
+
+#[cfg(windows)]
+fn guarded_async_command(program: &str) -> Result<tokio::process::Command> {
+    #[cfg(feature = "acp")]
+    {
+        let command = super::acp::guarded_command(program).map_err(anyhow::Error::msg)?;
+        return Ok(tokio::process::Command::from(command));
+    }
+    #[cfg(not(feature = "acp"))]
+    {
+        Ok(crate::no_window::no_window_command_async(program))
     }
 }
 
@@ -4707,6 +4895,23 @@ pub fn ensure_bash_available() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enterprise_ai_accounting_headers_preserve_latency_and_reject_raw_identity() {
+        let original = super::cloud_pipe_headers(None);
+        assert_eq!(original["x-screenpipe-workload"], "pipe");
+        assert_eq!(original["x-screenpipe-latency"], "background");
+        for invalid in ["", "license-raw", "person@example.com", &"a".repeat(65)] {
+            assert_eq!(super::cloud_pipe_headers(Some(invalid)), original);
+        }
+        let hash = "b".repeat(64);
+        let tagged = super::cloud_pipe_headers(Some(&hash));
+        assert_eq!(tagged["X-Screenpipe-Enterprise-Id-Hash"], hash);
+        assert_eq!(tagged["X-Screenpipe-AI-Operation"], "cloud-pipes");
+        assert_eq!(
+            tagged["x-screenpipe-workload"],
+            original["x-screenpipe-workload"]
+        );
+    }
     use super::*;
 
     #[test]
@@ -4772,35 +4977,6 @@ mod tests {
             std::fs::read_to_string(second_path).unwrap(),
             "second system"
         );
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn pi_launch_error_display_preserves_windows_io_cause() {
-        let missing = std::env::temp_dir().join(format!(
-            "screenpipe-missing-pi-{}-{}.exe",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut command = build_async_command(missing.to_str().unwrap());
-        let io_error = match command.spawn() {
-            Ok(mut child) => {
-                let _ = child.kill().await;
-                panic!("unexpectedly launched missing pi executable")
-            }
-            Err(error) => error,
-        };
-        assert_eq!(io_error.raw_os_error(), Some(2));
-
-        // Scheduler logging and execution history both use ordinary Display.
-        // Raw propagation must therefore retain the Windows OS text there.
-        let expected = io_error.to_string();
-        let persisted_error = anyhow::Error::from(io_error).to_string();
-        assert_eq!(persisted_error, expected);
-        assert!(persisted_error.contains("os error 2"));
     }
 
     #[test]
@@ -5300,38 +5476,223 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn windows_process_is_running(pid: u32) -> bool {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
+    struct WindowsProcessHandle(windows_sys::Win32::Foundation::HANDLE);
 
-        unsafe {
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if process.is_null() {
-                return false;
+    #[cfg(windows)]
+    unsafe impl Send for WindowsProcessHandle {}
+
+    #[cfg(windows)]
+    impl WindowsProcessHandle {
+        fn open(pid: u32) -> std::io::Result<Self> {
+            const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+            let handle = unsafe {
+                windows_sys::Win32::System::Threading::OpenProcess(
+                    windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION
+                        | windows_sys::Win32::System::Threading::PROCESS_TERMINATE
+                        | SYNCHRONIZE_ACCESS,
+                    0,
+                    pid,
+                )
+            };
+            if handle.is_null() {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(Self(handle))
             }
-            let mut exit_code = 0;
-            let ok = GetExitCodeProcess(process, &mut exit_code) != 0;
-            CloseHandle(process);
-            ok && exit_code == STILL_ACTIVE as u32
+        }
+
+        fn is_signaled(&self) -> std::io::Result<bool> {
+            match unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, 0) } {
+                windows_sys::Win32::Foundation::WAIT_OBJECT_0 => Ok(true),
+                windows_sys::Win32::Foundation::WAIT_TIMEOUT => Ok(false),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+
+        async fn wait_signaled(&self) -> std::io::Result<()> {
+            let handle = self.0 as usize;
+            tokio::task::spawn_blocking(move || {
+                let result = unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(
+                        handle as _,
+                        windows_sys::Win32::System::Threading::INFINITE,
+                    )
+                };
+                if result == windows_sys::Win32::Foundation::WAIT_OBJECT_0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+            .await
+            .expect("process wait worker panicked")
+        }
+
+        fn terminate(&self) -> std::io::Result<()> {
+            if unsafe { windows_sys::Win32::System::Threading::TerminateProcess(self.0, 1) } == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         }
     }
 
     #[cfg(windows)]
-    fn terminate_windows_process(pid: u32) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-        };
-
-        unsafe {
-            let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !process.is_null() {
-                TerminateProcess(process, 1);
-                CloseHandle(process);
+    impl Drop for WindowsProcessHandle {
+        fn drop(&mut self) {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
             }
         }
+    }
+
+    #[cfg(all(windows, feature = "acp"))]
+    async fn assert_completed_child_result_is_preserved(exit_code: i32) {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args(&[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[Console]::Out.Write('completed-out'); [Console]::Error.Write('completed-err'); exit {exit_code}"
+                ),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("spawn completed fixture");
+        let raw = child.raw_handle().expect("guarded fixture process handle") as usize;
+        tokio::task::spawn_blocking(move || {
+            let result = unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(
+                    raw as _,
+                    windows_sys::Win32::System::Threading::INFINITE,
+                )
+            };
+            assert_eq!(result, windows_sys::Win32::Foundation::WAIT_OBJECT_0);
+        })
+        .await
+        .expect("process wait worker");
+
+        let assignment = KillOnDropJob::assign(&child);
+        let error = match assignment.as_ref() {
+            Ok(_) => panic!("late assignment unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        eprintln!("signaled process rejected late Job assignment: {error}");
+        let guard = retain_child_job_or_recover_completion(
+            &mut child,
+            assignment,
+            "unguarded completed helper fixture",
+        )
+        .await
+        .expect("preserve completed result");
+        assert!(guard.is_none());
+        let pending_stop = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+            super::super::STOP_REQUESTED_PID,
+        ));
+        install_live_child_pid(&child, &pending_stop);
+        assert_eq!(
+            pending_stop.load(std::sync::atomic::Ordering::SeqCst),
+            super::super::STOP_REQUESTED_PID,
+            "a reaped child must not replace the pending-stop sentinel"
+        );
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("collect completed output");
+        assert_eq!(output.status.code(), Some(exit_code));
+        assert_eq!(output.stdout, b"completed-out");
+        assert_eq!(output.stderr, b"completed-err");
+    }
+
+    #[cfg(all(windows, feature = "acp"))]
+    #[tokio::test]
+    async fn windows_unguarded_helper_preserves_completed_zero_and_nonzero_results() {
+        assert_completed_child_result_is_preserved(0).await;
+        assert_completed_child_result_is_preserved(23).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_live_child_honors_pending_stop_during_pid_install() {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Wait-Event"])
+            .creation_flags(BACKGROUND_SPAWN_FLAGS)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().expect("spawn live fixture");
+        let process = WindowsProcessHandle::open(child.id().expect("live fixture pid"))
+            .expect("open live fixture");
+        let pending_stop = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+            super::super::STOP_REQUESTED_PID,
+        ));
+
+        install_live_child_pid(&child, &pending_stop);
+        process
+            .wait_signaled()
+            .await
+            .expect("pending stop terminated live fixture");
+        child.wait().await.expect("reap live fixture");
+    }
+
+    #[cfg(all(windows, feature = "acp"))]
+    #[tokio::test]
+    async fn windows_live_assignment_failure_fails_closed_without_unrelated_cleanup() {
+        fn blocked_child() -> tokio::process::Child {
+            let mut command = tokio::process::Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-Command", "Wait-Event"])
+                .creation_flags(BACKGROUND_SPAWN_FLAGS)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command.spawn().expect("spawn blocked fixture")
+        }
+
+        let mut child = blocked_child();
+        let child_handle = WindowsProcessHandle::open(child.id().expect("child pid"))
+            .expect("open blocked fixture");
+        let unrelated = blocked_child();
+        let unrelated_handle = WindowsProcessHandle::open(unrelated.id().expect("unrelated pid"))
+            .expect("open unrelated fixture");
+        assert!(!child_handle.is_signaled().unwrap());
+        assert!(!unrelated_handle.is_signaled().unwrap());
+
+        let assigned = unsafe {
+            windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                std::ptr::null_mut(),
+                child.raw_handle().expect("child process handle") as _,
+            )
+        };
+        assert_eq!(assigned, 0, "invalid Job handle unexpectedly assigned");
+        let assignment_error = std::io::Error::last_os_error();
+        let error = match retain_child_job_or_recover_completion(
+            &mut child,
+            Err(assignment_error),
+            "live fixture",
+        )
+        .await
+        {
+            Ok(_) => panic!("live uncontained child unexpectedly continued"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("failed to contain live fixture"));
+        child_handle
+            .wait_signaled()
+            .await
+            .expect("child was reaped");
+        assert!(
+            !unrelated_handle.is_signaled().unwrap(),
+            "cleanup terminated an unrelated real process"
+        );
+        unrelated_handle
+            .terminate()
+            .expect("terminate unrelated fixture");
+        unrelated_handle
+            .wait_signaled()
+            .await
+            .expect("wait unrelated fixture");
     }
 
     #[cfg(windows)]
@@ -5376,56 +5737,50 @@ mod tests {
             ready_path.exists(),
             "grandchild did not commit its simulated 32 MB payload"
         );
+        let grandchild = WindowsProcessHandle::open(grandchild_pid).expect("open grandchild");
         assert!(
-            windows_process_is_running(grandchild_pid),
-            "grandchild exited before cleanup could be tested"
+            !grandchild.is_signaled().unwrap(),
+            "grandchild exited early"
         );
 
         (grandchild_pid, job)
     }
 
     #[cfg(windows)]
-    async fn wait_for_windows_process_exit(pid: u32) -> bool {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while windows_process_is_running(pid) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        !windows_process_is_running(pid)
-    }
-
-    #[cfg(windows)]
     #[tokio::test]
-    async fn windows_job_prevents_orphaned_grandchildren() {
+    async fn windows_job_close_eventually_signals_owned_grandchildren_only() {
         // BEFORE: Windows leaves the descendant running after its immediate
         // parent exits. This is the leak mechanism the production guard fixes.
         let (unmanaged_pid, unmanaged_job) = spawn_parent_with_lingering_grandchild(false).await;
         assert!(unmanaged_job.is_none());
+        let unmanaged = WindowsProcessHandle::open(unmanaged_pid).expect("open unmanaged child");
         assert!(
-            windows_process_is_running(unmanaged_pid),
-            "unmanaged reproduction did not leave the expected orphan"
+            !unmanaged.is_signaled().unwrap(),
+            "unmanaged reproduction exited"
         );
         eprintln!(
             "before: unmanaged grandchild {unmanaged_pid} remained alive with 32 MB committed after parent exit"
         );
-        terminate_windows_process(unmanaged_pid);
-        assert!(
-            wait_for_windows_process_exit(unmanaged_pid).await,
-            "failed to clean up unmanaged reproduction process {unmanaged_pid}"
-        );
-
         // AFTER: the same tree joins a kill-on-close Job Object. The parent
         // still exits normally, but dropping the guard reaps the descendant.
         let (managed_pid, managed_job) = spawn_parent_with_lingering_grandchild(true).await;
-        drop(managed_job.expect("managed run should return a job guard"));
-        let managed_exited = wait_for_windows_process_exit(managed_pid).await;
-        eprintln!(
-            "after: managed grandchild {managed_pid} alive={}",
-            !managed_exited
-        );
+        let managed = WindowsProcessHandle::open(managed_pid).expect("open managed child");
         assert!(
-            managed_exited,
-            "grandchild {managed_pid} survived closing its job object"
+            !managed.is_signaled().unwrap(),
+            "managed fixture exited early"
         );
+        drop(managed_job.expect("managed run should return a job guard"));
+        managed.wait_signaled().await.expect("wait managed fixture");
+        eprintln!("after: managed grandchild {managed_pid} process handle signaled");
+        assert!(
+            !unmanaged.is_signaled().unwrap(),
+            "closing one Job terminated an unrelated real process"
+        );
+        unmanaged.terminate().expect("terminate unmanaged fixture");
+        unmanaged
+            .wait_signaled()
+            .await
+            .expect("wait unmanaged fixture");
     }
 
     #[test]
@@ -5829,6 +6184,89 @@ mod tests {
     }
 
     #[test]
+    fn pi_package_manager_repairs_only_missing_managed_bun() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let current_bun = dir
+            .path()
+            .join(if cfg!(windows) { "bun.exe" } else { "bun" });
+        std::fs::write(&current_bun, b"").unwrap();
+        let stale_bun =
+            dir.path()
+                .join("old-install")
+                .join(if cfg!(windows) { "bun.exe" } else { "bun" });
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "theme": "dark",
+                "packages": ["npm:other-extension", REQUIRED_PI_EXTENSION_PACKAGE],
+                "compaction": {"enabled": false},
+                "npmCommand": [stale_bun]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        ensure_pi_package_manager_settings(dir.path(), current_bun.to_str().unwrap()).unwrap();
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired["npmCommand"], json!([current_bun]));
+        assert_eq!(repaired["theme"], "dark");
+        assert_eq!(repaired["packages"][0], "npm:other-extension");
+        assert_eq!(repaired["compaction"], json!({"enabled": false}));
+
+        let persisted = std::fs::read(&path).unwrap();
+        ensure_pi_package_manager_settings(dir.path(), current_bun.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+    }
+
+    #[test]
+    fn pi_package_manager_preserves_custom_and_argument_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let current_bun = dir
+            .path()
+            .join(if cfg!(windows) { "bun.exe" } else { "bun" });
+        std::fs::write(&current_bun, b"").unwrap();
+        let missing_bun =
+            dir.path()
+                .join("missing")
+                .join(if cfg!(windows) { "bun.exe" } else { "bun" });
+        for command in [
+            json!(["npm"]),
+            json!(["pnpm"]),
+            json!([dir.path().join("package-wrapper.exe")]),
+            json!([missing_bun, "--registry", "https://registry.example"]),
+        ] {
+            let original = json!({"npmCommand": command, "unrelated": {"keep": true}});
+            std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+            ensure_pi_package_manager_settings(dir.path(), current_bun.to_str().unwrap()).unwrap();
+            let preserved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(preserved, original);
+        }
+    }
+
+    #[test]
+    fn pi_package_manager_initializes_fresh_config_and_persists_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let current_bun = dir
+            .path()
+            .join(if cfg!(windows) { "bun.exe" } else { "bun" });
+        std::fs::write(&current_bun, b"").unwrap();
+
+        ensure_pi_package_manager_settings(dir.path(), current_bun.to_str().unwrap()).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first).unwrap()["npmCommand"],
+            json!([current_bun])
+        );
+        ensure_pi_package_manager_settings(dir.path(), current_bun.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+    }
+
+    #[test]
     fn pi_compaction_default_initializes_fresh_config() {
         let dir = tempfile::tempdir().unwrap();
         ensure_pi_settings_defaults(dir.path()).unwrap();
@@ -6048,14 +6486,55 @@ mod tests {
         ]));
     }
 
+    #[tokio::test]
+    async fn retired_enclave_models_fail_before_config_or_network_access() {
+        for model in [
+            "glm-5.3-flash-reap50-iq3m",
+            "GEMMA4-E4B",
+            "gemma4-e2b@legacy",
+        ] {
+            let error = PiExecutor::ensure_pi_config(
+                None,
+                "http://127.0.0.1:1",
+                Some("screenpipe"),
+                Some(model),
+                None,
+            )
+            .await
+            .expect_err("retired model must fail before setup");
+            assert!(error.to_string().contains("no longer available"));
+        }
+    }
+
+    #[test]
+    fn retired_enclave_extension_cleanup_preserves_other_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = dir.path().join(".pi/extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::write(extensions.join("tinfoil.ts"), "legacy app extension").unwrap();
+        std::fs::write(extensions.join("custom.ts"), "keep me").unwrap();
+        PiExecutor::ensure_tinfoil_extension(dir.path()).unwrap();
+        PiExecutor::ensure_tinfoil_extension(dir.path()).unwrap();
+        assert!(!extensions.join("tinfoil.ts").exists());
+        assert_eq!(
+            std::fs::read_to_string(extensions.join("custom.ts")).unwrap(),
+            "keep me"
+        );
+        let skill = PiExecutor::render_screenpipe_api_skill();
+        assert!(!skill.contains("gemma4"));
+        assert!(skill.contains("/search"));
+    }
+
     #[test]
     fn gateway_catalog_omits_locked_models_from_pi() {
         let confidential = gateway_models_to_pi_models(&[json!({
             "id": "glm-5.3-flash-reap50-iq3m", "context_window": 32768,
             "max_output_tokens": 8192
         })]);
-        assert_eq!(confidential[0]["api"], json!("screenpipe-tinfoil"));
-        assert_eq!(confidential[0]["input"], json!(["text"]));
+        assert!(
+            confidential.is_empty(),
+            "retired enclave model must not be selectable"
+        );
         let models = gateway_models_to_pi_models(&[
             json!({
                 "id": "auto",

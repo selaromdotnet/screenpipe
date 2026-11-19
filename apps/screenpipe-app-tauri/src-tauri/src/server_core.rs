@@ -397,6 +397,13 @@ impl ServerCore {
             message
         })?;
 
+        // Recovery and fresh hybrid initialization happen before the database
+        // opens, and fresh initialization can take minutes on slower devices.
+        crate::health::set_boot_phase(
+            "migrating_database",
+            Some("updating database — this may take several minutes on large installs"),
+        );
+
         screenpipe_db::storage::recover_interrupted_compaction(
             &local_data_dir,
             config.db_config.clone(),
@@ -422,10 +429,6 @@ impl ServerCore {
                 .map_err(|e| e.to_string())?
                 .to_string_lossy()
                 .into_owned();
-        crate::health::set_boot_phase(
-            "migrating_database",
-            Some("updating database — this may take several minutes on large installs"),
-        );
 
         // DB init with bounded retry on lock contention.
         //
@@ -445,7 +448,7 @@ impl ServerCore {
         // immediately — retrying would just delay the user-visible error.
         const DB_LOCK_RETRY_DELAYS_SECS: &[u64] = &[0, 2, 5];
         let db = {
-            let mut last_err: Option<String> = None;
+            let mut first_err: Option<String> = None;
             let mut built = None;
             for (attempt_idx, delay) in DB_LOCK_RETRY_DELAYS_SECS.iter().enumerate() {
                 if *delay > 0 {
@@ -463,7 +466,10 @@ impl ServerCore {
                         break;
                     }
                     Err(e) => {
-                        let s = e.to_string();
+                        let s = format!(
+                            "operation=database_manager_init; {}",
+                            screenpipe_db::database_error_diagnostic(&e)
+                        );
                         let is_lock =
                             s.contains("database is locked") || s.contains("database is busy");
                         if is_lock && attempt_idx + 1 < DB_LOCK_RETRY_DELAYS_SECS.len() {
@@ -474,21 +480,20 @@ impl ServerCore {
                                 DB_LOCK_RETRY_DELAYS_SECS.len(),
                                 e
                             );
-                            last_err = Some(s);
+                            first_err.get_or_insert(s);
                             continue;
                         }
                         // Final failure — either non-lock error or exhausted retries
                         let msg = if is_lock {
                             format!(
-                                "Database is locked by another process (likely Spotlight, \
-                                 Time Machine, antivirus, or iCloud/OneDrive sync). After \
-                                 {} attempts the lock did not clear. Close backup/sync tools \
-                                 and relaunch. Underlying error: {}",
+                                "Database remained busy after {} startup attempts. The lock \
+                                 owner is unknown; recording recovery will retry. First \
+                                 retained failure: {}",
                                 DB_LOCK_RETRY_DELAYS_SECS.len(),
-                                e
+                                first_err.as_deref().unwrap_or(&s)
                             )
                         } else {
-                            format!("Failed to initialize database: {}", e)
+                            format!("Failed to initialize database: {s}")
                         };
                         crate::health::set_boot_error(&msg);
                         return Err(msg);
@@ -501,7 +506,7 @@ impl ServerCore {
                     // All attempts returned lock errors and we exhausted the loop.
                     // The branch above handles the last-attempt case, but defensively
                     // handle the case where the loop exited without a match.
-                    let e = last_err.unwrap_or_else(|| "unknown error".to_string());
+                    let e = first_err.unwrap_or_else(|| "unknown error".to_string());
                     let msg = format!(
                         "Database is locked — exhausted all {} retry attempts. {}",
                         DB_LOCK_RETRY_DELAYS_SECS.len(),
@@ -647,7 +652,10 @@ impl ServerCore {
 
         // --- Resource + sleep monitors (long-lived) ---
         let resource_reporter = ResourceTelemetryReporter::new(config.analytics_enabled);
-        resource_reporter.start_monitoring(Duration::from_secs(30), Some(Duration::from_secs(60)));
+        resource_reporter.start_monitoring(
+            Duration::from_secs(30),
+            Some(screenpipe_engine::telemetry_reporting::RESOURCE_DIAGNOSTIC_REPORT_INTERVAL),
+        );
         start_sleep_monitor();
 
         // --- HTTP server ---
@@ -661,6 +669,10 @@ impl ServerCore {
             config.use_pii_removal,
             config.video_quality.clone(),
         );
+        let diagnostic_shutdown = resource_reporter.shutdown_handle();
+        server.diagnostic_shutdown = diagnostic_shutdown.clone();
+        server.diagnostic_report_interval =
+            screenpipe_engine::telemetry_reporting::DESKTOP_DIAGNOSTIC_REPORT_INTERVAL;
         server.workflow_catalog_dir = workflow_catalog_dir;
         server.vision_metrics = vision_metrics.clone();
         server.audio_metrics = audio_manager.metrics.clone();
@@ -1136,6 +1148,7 @@ impl ServerCore {
                     // Err means the sender dropped, which only happens when
                     // the whole ServerCore is gone — treat as shutdown.
                     let _ = shutdown_rx.wait_for(|stop| *stop).await;
+                    diagnostic_shutdown.flush().await;
                 },
             ))
             .catch_unwind()

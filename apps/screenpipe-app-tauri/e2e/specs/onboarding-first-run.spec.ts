@@ -73,8 +73,6 @@ const waitForBodyText = async (needle: string, timeout = 10_000) => {
  * dependencies. Same shape as screen-recording-restart.spec.ts.
  */
 const gotoSlide = async (step: string) => {
-  await invokeOrThrow("set_onboarding_step", { step });
-
   // Destroy and recreate rather than just showing: showWindow on a live
   // window only focuses it, so the mount-time restore effect never re-runs
   // and the flow stays on whatever slide it was already displaying.
@@ -84,6 +82,9 @@ const gotoSlide = async (step: string) => {
   await closeWindow("Onboarding");
   await waitForWindowClosed("onboarding", t(15_000));
 
+  // Save only after the old window is gone: its permission/engine effects can
+  // still advance and overwrite the requested step while it is closing.
+  await invokeOrThrow("set_onboarding_step", { step });
   await showWindow("Onboarding");
   await waitForWindowHandle("onboarding", t(20_000));
   await browser.switchToWindow("onboarding");

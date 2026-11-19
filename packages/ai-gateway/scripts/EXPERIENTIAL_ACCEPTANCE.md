@@ -19,19 +19,34 @@ organization and `EXPERIENTIAL_ACCEPTANCE_REPORT` to a private absolute JSON pat
 bun scripts/experiential-acceptance.ts --allow-spend
 ```
 
-The script's synthetic test-organization preflight refuses a different organization
-or a configuration that does not have retention enabled and organization-level ZDR disabled.
-Production inference still forces `provider.zdr=true` after SDK serialization on
-both hybrid and internal-canary routes, with OpenAI `store=false`. A successful
-response must confirm `x-gateway-zdr: true`; a missing verdict or privacy refusal
-stops the request, including Auto and background rescue. These failures cannot
-fall back around the privacy gate. Organization-level defaults never grant
-retention for production inference.
+The script's synthetic test-organization preflight refuses a different organization.
+The destination's no-training policy is checked by the real Worker dispatch path,
+including when the local harness substitutes the operator's inference credential.
+Production inference permits retention and does not require ZDR. Before every
+SDK dispatch, the Worker reads `/api/whoami` and that organization's provider
+policy with the dispatch credential. It requires `require_no_training: true`
+and rejects unscoped or no-training exemptions. Unavailable or invalid policy
+reads stop before content is sent; policy failures cannot trigger native
+transport fallback or rescue. ZDR and region-only exemptions remain separate.
+The policy read inherits the SDK cancellation signal and has no permission cache.
+OpenAI `store=false` and full-conversation requests preserve stateless operation.
+A missing or false `x-gateway-zdr` verdict is accepted.
 
-Full Workflows contributions travel separately: strict attested redaction,
-current consent/epoch checks, and the Screenpipe-owned dataset's expiry/deletion
-controls. Consent permits training Screenpipe-owned models only, never the
-vendor's models. No training export is introduced here.
+Hosted-conversation training uses a separate optional account preference,
+`/api/user/ai-training-consent`. Before building a chat's gateway context, the
+Worker reads it with the authenticated caller's bearer, without the commercial
+entitlement cache. Verified opt-in adds `training_allowed=true` and its notice,
+grant time and epoch to `X-Explabs-Tags`. Missing permission, services, failed
+lookups and identity mismatches explicitly send `training_allowed=false`.
+Neither client headers nor inference JSON grant permission. Symbols preserve
+the verified permission across model-lane changes and rescue without adding
+fields to Cloudflare's spend metadata. Upstream no-training remains mandatory.
+
+The website's `/api/admin/ai-training/eligibility` rechecks captured request tags
+against current consent and request time when a Screenpipe-owned trainer selects
+traffic. Old epochs, pre-consent traffic and withdrawn/deleted accounts are
+denied. Metadata tags alone do not automatically turn on a vendor training job.
+The old Workflows contribution/upload path is separate from this inference path.
 
 The script does not modify account settings, expose
 the credential to the Worker, or deploy anything. Each case sends synthetic
@@ -39,8 +54,9 @@ content; the bundled image shows four digits. Preserve no-training and all other
 account settings. Model access denials remain failures, not policy overrides.
 
 Every hosted model from the source policy is tested through `/chat/completions`,
-including Auto. Gemini's native Vertex route, the confidential GLM route, and the
-self-hosted classifier stay on their existing providers and are listed separately
+including Auto. Argon uses Experiential's OpenAI-compatible Chat wire, preserving the native
+output bounds, effort mapping and opaque signed tool-call IDs. The confidential
+GLM route and the self-hosted classifier retain their existing providers and are listed separately
 in the report. They are not sent as vendor aliases. The verified mappings are native `claude-haiku-5-5` to catalog
 `claude-haiku-5.5`, and `gpt-5.6` to `gpt-5.6-sol`. OpenAI's official Sol
 documentation confirms that unsuffixed alias, and the authenticated destination
@@ -58,7 +74,7 @@ The temporary local Worker and database are disposed at the end.
 
 This supersedes the ad hoc direct-request matrix for cutover acceptance. Synthetic
 smoke and acceptance commands retain their test-organization preflight defaults;
-the production connection enforces per-request ZDR. Passing this harness alone does not enable
+the production connection verifies no-training policy before dispatch. Passing this harness alone does not enable
 production traffic or establish that every original provider can be moved.
 
 For a focused recheck, set comma-separated `EXPERIENTIAL_ACCEPTANCE_MODELS` and
@@ -84,10 +100,13 @@ existing Cloudflare route; client headers or JSON cannot choose this flag.
 
 Features retained on original routes:
 
-- Context-tier pricing models: retain native pricing rather than estimate the
-  threshold. The central pricing table identifies these models.
-- Vertex, confidential/custom GLM, classifier, audio and background rescue:
-  retain their existing routes.
+- Confidential/custom GLM, classifier and audio retain their existing routes.
+- Argon uses Experiential with the current scheduled token/cache prices; rollback
+  and explicit unsupported-request fallback retain native Vertex.
+- Background rescue uses Experiential directly when the hybrid flag is enabled.
+  It preserves the existing model and text-only eligibility, no-training gate,
+  and trusted tags while bypassing only the already exhausted Cloudflare counter.
+  Cloudflare mode restores the previous direct OpenAI rescue transport.
 
 GPT-5.4 Pro, Mini/Nano image input (GPT-5.4 and GPT-5), and GPT-5.6 now
 use Experiential. OpenAI Chat requests use automatic prompt caching there;
@@ -106,8 +125,23 @@ pass.
 Every hosted response carries `x-screenpipe-gateway` (`experiential` or
 `cloudflare`) and `x-screenpipe-gateway-reason`. Browser CORS exposes these
 headers; the normal route audit records `gateway_mode` and `gateway_reason`.
-Cloudflare custom-provider pricing comes from the same flat/cache rates as
-application settlement. Destination requests preserve the existing server-owned
+Cloudflare custom-provider pricing uses the central flat base/cache rates.
+Context-priced Haiku, Luna and Astra retain the native Cloudflare provider route
+so Cloudflare accounts for native context pricing and enforces its existing
+per-actor spend rules. Chat does not read reporting APIs or the legacy
+`hosted_context_pricing` ledger before dispatch. Reporting outages and missing
+legacy ledger storage cannot refuse a chat request. Native Cloudflare spend
+refusals remain terminal and cannot cascade around the account limit.
+
+The October 29 premium ledger is retained for historical audit; it is no longer
+an admission authority or an addition to the Cloudflare usage display. No
+existing rows, counters or pending holds are deleted by this recovery.
+
+Like the existing Cloudflare policy, admission is eventually consistent: the
+base component comes from Cloudflare analytics and Cloudflare also independently
+enforces its base counter. This does not create a synchronous invoice ceiling.
+
+ Destination requests preserve the existing server-owned
 actor, plan, lane, workload and trial metadata, so native and Experiential
 requests share the same counters and rollback does not reset allowances.
 
@@ -126,7 +160,7 @@ base URL and `EXPERIENTIAL_ACCEPTANCE_SERVICE_TOKEN` to its dedicated test-servi
 credential. Keep the same org preflight key and report path, then run the same
 command. The runner accepts only the Screenpipe canary prefix under the verified
 `louis-beaumont.workers.dev` account; it never sends the service bearer to an
-arbitrary URL. All six cases run against each applicable model, 108 total.
+arbitrary URL. All six cases run against each applicable model in the current source manifest.
 
 In this mode the request goes to the deployed Worker with no local egress
 instrumentation. Reports identify `worker_request_id` as Cloudflare's CF-Ray,
@@ -136,11 +170,12 @@ instrumented runs separately retain the vendor request IDs. Do not conflate
 these evidence boundaries.
 
 For hybrid acceptance set `EXPERIENTIAL_ACCEPTANCE_EXPECTED_GATEWAY=hybrid`.
-The same 108-case manifest verifies both the content and the policy-selected
+The same source-derived manifest verifies both the content and the policy-selected
 route. Each row names its actual gateway and reason. Known original-route cases
 are successful hybrid behavior, not Experiential coverage. GPT-5.4 Pro's native
-unsupported schema remains a separate unsupported case. A full passing run is
-107 supported cases plus that explicitly verified rejection.
+unsupported schema remains a separate unsupported case. The earlier pre-Argon live run passed
+107 supported cases plus that explicitly verified rejection. It does not certify
+Argon or the new no-training dispatch path; those require fresh live acceptance.
 
 For a deployed Cloudflare rollback/baseline run, set
 `EXPERIENTIAL_ACCEPTANCE_EXPECTED_GATEWAY=cloudflare` after selecting `HOSTED_CHAT_GATEWAY=cloudflare`.
@@ -150,6 +185,45 @@ Experiential cases. A dedicated internal canary without a copied production
 gateway token uses the authenticated gateway binding for rollback, preserving
 native SDK request/response formats and the existing metadata. Production
 connections with their configured gateway token keep their current transport.
+
+## October 29 live validation
+
+A dedicated browser-created Screenpipe inference key verified
+`require_no_training=true`, `require_zdr=false`, and no exemptions. The full
+local Worker/real-provider matrix completed 114 cases: 112 passed, GPT-5.4 Pro's
+unsupported schema was explicitly verified, and Fable's streaming tool-result
+turn hit its requested 2,048-token output budget. A focused repeat reproduced
+the truncation; a subsequent traced repeat completed without changing the
+request or output budget. Preserve those failures when interpreting coverage.
+Argon passed all six features, including both tool-result turns.
+
+An isolated deployed Worker (`ai-proxy-experiential-canary-20261029`, version
+`8d504489-57b6-4a2b-9946-f0596e48d16b`) then passed all 24 cases for Auto,
+GPT-5.4 Mini, Argon and Fable. The latter three used Experiential; Auto retained
+native context pricing. This run included the final-usage fix, used a separate
+migrated D1 database, and made no production route changes. It is partial
+deployed coverage, not a completed cutover or a full-model deployed matrix.
+
+The trace also showed that Experiential's opening Messages event reports an
+input estimate, with authoritative input/cache counts in `message_delta`.
+The adapter now uses those final counts, including zero, while preserving
+native Claude's opening counts when the final event omits them. Real Worker
+tests verify both public SSE usage and persisted cost telemetry.
+
+Live accounting probes used the existing gateway and a synthetic internal
+actor, without changing spend rules or customer balances. Without a custom
+rate header, a successful GPT-6 Luna request recorded 9 input/5 output tokens
+and **zero** Cloudflare cost (log `01a18932-39fc-71d4-bad0-eb21ce72c54c`).
+A Fable stream with source-policy custom rates settled its final 12 input/4
+output tokens as $0.00032 (log `01a18936-9d7a-7188-b445-3f5fa1d6a012`), rather
+than its opening 7-token estimate. Flat-rate settlement works; neither probe
+establishes a context-tier pricing contract. The current nine spend rules use
+fixed weekly windows; keep their existing identities and counters.
+
+Authenticated lookup of `glm-5.3-flash-reap50-iq3m` returned 404, explicitly
+stating it is absent from both the public catalog and Screenpipe's organizations.
+Screenpipe has no configured provider connections. Other GLM variants are not
+the deployed confidential model and are not substitutes.
 
 ## Native Pro capabilities
 
@@ -165,3 +239,27 @@ preserves supported caller effort and native defaults when omitted.
 
 Capability references: [GPT-5.4 Pro](https://developers.openai.com/api/docs/models/gpt-5.4-pro)
 and [GPT-5.5 Pro](https://developers.openai.com/api/docs/models/gpt-5.5-pro).
+
+## Context-tier validation follow-up
+
+Real Worker/D1 acceptance covers all three context-priced models in JSON and SSE
+below, at and above the published thresholds; whole-request cache prices;
+admission below/at/above budget; another user's isolation; persisted rollback,
+restart and the actual fixed weekly reset; SQLite settlement failure; recovery
+with and without response headers; Messages cache normalization; and Auto
+fallback after a truncated paid response.
+
+Three real Cloudflare-to-Experiential Haiku requests also verified >100k input,
+cache creation and cache reading. Source-policy total equals Cloudflare base
+plus the final-usage premium. Financial log IDs are
+`01a1898f-c5d1-757f-b307-ca12b6e16a48`,
+`01a18990-0b97-7315-941f-43d0970901ef` and
+`01a18990-2f4c-72dc-9d40-d8a60a891da5`. Logs retained final cache counters with
+payload storage off. Exact event-ID recovery uses the API's JSON `filters`
+parameter, verified live; bracket/dotted alternatives were observed to ignore
+that filter and are not used.
+
+The selectable GLM label is the separate EHBP-encrypted Private AI transport,
+not ordinary hosted chat: desktop `tinfoil-transport.ts` selects
+`/v1/tinfoil/glm/chat/completions`. Confidential inference was excluded by the
+user's scope clarification. Preserve its opaque relay and enclave verification.

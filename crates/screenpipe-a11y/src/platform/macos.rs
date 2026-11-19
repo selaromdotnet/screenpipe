@@ -53,6 +53,8 @@ static AX_QUERY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 /// sets, so it only ever acts as a backstop: `AXUIElementSetMessagingTimeout`
 /// on a specific element still overrides it for that element.
 const AX_DEFAULT_TIMEOUT_SECS: f32 = 1.0;
+// Existing interaction-metadata reads use this shorter per-element bound.
+const AX_METADATA_TIMEOUT_SECS: f32 = 0.1;
 
 /// Keep click attribution recent enough that a delayed AX hit-test cannot
 /// accidentally describe a window that moved under the recorded coordinate.
@@ -208,6 +210,8 @@ const KEY_X: u16 = 7;
 const KEY_V: u16 = 9;
 // cidre 0.13.1 does not expose kCGEventTargetUnixProcessID yet.
 const CG_EVENT_TARGET_UNIX_PROCESS_ID: cg::EventField = cg::EventField(40);
+// kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent (CGEventTypes.h).
+const CG_EVENT_RECEIVER_WINDOW_ID: cg::EventField = cg::EventField(92);
 
 #[repr(C)]
 struct UCKeyboardLayout {
@@ -738,6 +742,7 @@ struct ContextCaptureRequest {
     x: f64,
     y: f64,
     app_pid: i32,
+    window_id: Option<u32>,
     captured_at: Instant,
     timestamp: chrono::DateTime<Utc>,
     relative_ms: u64,
@@ -1911,7 +1916,7 @@ fn find_labeled_descendant_at(
         // Each child is its own AX ref — cap its messaging timeout so a busy
         // app costs at most ~0.1s per read instead of the ~6s macOS default
         // (tree-walker pattern, tree/macos.rs).
-        let _ = child.set_messaging_timeout_secs(0.1);
+        let _ = child.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
         let Some(b) = get_element_bounds(child) else {
             continue;
         };
@@ -1956,6 +1961,7 @@ fn capture_click_at_position(
         return None;
     }
     let app_name = app_name?;
+    let is_browser = crate::url_filter::is_known_browser(&app_name);
 
     // Serialize accessibility queries to prevent concurrent calls that corrupt
     // AppKit's internal accessibility caches. This runs on the click worker,
@@ -1963,10 +1969,38 @@ fn capture_click_at_position(
     // preserves the click instead of racing and dropping its attribution.
     let _guard = AX_QUERY_LOCK.lock();
 
+    if is_browser {
+        // Firefox starts its full accessibility provider when AXRole is read
+        // on the application (Mozilla bug 1845364). Without this handshake,
+        // the window may expose only native chrome and no page/address URL.
+        // This is a read, avoiding explicit screen-reader flag changes.
+        let app = ax::UiElement::with_app_pid(request.app_pid);
+        let _ = app.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
+        let _ = app.role();
+    }
+
     let sys = ax::UiElement::sys_wide();
-    let elem = sys
-        .element_at_pos(request.x as f32, request.y as f32)
-        .ok()?;
+    let (elem, element_hit) = match sys.element_at_pos(request.x as f32, request.y as f32) {
+        Ok(element) => (element, true),
+        Err(system_error) if is_browser => {
+            // Safari can expose its windows and URLs while reporting hit
+            // testing as unimplemented. Use the WindowServer receiver ID
+            // snapshotted from this mouse-down, never the foreground window.
+            match clicked_window_for_receiver(request) {
+                Ok(window) => (window, false),
+                Err(cause) => {
+                    crate::capture_diagnostics::report_browser_click_failure(
+                        "clicked_element",
+                        &format!("system-wide AX hit-test failed: {system_error:?}; receiver window resolution failed: {cause}"),
+                        request.captured_at.elapsed(),
+                        "withheld_unattributable",
+                    );
+                    return None;
+                }
+            }
+        }
+        Err(_) => return None,
+    };
 
     // Cross-check the hit-test against the immutable CGEvent receiver. A focus
     // transition can change the system-wide AX answer after mouse-down; mixing
@@ -1989,12 +2023,25 @@ fn capture_click_at_position(
     // indexing) would stall this worker for seconds while it holds
     // AX_QUERY_LOCK, and the bounded ctx channel would then silently drop the
     // next clicks' context. Cap it like the tree walker does (tree/macos.rs).
-    let _ = elem.set_messaging_timeout_secs(0.1);
+    let _ = elem.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
 
-    // AXWindow belongs to the hit-tested element, unlike AXFocusedWindow which
-    // can still describe the previously focused app at mouse-down time.
-    let window = elem.window().ok()?;
-    let _ = window.set_messaging_timeout_secs(0.1);
+    // Firefox page elements can omit AXWindow. Resolve the clicked ancestry,
+    // never AXFocusedWindow (which can describe another window at mouse-down).
+    let window = match resolve_clicked_window(&elem, request.app_pid) {
+        Ok(window) => window,
+        Err(cause) => {
+            if is_browser {
+                crate::capture_diagnostics::report_browser_click_failure(
+                    "clicked_window",
+                    &cause,
+                    request.captured_at.elapsed(),
+                    "withheld_unattributable",
+                );
+            }
+            return None;
+        }
+    };
+    let _ = window.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
     let raw_window_title = get_string_attr(&window, ax::attr::title())
         .or_else(|| get_string_attr(&window, ax::attr::desc()));
 
@@ -2011,14 +2058,174 @@ fn capture_click_at_position(
             }
         };
 
-    let element = config
-        .capture_context
-        .then(|| build_click_element_context(&elem, request.x, request.y, config))
-        .flatten();
+    let element = if config.capture_context && element_hit {
+        build_click_element_context(&elem, request.x, request.y, config)
+    } else {
+        None
+    };
 
-    attributed_click_event(request, app_name, window_title, element)
+    let mut event = attributed_click_event(request, app_name, window_title, element)
         .map_err(|reason| debug!(?reason, "dropping click with invalid event coordinates"))
-        .ok()
+        .ok()?;
+    if is_browser {
+        let started = Instant::now();
+        let url = crate::tree::clicked_window_browser_url(&window);
+        let current_title = get_string_attr(&window, ax::attr::title())
+            .or_else(|| get_string_attr(&window, ax::attr::desc()));
+        let url = if current_title.as_deref() == raw_window_title.as_deref() {
+            url
+        } else {
+            Err("clicked window title changed during URL lookup; URL attribution discarded".into())
+        };
+        match url {
+            Ok(url) => event.browser_url = Some(url),
+            Err(cause) => crate::capture_diagnostics::report_browser_click_failure(
+                "clicked_window_url",
+                &cause,
+                started.elapsed(),
+                "forwarded_to_privacy_filter",
+            ),
+        }
+    }
+    Some(event)
+}
+
+/// AX's native window-ID bridge lets a receiver window remain identifiable
+/// even when a browser does not implement element-at-position queries.
+fn native_window_id(window: &ax::UiElement) -> Result<u32, String> {
+    unsafe extern "C" {
+        fn _AXUIElementGetWindow(element: *const ax::UiElement, window: *mut u32) -> i32;
+    }
+    let mut id = 0;
+    let status = unsafe { _AXUIElementGetWindow(window, &mut id) };
+    if status == 0 && id != 0 {
+        Ok(id)
+    } else {
+        Err(format!(
+            "AX window ID read failed: status={status}, window_id={id}"
+        ))
+    }
+}
+
+fn sharing_session_button(role: Option<&str>, title: Option<&str>) -> bool {
+    role == Some("AXButton") && title == Some("WindowSharingSessionButton")
+}
+
+/// Positively identify AppKit's window-sharing controls, not user dialogs.
+/// The native AX child marker is observed on macOS 26/27, not a public SDK
+/// constant. Unknown elements remain ordinary content. Match exact native
+/// window IDs; window titles, dimensions and screen positions are not identity.
+pub fn window_sharing_control_ids(pid: i32) -> Result<Vec<u32>, String> {
+    if !ax::is_process_trusted() {
+        return Err(
+            "Accessibility permission unavailable for sharing-control identification".into(),
+        );
+    }
+    let _query = AX_QUERY_LOCK.try_lock().ok_or("AX metadata query busy")?;
+    let app = ax::UiElement::with_app_pid(pid);
+    let _ = app.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
+    let value = app
+        .attr_value(ax::attr::windows())
+        .map_err(|error| format!("sharing-control AXWindows read failed: {error:?}"))?;
+    if value.get_type_id() != cf::Array::type_id() {
+        return Err("sharing-control AXWindows was not an array".into());
+    }
+    let windows: &cf::ArrayOf<ax::UiElement> = unsafe { std::mem::transmute(&*value) };
+    let mut ids = Vec::new();
+    for window in windows.iter() {
+        let _ = window.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
+        if window.pid().ok() != Some(pid) {
+            continue;
+        }
+        let Ok(children) = window.children() else {
+            continue;
+        };
+        for child in children.iter() {
+            let _ = child.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
+            if sharing_session_button(
+                get_string_attr(child, ax::attr::role()).as_deref(),
+                get_string_attr(child, ax::attr::title()).as_deref(),
+            ) {
+                ids.push(native_window_id(window)?);
+                break;
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn clicked_window_for_receiver(
+    request: &ContextCaptureRequest,
+) -> Result<Retained<ax::UiElement>, String> {
+    let wanted = request
+        .window_id
+        .ok_or("CGEvent receiver window ID missing")?;
+    let app = ax::UiElement::with_app_pid(request.app_pid);
+    let _ = app.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
+    let value = app
+        .attr_value(ax::attr::windows())
+        .map_err(|error| format!("receiver AXWindows read failed: {error:?}"))?;
+    if value.get_type_id() != cf::Array::type_id() {
+        return Err("receiver AXWindows was not an array".into());
+    }
+    let windows: &cf::ArrayOf<ax::UiElement> = unsafe { std::mem::transmute(&*value) };
+    let mut last_error = "receiver window is no longer present".to_string();
+    for window in windows.iter() {
+        let _ = window.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
+        match native_window_id(window) {
+            Ok(id) if id == wanted => {
+                validate_click_element_pid(
+                    request.app_pid,
+                    window.pid().ok(),
+                    std::process::id() as i32,
+                )
+                .map_err(|reason| format!("receiver AXWindow identity rejected: {reason:?}"))?;
+                return Ok(window.retained());
+            }
+            Err(error) => last_error = error,
+            _ => {}
+        }
+    }
+    Err(format!(
+        "no AXWindow matches CGEvent receiver window ID; {last_error}"
+    ))
+}
+
+fn resolve_clicked_window(
+    elem: &ax::UiElement,
+    target_pid: i32,
+) -> Result<Retained<ax::UiElement>, String> {
+    let window_error = match elem.window() {
+        Ok(window) => {
+            validate_click_element_pid(target_pid, window.pid().ok(), std::process::id() as i32)
+                .map_err(|reason| format!("clicked AXWindow identity rejected: {reason:?}"))?;
+            return Ok(window);
+        }
+        Err(error) => error,
+    };
+    let mut current = elem.retained();
+    let mut seen: Vec<Retained<ax::UiElement>> = Vec::new();
+    loop {
+        // Follow the retained hit-test element to its natural window root.
+        // Detect provider cycles without imposing a new ancestry depth limit.
+        if seen.iter().any(|ancestor| ancestor.equal(&current)) {
+            return Err(format!(
+                "AXWindow read failed: {window_error:?}; cyclic clicked AXParent chain"
+            ));
+        }
+        seen.push(current.retained());
+        let _ = current.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
+        validate_click_element_pid(target_pid, current.pid().ok(), std::process::id() as i32)
+            .map_err(|reason| format!("AXWindow read failed: {window_error:?}; clicked ancestor identity rejected: {reason:?}"))?;
+        if role_string(&current).as_deref() == Some("AXWindow") {
+            return Ok(current);
+        }
+        current = current.parent().map_err(|error| {
+            format!(
+                "AXWindow read failed: {window_error:?}; clicked AXParent read failed: {error:?}"
+            )
+        })?;
+    }
 }
 
 fn valid_event_target_pid(raw_pid: i64) -> Option<i32> {
@@ -2045,6 +2252,9 @@ fn snapshot_click_request(
         x: location.x,
         y: location.y,
         app_pid,
+        window_id: u32::try_from(event.field_i64(CG_EVENT_RECEIVER_WINDOW_ID))
+            .ok()
+            .filter(|id| *id != 0),
         captured_at: Instant::now(),
         timestamp,
         relative_ms,
@@ -2310,7 +2520,7 @@ fn collect_ancestor_chain(
         let node_elem: &ax::UiElement = unsafe { std::mem::transmute(&*node) };
         // Per-hop cap: each ancestor is a NEW AXUIElement ref, so the
         // timeout set on the hit-test element does not carry over.
-        let _ = node_elem.set_messaging_timeout_secs(0.1);
+        let _ = node_elem.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
         let Some(role) = role_string(node_elem) else {
             break;
         };
@@ -2368,6 +2578,22 @@ fn get_string_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<String> {
     })
 }
 
+/// Read only the focused window's geometry, without walking or extracting text.
+/// Cursor location and notification caches are not evidence of window ownership.
+pub fn get_focused_window_bounds_fresh() -> Option<ElementBounds> {
+    ensure_global_ax_timeout();
+    let pid = get_focused_pid_fresh()?;
+    let app = ax::UiElement::with_app_pid(pid);
+    let focused = app.attr_value(ax::attr::focused_window()).ok()?;
+    if focused.get_type_id() != ax::UiElement::type_id() {
+        return None;
+    }
+    // Safety: the AX type was checked above and `focused` retains the element.
+    let window: &ax::UiElement = unsafe { std::mem::transmute(&*focused) };
+    let bounds = get_element_bounds(window)?;
+    (get_focused_pid_fresh() == Some(pid)).then_some(bounds)
+}
+
 fn get_focused_window_title(pid: i32) -> Option<String> {
     let app = ax::UiElement::with_app_pid(pid);
 
@@ -2375,7 +2601,7 @@ fn get_focused_window_title(pid: i32) -> Option<String> {
     // frequent unbounded read we make. Match the 0.1s the click/context paths
     // already use rather than leaning on the 1s process default: a slow app
     // should cost us a missing title, not a stalled observer thread.
-    let _ = app.set_messaging_timeout_secs(0.1);
+    let _ = app.set_messaging_timeout_secs(AX_METADATA_TIMEOUT_SECS);
 
     let focused = app.attr_value(ax::attr::focused_window()).ok()?;
 
@@ -3096,6 +3322,24 @@ mod macos_click_attribution_eval;
 mod tests {
     use super::*;
 
+    #[test]
+    fn sharing_control_requires_the_native_button_marker() {
+        assert!(sharing_session_button(
+            Some("AXButton"),
+            Some("WindowSharingSessionButton")
+        ));
+        assert!(!sharing_session_button(Some("AXButton"), Some("Window")));
+        assert!(!sharing_session_button(
+            Some("AXDialog"),
+            Some("WindowSharingSessionButton")
+        ));
+        assert!(!sharing_session_button(
+            None,
+            Some("WindowSharingSessionButton")
+        ));
+        assert!(!sharing_session_button(Some("AXButton"), None));
+    }
+
     /// The AX observer thread loops on `run_in_mode`. Two of the four results
     /// come back instantly: `Finished` when the mode has no sources or timers
     /// left, and `Stopped` after `CFRunLoopStop`. Looping straight back in on
@@ -3223,12 +3467,40 @@ mod tests {
     }
 
     #[test]
+    fn macos_click_attribution_snapshots_receiver_window_id() {
+        let mut event = cg::Event::mouse(
+            None,
+            cg::EventType::LEFT_MOUSE_DOWN,
+            cg::Point::new(100.0, 100.0),
+            cg::MouseButton::Left,
+        )
+        .unwrap();
+        event.set_field_i64(CG_EVENT_TARGET_UNIX_PROCESS_ID, 42);
+        event.set_field_i64(cg::EventField::MOUSE_EVENT_CLICK_STATE, 1);
+        for (raw, expected) in [
+            // CoreGraphics canonicalizes this field to UInt32 on write.
+            (-1, Some(u32::MAX)),
+            (0, None),
+            (123, Some(123)),
+            (i64::from(u32::MAX), Some(u32::MAX)),
+            (i64::from(u32::MAX) + 1, None),
+        ] {
+            event.set_field_i64(CG_EVENT_RECEIVER_WINDOW_ID, raw);
+            let request =
+                snapshot_click_request(cg::EventType::LEFT_MOUSE_DOWN, &event, Utc::now(), 1)
+                    .unwrap();
+            assert_eq!(request.window_id, expected, "native window field {raw}");
+        }
+    }
+
+    #[test]
     fn attributed_click_preserves_original_mouse_down_facts() {
         let timestamp = Utc::now();
         let request = ContextCaptureRequest {
             x: 321.75,
             y: 654.25,
             app_pid: 42,
+            window_id: None,
             captured_at: Instant::now(),
             timestamp,
             relative_ms: 987,

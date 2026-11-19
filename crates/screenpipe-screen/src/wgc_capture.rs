@@ -33,11 +33,12 @@
 
 use anyhow::{anyhow, Result};
 use image::{DynamicImage, RgbaImage};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use windows::{
-    core::{factory, IInspectable, Interface},
+    core::{factory, Error as WindowsError, IInspectable, Interface},
     Foundation::{EventRegistrationToken, TimeSpan, TypedEventHandler},
     Graphics::{
         Capture::{
@@ -48,15 +49,14 @@ use windows::{
         SizeInt32,
     },
     Win32::{
-        Foundation::{BOOL, HMODULE, LPARAM, RECT, TRUE},
+        Foundation::{BOOL, HMODULE, HWND, LPARAM, RECT, TRUE},
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
                 ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
-                D3D11_USAGE_STAGING,
+                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_STAGING,
             },
             Dxgi::IDXGIDevice,
             Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
@@ -68,11 +68,7 @@ use windows::{
     },
 };
 
-/// Caps the `FrameArrived` callback rate at ~60Hz. Purely a bonus on top of
-/// demand-driven copying: it reduces callback overhead on high-refresh-rate displays.
-/// Best-effort — `SetMinUpdateInterval` needs Win11 24H2+ and is a no-op if unsupported,
-/// since callbacks without a pending request only drain and inspect the frame.
-const MIN_UPDATE_INTERVAL_100NS: i64 = 166_667;
+const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
 
 const FRAME_POOL_BUFFERS: i32 = 2;
 
@@ -82,6 +78,11 @@ pub struct CaptureStats {
     pub frame_arrivals: u64,
     pub copy_submissions: u64,
     pub image_requests: u64,
+    pub native_interval_requested_fps: u32,
+    pub native_interval_ticks: i64,
+    pub native_interval_attempts: u64,
+    pub native_interval_successes: u64,
+    pub native_interval_failures: u64,
 }
 
 #[derive(Default)]
@@ -89,6 +90,11 @@ struct CaptureCounters {
     frame_arrivals: AtomicU64,
     copy_submissions: AtomicU64,
     image_requests: AtomicU64,
+    native_interval_requested_fps: AtomicU32,
+    native_interval_ticks: AtomicI64,
+    native_interval_attempts: AtomicU64,
+    native_interval_successes: AtomicU64,
+    native_interval_failures: AtomicU64,
 }
 
 impl CaptureCounters {
@@ -97,8 +103,126 @@ impl CaptureCounters {
             frame_arrivals: self.frame_arrivals.load(Ordering::Relaxed),
             copy_submissions: self.copy_submissions.load(Ordering::Relaxed),
             image_requests: self.image_requests.load(Ordering::Relaxed),
+            native_interval_requested_fps: self
+                .native_interval_requested_fps
+                .load(Ordering::Relaxed),
+            native_interval_ticks: self.native_interval_ticks.load(Ordering::Relaxed),
+            native_interval_attempts: self.native_interval_attempts.load(Ordering::Relaxed),
+            native_interval_successes: self.native_interval_successes.load(Ordering::Relaxed),
+            native_interval_failures: self.native_interval_failures.load(Ordering::Relaxed),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NativeIntervalStatus {
+    NotAttempted = 0,
+    Applied = 1,
+    UnsupportedOrFailed = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum NativeIntervalCapability {
+    Unknown = 0,
+    Available = 1,
+    Unavailable = 2,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConfiguredIntervalCause {
+    InitialSetup,
+    LivePreference,
+    FreshRequestRestore,
+}
+
+fn native_interval_is_unavailable(error: &WindowsError) -> bool {
+    matches!(
+        error.code().0 as u32,
+        0x8000_4001 // E_NOTIMPL
+            | 0x8000_4002 // E_NOINTERFACE (older GraphicsCaptureSession interface)
+            | 0x8007_0032 // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+    )
+}
+
+fn should_attempt_fresh_override(capability: u8) -> bool {
+    capability != NativeIntervalCapability::Unavailable as u8
+}
+
+fn record_configured_interval_outcome(
+    stats: &CaptureCounters,
+    status: &AtomicU8,
+    capability: &AtomicU8,
+    requested_fps: u32,
+    interval_ticks: i64,
+    cause: ConfiguredIntervalCause,
+    outcome: &windows::core::Result<()>,
+) -> NativeIntervalStatus {
+    stats
+        .native_interval_requested_fps
+        .store(requested_fps, Ordering::Release);
+    stats
+        .native_interval_attempts
+        .fetch_add(1, Ordering::Relaxed);
+
+    match outcome {
+        Ok(()) => {
+            stats
+                .native_interval_ticks
+                .store(interval_ticks, Ordering::Release);
+            stats
+                .native_interval_successes
+                .fetch_add(1, Ordering::Relaxed);
+            capability.store(NativeIntervalCapability::Available as u8, Ordering::Release);
+            let previous = status.swap(NativeIntervalStatus::Applied as u8, Ordering::AcqRel);
+            if previous == NativeIntervalStatus::UnsupportedOrFailed as u8 {
+                tracing::info!(
+                    requested_fps,
+                    interval_ticks,
+                    ?cause,
+                    outcome = "recovered",
+                    "WGC native minimum update interval recovered"
+                );
+            } else if !matches!(cause, ConfiguredIntervalCause::FreshRequestRestore) {
+                tracing::info!(
+                    requested_fps,
+                    interval_ticks,
+                    ?cause,
+                    outcome = "applied",
+                    "WGC native minimum update interval applied"
+                );
+            }
+            NativeIntervalStatus::Applied
+        }
+        Err(error) => {
+            stats.native_interval_ticks.store(0, Ordering::Release);
+            stats
+                .native_interval_failures
+                .fetch_add(1, Ordering::Relaxed);
+            if native_interval_is_unavailable(error) {
+                capability.store(
+                    NativeIntervalCapability::Unavailable as u8,
+                    Ordering::Release,
+                );
+                tracing::warn!(requested_fps, interval_ticks, ?cause, outcome = "unsupported", ?error, "WGC native minimum update interval unavailable for this session; retaining safe demand-driven capture without per-request capability probes");
+            } else {
+                tracing::warn!(requested_fps, interval_ticks, ?cause, outcome = "failed", ?error, "WGC native minimum update interval failed transiently; retaining safe demand-driven capture; a later retry can recover native rate control");
+            }
+            status.store(
+                NativeIntervalStatus::UnsupportedOrFailed as u8,
+                Ordering::Release,
+            );
+            NativeIntervalStatus::UnsupportedOrFailed
+        }
+    }
+}
+
+fn min_update_interval_ticks(fps: u32) -> i64 {
+    // Round up so the producer is never asked to exceed the preference. Windows'
+    // TimeSpan has 100ns resolution, so rates above 10 MHz saturate at one tick;
+    // this is a native representation limit, not a product FPS ceiling.
+    WINDOWS_TICKS_PER_SECOND.div_ceil(fps as u64).max(1) as i64
 }
 
 /// Generations make outstanding demand explicit and allow one frame to satisfy all
@@ -174,6 +298,7 @@ struct D3dContext {
 }
 
 static SHARED_D3D: Mutex<Option<Arc<D3dContext>>> = Mutex::new(None);
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn shared_d3d_cache() -> MutexGuard<'static, Option<Arc<D3dContext>>> {
     // Poison recovery: the cache holds an Option we always overwrite consistently;
@@ -329,6 +454,12 @@ fn create_texture_like(
     texture.ok_or_else(|| anyhow!("CreateTexture2D returned no texture"))
 }
 
+fn texture_dimensions(texture: &ID3D11Texture2D) -> (u32, u32) {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    (desc.Width, desc.Height)
+}
+
 extern "system" fn monitor_enum_proc(
     h_monitor: HMONITOR,
     _hdc: HDC,
@@ -364,8 +495,12 @@ fn find_hmonitor(monitor_id: u32) -> Result<HMONITOR> {
 
 struct LatestFrame {
     texture: Option<ID3D11Texture2D>,
+    reusable: Vec<ID3D11Texture2D>,
     width: u32,
     height: u32,
+    system_relative_time: i64,
+    sequence: u64,
+    captured_at: chrono::DateTime<chrono::Utc>,
     /// Size the frame pool's buffers were (re)created with. Frames whose surface size
     /// differs are stale pre-`Recreate` deliveries and are dropped; frames whose
     /// `ContentSize` differs signal a display mode change and trigger a `Recreate`.
@@ -373,9 +508,73 @@ struct LatestFrame {
     demand: CopyDemand,
 }
 
+// CreateForWindow can retain an ALPC port after the returned item is released.
+// Cache only a bounded set of keyed native targets, never sessions or pixels.
+struct PrivacyWindowItem {
+    window_id: u32,
+    pid: u32,
+    item: GraphicsCaptureItem,
+    closed: Arc<AtomicBool>,
+    closed_token: EventRegistrationToken,
+}
+
+impl Drop for PrivacyWindowItem {
+    fn drop(&mut self) {
+        let _ = self.item.RemoveClosed(self.closed_token);
+    }
+}
+
+fn privacy_window_items() -> &'static Mutex<VecDeque<PrivacyWindowItem>> {
+    static ITEMS: OnceLock<Mutex<VecDeque<PrivacyWindowItem>>> = OnceLock::new();
+    ITEMS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn privacy_window_item(window_id: u32, pid: u32) -> Result<GraphicsCaptureItem> {
+    let mut items = privacy_window_items()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    items.retain(|entry| {
+        !entry.closed.load(Ordering::Acquire) && (entry.window_id != window_id || entry.pid == pid)
+    });
+    if let Some(index) = items
+        .iter()
+        .position(|entry| entry.window_id == window_id && entry.pid == pid)
+    {
+        let entry = items.remove(index).expect("located item");
+        let item = entry.item.clone();
+        items.push_back(entry);
+        return Ok(item);
+    }
+    let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+    let item: GraphicsCaptureItem =
+        unsafe { interop.CreateForWindow(HWND(window_id as usize as *mut std::ffi::c_void))? };
+    let closed = Arc::new(AtomicBool::new(false));
+    let flag = closed.clone();
+    let closed_token = item.Closed(
+        &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
+            flag.store(true, Ordering::Release);
+            Ok(())
+        }),
+    )?;
+    const MAX_PRIVACY_ITEMS: usize = 8;
+    if items.len() == MAX_PRIVACY_ITEMS {
+        items.pop_front();
+    }
+    items.push_back(PrivacyWindowItem {
+        window_id,
+        pid,
+        item: item.clone(),
+        closed,
+        closed_token,
+    });
+    Ok(item)
+}
+
 /// Persistent WGC capture session that keeps a single GraphicsCaptureSession alive,
 /// eliminating the orange border flash caused by per-frame session create/destroy.
 pub struct PersistentCapture {
+    session_id: u64,
+    preserve_alpha: bool,
     d3d: Arc<D3dContext>,
     item: GraphicsCaptureItem,
     session: GraphicsCaptureSession,
@@ -384,6 +583,9 @@ pub struct PersistentCapture {
     closed_token: EventRegistrationToken,
     latest: Arc<(Mutex<LatestFrame>, Condvar)>,
     stats: Arc<CaptureCounters>,
+    native_interval_status: AtomicU8,
+    native_interval_capability: AtomicU8,
+    native_interval_update: Mutex<()>,
     /// Set when the capture item reports `Closed` (monitor disconnect, session
     /// invalidated) or `stop()` runs. Checked *before* the cached frame in
     /// `get_latest_image` — a closed session errors out (triggering reinit in
@@ -392,15 +594,23 @@ pub struct PersistentCapture {
     /// Makes `stop()` idempotent: explicit `stop()` followed by `Drop` must not
     /// double-`Close()` the session/pool (spurious warn logs on every teardown).
     stopped: AtomicBool,
-    /// Cached staging texture for lazy readback, reused across calls unless size changes.
-    staging: Mutex<Option<(ID3D11Texture2D, u32, u32)>>,
+}
+
+/// Pixels and compositor identity selected by one atomic GPU submission.
+/// The texture copied for this observation is never reused, so the callback
+/// cannot advance its contents between selection and CPU staging.
+pub(crate) struct NativeFrame {
+    pub image: DynamicImage,
+    pub session_id: u64,
+    pub system_relative_time: i64,
+    pub sequence: u64,
+    pub captured_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl PersistentCapture {
     /// Create and start a persistent WGC capture for the given monitor ID.
     pub fn new(monitor_id: u32) -> Result<Self> {
         let h_monitor = find_hmonitor(monitor_id)?;
-        let d3d = acquire_d3d()?;
 
         let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .map_err(|e| anyhow!("failed to get GraphicsCaptureItem factory: {}", e))?;
@@ -409,6 +619,25 @@ impl PersistentCapture {
                 .CreateForMonitor(h_monitor)
                 .map_err(|e| anyhow!("CreateForMonitor failed: {}", e))?
         };
+        Self::from_item(item, false)
+    }
+
+    /// Capture only this window's compositor surface. Reuse only the keyed native
+    /// target; every call creates a new session and never retains pixels.
+    pub(crate) fn new_privacy_window(window_id: u32, pid: u32) -> Result<Self> {
+        let item = privacy_window_item(window_id, pid)?;
+        let result = Self::from_item(item, true);
+        if result.is_err() {
+            privacy_window_items()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|entry| entry.window_id != window_id || entry.pid != pid);
+        }
+        result
+    }
+
+    fn from_item(item: GraphicsCaptureItem, capture_initial_frame: bool) -> Result<Self> {
+        let d3d = acquire_d3d()?;
         let item_size = item
             .Size()
             .map_err(|e| anyhow!("GraphicsCaptureItem::Size failed: {}", e))?;
@@ -424,13 +653,24 @@ impl PersistentCapture {
         )
         .map_err(|e| d3d.describe_err("CreateFreeThreaded", e))?;
 
+        // A newly created window session can emit its only frame before its
+        // caller starts waiting. Retain that first frame for a static window;
+        // ordinary persistent monitor sessions remain demand-driven as before.
+        let mut demand = CopyDemand::default();
+        if capture_initial_frame {
+            demand.request();
+        }
         let latest: Arc<(Mutex<LatestFrame>, Condvar)> = Arc::new((
             Mutex::new(LatestFrame {
                 texture: None,
+                reusable: Vec::with_capacity(2),
                 width: 0,
                 height: 0,
+                system_relative_time: 0,
+                sequence: 0,
+                captured_at: chrono::Utc::now(),
                 pool_size: (item_size.Width, item_size.Height),
-                demand: CopyDemand::default(),
+                demand,
             }),
             Condvar::new(),
         ));
@@ -478,6 +718,7 @@ impl PersistentCapture {
                     match closed_latest.0.lock() {
                         Ok(mut slot) => {
                             slot.texture = None;
+                            slot.reusable.clear();
                             closed_flag.store(true, Ordering::Release);
                         }
                         Err(_) => closed_flag.store(true, Ordering::Release),
@@ -521,14 +762,22 @@ impl PersistentCapture {
                 e
             );
         }
-        if let Err(e) = session.SetMinUpdateInterval(TimeSpan {
-            Duration: MIN_UPDATE_INTERVAL_100NS,
-        }) {
-            tracing::debug!(
-                "SetMinUpdateInterval failed (non-fatal, needs Win11 24H2+): {:?}",
-                e
-            );
-        }
+        let requested_fps = crate::screenshot_rate::current();
+        let interval_ticks = min_update_interval_ticks(requested_fps);
+        let native_interval_status = AtomicU8::new(NativeIntervalStatus::NotAttempted as u8);
+        let native_interval_capability = AtomicU8::new(NativeIntervalCapability::Unknown as u8);
+        let interval_outcome = session.SetMinUpdateInterval(TimeSpan {
+            Duration: interval_ticks,
+        });
+        record_configured_interval_outcome(
+            &stats,
+            &native_interval_status,
+            &native_interval_capability,
+            requested_fps,
+            interval_ticks,
+            ConfiguredIntervalCause::InitialSetup,
+            &interval_outcome,
+        );
 
         if let Err(e) = session.StartCapture() {
             cleanup_init_failure(Some(&session));
@@ -536,6 +785,8 @@ impl PersistentCapture {
         }
 
         Ok(Self {
+            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            preserve_alpha: capture_initial_frame,
             d3d,
             item,
             session,
@@ -544,9 +795,11 @@ impl PersistentCapture {
             closed_token,
             latest,
             stats,
+            native_interval_status,
+            native_interval_capability,
+            native_interval_update: Mutex::new(()),
             closed,
             stopped: AtomicBool::new(false),
-            staging: Mutex::new(None),
         })
     }
 
@@ -628,6 +881,7 @@ impl PersistentCapture {
             }
             slot.pool_size = content_size;
             slot.texture = None;
+            slot.reusable.clear();
             slot.width = 0;
             slot.height = 0;
             // Skip this old-size frame; the next delivery uses the recreated buffers.
@@ -663,15 +917,29 @@ impl PersistentCapture {
             return Ok(false);
         }
 
-        if slot.texture.is_none() || slot.width != desc.Width || slot.height != desc.Height {
-            let texture = create_texture_like(&d3d.device, &desc, D3D11_USAGE_DEFAULT, 0)
-                .map_err(|e| d3d.describe_err("create latest texture", e))?;
-            slot.texture = Some(texture);
-            slot.width = desc.Width;
-            slot.height = desc.Height;
-        }
-
-        let dst = slot.texture.as_ref().expect("ensured above");
+        // A selected texture is immutable. Reusing the previous destination lets
+        // FrameArrived overwrite it after a reader chooses metadata but before it
+        // submits its staging copy (an ABA privacy bug).
+        let dst = slot
+            .texture
+            .take()
+            .filter(|texture| texture_dimensions(texture) == (desc.Width, desc.Height))
+            .or_else(|| {
+                slot.reusable
+                    .iter()
+                    .position(|texture| texture_dimensions(texture) == (desc.Width, desc.Height))
+                    .map(|index| slot.reusable.swap_remove(index))
+            })
+            .map(Ok)
+            .unwrap_or_else(|| {
+                create_texture_like(
+                    &d3d.device,
+                    &desc,
+                    D3D11_USAGE_STAGING,
+                    D3D11_CPU_ACCESS_READ.0 as u32,
+                )
+                .map_err(|e| d3d.describe_err("create selected texture", e))
+            })?;
         let dst_resource: ID3D11Resource = dst
             .cast()
             .map_err(|e| anyhow!("cast latest texture to ID3D11Resource failed: {}", e))?;
@@ -682,6 +950,16 @@ impl PersistentCapture {
             let _context_guard = d3d.lock_context();
             unsafe { d3d.context.CopyResource(&dst_resource, &src_resource) };
         }
+        let system_relative_time = frame
+            .SystemRelativeTime()
+            .map_err(|e| anyhow!("SystemRelativeTime failed: {}", e))?
+            .Duration;
+        slot.texture = Some(dst);
+        slot.width = desc.Width;
+        slot.height = desc.Height;
+        slot.system_relative_time = system_relative_time;
+        slot.sequence = slot.sequence.wrapping_add(1).max(1);
+        slot.captured_at = chrono::Utc::now();
         slot.demand.complete(request_generation);
         stats.copy_submissions.fetch_add(1, Ordering::Relaxed);
         Ok(true)
@@ -696,7 +974,59 @@ impl PersistentCapture {
     /// BGRA->RGBA swizzle happen here, lazily, only when a frame is actually needed —
     /// not on every compositor frame `FrameArrived` delivers.
     pub fn get_latest_image(&self, timeout: Duration) -> Result<DynamicImage> {
-        self.get_image(timeout, FrameReadPolicy::Fresh)
+        self.refresh_min_update_interval();
+
+        // A low background producer rate must not make an explicitly requested
+        // fresh screenshot miss the caller's existing deadline. Temporarily remove
+        // the native throttle while this demand is outstanding, then restore the
+        // user's configured rate. The update mutex keeps live preference changes
+        // and concurrent requests ordered; cached pixels are still forbidden by
+        // FrameReadPolicy::Fresh.
+        let _update = self
+            .native_interval_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capability = self.native_interval_capability.load(Ordering::Acquire);
+        let override_applied = if !should_attempt_fresh_override(capability) {
+            false
+        } else {
+            match self.session.SetMinUpdateInterval(TimeSpan { Duration: 0 }) {
+                Ok(()) => {
+                    self.native_interval_capability
+                        .store(NativeIntervalCapability::Available as u8, Ordering::Release);
+                    true
+                }
+                Err(error) => {
+                    if native_interval_is_unavailable(&error) {
+                        self.native_interval_capability.store(
+                            NativeIntervalCapability::Unavailable as u8,
+                            Ordering::Release,
+                        );
+                    }
+                    tracing::warn!(?error, outcome = "failed", "WGC fresh-request interval override unsupported or failed; continuing with configured interval and fresh-pixel guard");
+                    false
+                }
+            }
+        };
+
+        let result = self.get_image_inner(timeout, FrameReadPolicy::Fresh);
+        if override_applied {
+            let requested_fps = crate::screenshot_rate::current();
+            let interval_ticks = min_update_interval_ticks(requested_fps);
+            let outcome = self.session.SetMinUpdateInterval(TimeSpan {
+                Duration: interval_ticks,
+            });
+            record_configured_interval_outcome(
+                &self.stats,
+                &self.native_interval_status,
+                &self.native_interval_capability,
+                requested_fps,
+                interval_ticks,
+                ConfiguredIntervalCause::FreshRequestRestore,
+                &outcome,
+            );
+        }
+        result
     }
 
     /// Read at recording cadence while still requesting the next changed frame.
@@ -707,10 +1037,42 @@ impl PersistentCapture {
     /// pending, allowing the next compositor update to replace that texture without
     /// continuously copying unchanged GPU frames.
     pub fn get_latest_image_streaming(&self, timeout: Duration) -> Result<DynamicImage> {
-        self.get_image(timeout, FrameReadPolicy::CachedWhileRefreshing)
+        Ok(self.get_latest_native_frame_streaming(timeout)?.image)
     }
 
-    fn get_image(&self, timeout: Duration, policy: FrameReadPolicy) -> Result<DynamicImage> {
+    pub(crate) fn get_latest_native_frame_streaming(
+        &self,
+        timeout: Duration,
+    ) -> Result<NativeFrame> {
+        self.get_changed_native_frame_streaming(timeout, None)?
+            .ok_or_else(|| anyhow!("WGC returned no image for an unconditional read"))
+    }
+
+    pub(crate) fn get_changed_native_frame_streaming(
+        &self,
+        timeout: Duration,
+        previous_sequence: Option<u64>,
+    ) -> Result<Option<NativeFrame>> {
+        self.refresh_min_update_interval();
+        self.get_native_frame_inner(
+            timeout,
+            FrameReadPolicy::CachedWhileRefreshing,
+            previous_sequence,
+        )
+    }
+
+    fn get_image_inner(&self, timeout: Duration, policy: FrameReadPolicy) -> Result<DynamicImage> {
+        self.get_native_frame_inner(timeout, policy, None)?
+            .map(|frame| frame.image)
+            .ok_or_else(|| anyhow!("WGC returned no image for an unconditional read"))
+    }
+
+    fn get_native_frame_inner(
+        &self,
+        timeout: Duration,
+        policy: FrameReadPolicy,
+        previous_sequence: Option<u64>,
+    ) -> Result<Option<NativeFrame>> {
         let deadline = Instant::now() + timeout;
         let (frame_lock, frame_ready) = &*self.latest;
         let mut slot = frame_lock
@@ -737,6 +1099,9 @@ impl PersistentCapture {
                 slot.texture.is_some(),
                 slot.demand.is_complete(request_generation),
             ) {
+                if previous_sequence == Some(slot.sequence) {
+                    return Ok(None);
+                }
                 break;
             }
             let now = Instant::now();
@@ -750,18 +1115,90 @@ impl PersistentCapture {
             slot = next_slot;
         }
 
-        let texture = slot.texture.clone().expect("checked Some above");
+        let texture = slot.texture.take().expect("checked Some above");
         let width = slot.width;
         let height = slot.height;
+        let system_relative_time = slot.system_relative_time;
+        let sequence = slot.sequence;
+        let captured_at = slot.captured_at;
+        let pool_size = slot.pool_size;
         // Release the frame lock before the (comparatively slow) readback so
         // FrameArrived isn't blocked from swapping in newer frames meanwhile.
         drop(slot);
 
-        self.readback(&texture, width, height)
+        let image = self.readback(&texture, width, height);
+        if let Ok(mut slot) = frame_lock.lock() {
+            if !self.closed.load(Ordering::Acquire) && slot.pool_size == pool_size {
+                if slot.texture.is_none() && slot.sequence == sequence && image.is_ok() {
+                    slot.texture = Some(texture);
+                    frame_ready.notify_all();
+                } else if slot.reusable.len() < 2 {
+                    slot.reusable.push(texture);
+                }
+            }
+        }
+        Ok(Some(NativeFrame {
+            image: image?,
+            session_id: self.session_id,
+            system_relative_time,
+            sequence,
+            captured_at,
+        }))
     }
 
     pub fn stats(&self) -> CaptureStats {
         self.stats.snapshot()
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) || self.d3d.invalidate_if_removed()
+    }
+
+    pub fn native_interval_status(&self) -> NativeIntervalStatus {
+        match self.native_interval_status.load(Ordering::Acquire) {
+            1 => NativeIntervalStatus::Applied,
+            2 => NativeIntervalStatus::UnsupportedOrFailed,
+            _ => NativeIntervalStatus::NotAttempted,
+        }
+    }
+
+    /// Apply a live preference change before admitting the next screenshot request.
+    /// An already-admitted request is never cancelled or restarted.
+    fn refresh_min_update_interval(&self) {
+        let requested_fps = crate::screenshot_rate::current();
+        if self
+            .stats
+            .native_interval_requested_fps
+            .load(Ordering::Acquire)
+            == requested_fps
+        {
+            return;
+        }
+        let _update = self
+            .native_interval_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .stats
+            .native_interval_requested_fps
+            .load(Ordering::Acquire)
+            == requested_fps
+        {
+            return;
+        }
+        let interval_ticks = min_update_interval_ticks(requested_fps);
+        let outcome = self.session.SetMinUpdateInterval(TimeSpan {
+            Duration: interval_ticks,
+        });
+        record_configured_interval_outcome(
+            &self.stats,
+            &self.native_interval_status,
+            &self.native_interval_capability,
+            requested_fps,
+            interval_ticks,
+            ConfiguredIntervalCause::LivePreference,
+            &outcome,
+        );
     }
 
     fn readback(&self, texture: &ID3D11Texture2D, width: u32, height: u32) -> Result<DynamicImage> {
@@ -769,41 +1206,12 @@ impl PersistentCapture {
         let mut rgba = vec![0u8; row_bytes * height as usize];
 
         {
-            let mut staging_slot = self
-                .staging
-                .lock()
-                .map_err(|_| anyhow!("staging texture mutex poisoned"))?;
-
-            let needs_new =
-                !matches!(&*staging_slot, Some((_, w, h)) if *w == width && *h == height);
-            if needs_new {
-                let mut src_desc = D3D11_TEXTURE2D_DESC::default();
-                unsafe { texture.GetDesc(&mut src_desc) };
-                let staging = create_texture_like(
-                    &self.d3d.device,
-                    &src_desc,
-                    D3D11_USAGE_STAGING,
-                    D3D11_CPU_ACCESS_READ.0 as u32,
-                )
-                .map_err(|e| self.d3d.describe_err("create staging texture", e))?;
-                *staging_slot = Some((staging, width, height));
-            }
-
-            let staging_texture = &staging_slot
-                .as_ref()
-                .expect("staging texture ensured above")
-                .0;
-            let dst_resource: ID3D11Resource = staging_texture
+            let dst_resource: ID3D11Resource = texture
                 .cast()
                 .map_err(|e| anyhow!("cast staging texture to ID3D11Resource failed: {}", e))?;
-            let src_resource: ID3D11Resource = texture
-                .cast()
-                .map_err(|e| anyhow!("cast latest texture to ID3D11Resource failed: {}", e))?;
 
             let _context_guard = self.d3d.lock_context();
             unsafe {
-                self.d3d.context.CopyResource(&dst_resource, &src_resource);
-
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 if let Err(e) =
                     self.d3d
@@ -821,18 +1229,21 @@ impl PersistentCapture {
                     let src_row = std::slice::from_raw_parts(src_ptr.add(src_offset), row_bytes);
                     let dst_row = &mut rgba[row * row_bytes..(row + 1) * row_bytes];
                     dst_row.copy_from_slice(src_row);
-                    // BGRA -> RGBA fused into the row copy while the row is hot in
-                    // cache. A separate whole-buffer pass after releasing the locks
-                    // re-reads the full frame from DRAM and measured ~4ms/readback
-                    // slower, so the swizzle stays inside the mapped loop.
-                    for px in dst_row.chunks_exact_mut(4) {
-                        px.swap(0, 2);
-                    }
                 }
 
                 self.d3d.context.Unmap(&dst_resource, 0);
             }
-        } // staging + context locks released — FrameArrived (all monitors) unblocked
+        } // context released — FrameArrived on every display can submit immediately
+
+        // CPU conversion must not hold either the frame-slot or shared D3D context
+        // lock. A large monitor's swizzle otherwise stalls callback submission for
+        // unrelated displays and can turn capture pressure into dropped evidence.
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+            if !self.preserve_alpha {
+                pixel[3] = 255;
+            }
+        }
 
         let img = RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| anyhow!("failed to build RgbaImage {}x{}", width, height))?;
@@ -866,15 +1277,12 @@ impl PersistentCapture {
         match self.latest.0.lock() {
             Ok(mut slot) => {
                 slot.texture = None;
+                slot.reusable.clear();
                 self.closed.store(true, Ordering::Release);
             }
             Err(_) => self.closed.store(true, Ordering::Release),
         }
         self.latest.1.notify_all();
-
-        if let Ok(mut staging) = self.staging.lock() {
-            *staging = None;
-        }
 
         tracing::debug!("persistent WGC capture stopped");
     }
@@ -889,7 +1297,32 @@ impl Drop for PersistentCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Write};
     use xcap::Monitor as XcapMonitor;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
 
     fn deliver_frame(demand: &mut CopyDemand) -> bool {
         let Some(generation) = demand.pending_generation() else {
@@ -989,6 +1422,132 @@ mod tests {
         assert!(demand.is_complete(u64::MAX));
     }
 
+    #[test]
+    fn native_interval_rounds_up_without_an_arbitrary_fps_ceiling() {
+        assert_eq!(min_update_interval_ticks(1), 10_000_000);
+        assert_eq!(min_update_interval_ticks(2), 5_000_000);
+        assert_eq!(min_update_interval_ticks(24), 416_667);
+        assert_eq!(min_update_interval_ticks(30), 333_334);
+        assert_eq!(min_update_interval_ticks(i32::MAX as u32), 1);
+    }
+
+    #[test]
+    fn configured_interval_failure_then_success_reports_recovery_consistently() {
+        let stats = CaptureCounters::default();
+        let status = AtomicU8::new(NativeIntervalStatus::Applied as u8);
+        let capability = AtomicU8::new(NativeIntervalCapability::Available as u8);
+        let ticks = min_update_interval_ticks(2);
+        let transient = Err(WindowsError::from_hresult(windows::core::HRESULT(
+            0x8000_4005u32 as i32,
+        )));
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(
+                record_configured_interval_outcome(
+                    &stats,
+                    &status,
+                    &capability,
+                    2,
+                    ticks,
+                    ConfiguredIntervalCause::FreshRequestRestore,
+                    &transient,
+                ),
+                NativeIntervalStatus::UnsupportedOrFailed
+            );
+            assert_eq!(stats.snapshot().native_interval_attempts, 1);
+            assert_eq!(stats.snapshot().native_interval_failures, 1);
+
+            assert_eq!(
+                record_configured_interval_outcome(
+                    &stats,
+                    &status,
+                    &capability,
+                    2,
+                    ticks,
+                    ConfiguredIntervalCause::FreshRequestRestore,
+                    &Ok(()),
+                ),
+                NativeIntervalStatus::Applied
+            );
+            // Ordinary successful restores must stay quiet on the recording hot path.
+            record_configured_interval_outcome(
+                &stats,
+                &status,
+                &capability,
+                2,
+                ticks,
+                ConfiguredIntervalCause::FreshRequestRestore,
+                &Ok(()),
+            );
+        });
+        assert_eq!(
+            capability.load(Ordering::Acquire),
+            NativeIntervalCapability::Available as u8
+        );
+        let recovered = stats.snapshot();
+        assert_eq!(recovered.native_interval_attempts, 3);
+        assert_eq!(recovered.native_interval_successes, 2);
+        assert_eq!(recovered.native_interval_failures, 1);
+        assert_eq!(recovered.native_interval_ticks, ticks);
+        assert_eq!(
+            status.load(Ordering::Acquire),
+            NativeIntervalStatus::Applied as u8
+        );
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("requested_fps=2"));
+        assert!(logs.contains("interval_ticks=5000000"));
+        assert!(logs.contains("cause=FreshRequestRestore"));
+        assert!(logs.contains("outcome=\"failed\""));
+        assert!(logs.contains("0x80004005"));
+        assert!(logs.contains("outcome=\"recovered\""));
+        assert!(!logs.contains("outcome=\"applied\""));
+        assert!(logs.contains("a later retry can recover native rate control"));
+    }
+
+    #[test]
+    fn unavailable_interval_capability_skips_reprobe_without_weakening_fresh_guard() {
+        for hresult in [0x8000_4001u32, 0x8000_4002, 0x8007_0032] {
+            let error = WindowsError::from_hresult(windows::core::HRESULT(hresult as i32));
+            assert!(native_interval_is_unavailable(&error));
+        }
+        let stats = CaptureCounters::default();
+        let status = AtomicU8::new(NativeIntervalStatus::NotAttempted as u8);
+        let capability = AtomicU8::new(NativeIntervalCapability::Unknown as u8);
+        let unsupported = Err(WindowsError::from_hresult(windows::core::HRESULT(
+            0x8007_0032u32 as i32,
+        )));
+        record_configured_interval_outcome(
+            &stats,
+            &status,
+            &capability,
+            2,
+            min_update_interval_ticks(2),
+            ConfiguredIntervalCause::InitialSetup,
+            &unsupported,
+        );
+        assert_eq!(stats.snapshot().native_interval_attempts, 1);
+        assert_eq!(stats.snapshot().native_interval_failures, 1);
+        assert_eq!(
+            status.load(Ordering::Acquire),
+            NativeIntervalStatus::UnsupportedOrFailed as u8
+        );
+        assert!(!should_attempt_fresh_override(
+            capability.load(Ordering::Acquire)
+        ));
+
+        let mut demand = CopyDemand::default();
+        let request = demand.request();
+        assert!(!FrameReadPolicy::Fresh.can_read(true, demand.is_complete(request)));
+        assert!(deliver_frame(&mut demand));
+        assert!(FrameReadPolicy::Fresh.can_read(true, demand.is_complete(request)));
+    }
+
     /// Resolve the first monitor through xcap, exactly like production code in
     /// monitor/windows.rs does. This also exercises the id contract that
     /// find_hmonitor re-derives (xcap Monitor::id() == HMONITOR value as u32) —
@@ -1035,6 +1594,44 @@ mod tests {
             (monitor_width, monitor_height)
         );
 
+        capture.stop();
+    }
+
+    #[test]
+    #[ignore = "requires a live Windows desktop session"]
+    fn live_rate_changes_apply_without_restarting_the_session() {
+        let (monitor_id, _, _) = first_monitor().expect("no monitor found");
+        crate::screenshot_rate::set(2).expect("set 2fps");
+        let mut capture = PersistentCapture::new(monitor_id).expect("failed to start capture");
+        capture
+            .get_latest_image(Duration::from_secs(2))
+            .expect("failed to get first frame");
+        let initial_stats = capture.stats();
+
+        for fps in [24, 4] {
+            crate::screenshot_rate::set(fps).expect("set live fps");
+            capture
+                .get_latest_image_streaming(Duration::from_secs(2))
+                .expect("live rate change disturbed capture");
+            let stats = capture.stats();
+            assert_eq!(stats.native_interval_requested_fps, fps);
+            assert_eq!(stats.native_interval_ticks, min_update_interval_ticks(fps));
+            assert_eq!(
+                capture.native_interval_status(),
+                NativeIntervalStatus::Applied
+            );
+        }
+
+        let stats = capture.stats();
+        assert_eq!(
+            stats.native_interval_attempts,
+            initial_stats.native_interval_attempts + 2
+        );
+        assert_eq!(
+            stats.native_interval_successes,
+            initial_stats.native_interval_successes + 2
+        );
+        assert_eq!(stats.native_interval_failures, 0);
         capture.stop();
     }
 

@@ -150,6 +150,8 @@ export type WorkflowRecording = {
 };
 
 export type WorkflowsAppProps = {
+  /** Optional content-free usage events; the host owns consent and identity. */
+  onUsageEvent?: (event: import("./use-workflow-usage").WorkflowUsageEvent) => void;
   modelControl?: import("react").ReactNode;
   /** Quiet in-app alternative to interrupting a focused workflow reader. */
   readyWorkflowIds?: string[];
@@ -178,7 +180,7 @@ export type WorkflowsAppProps = {
   onShareDocument?: (document: import("./document-actions").LibraryShareDocument) => void;
   onShareWorkflow?: (workflow: WorkflowMap) => void;
   /** Optional host integration with the existing external-agent launchers. */
-  workflowAgentActions?: (workflow: WorkflowMap) => import("react").ReactNode;
+  workflowAgentActions?: (workflow: WorkflowMap, closeSharing?: () => void) => import("react").ReactNode;
   /** Host-owned live recorder status and controls. */
   recordingStatus?: import("react").ReactNode;
   analysisUnavailableReason?: string;

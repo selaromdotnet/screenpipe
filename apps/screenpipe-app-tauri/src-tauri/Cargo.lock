@@ -478,7 +478,7 @@ dependencies = [
 [[package]]
 name = "antirez-asr-sys"
 version = "0.1.0"
-source = "git+https://github.com/EzraEllette/audiopipe.git?rev=b099a2e589d0dc4d8f22e3e8351efea9e1a359ac#b099a2e589d0dc4d8f22e3e8351efea9e1a359ac"
+source = "git+https://github.com/EzraEllette/audiopipe.git?rev=eb660d74867a6492ebf68ad4798bdc74d3902fd7#eb660d74867a6492ebf68ad4798bdc74d3902fd7"
 dependencies = [
  "cc",
 ]
@@ -1004,7 +1004,7 @@ dependencies = [
 [[package]]
 name = "audiopipe"
 version = "0.2.0"
-source = "git+https://github.com/EzraEllette/audiopipe.git?rev=b099a2e589d0dc4d8f22e3e8351efea9e1a359ac#b099a2e589d0dc4d8f22e3e8351efea9e1a359ac"
+source = "git+https://github.com/EzraEllette/audiopipe.git?rev=eb660d74867a6492ebf68ad4798bdc74d3902fd7#eb660d74867a6492ebf68ad4798bdc74d3902fd7"
 dependencies = [
  "antirez-asr-sys",
  "half",
@@ -10044,7 +10044,7 @@ checksum = "478e0585659a122aa407eb7e3c0e1fa51b1d8a870038bd29f0cf4a8551eea972"
 [[package]]
 name = "qwen3-asr-sys"
 version = "0.1.0"
-source = "git+https://github.com/EzraEllette/audiopipe.git?rev=b099a2e589d0dc4d8f22e3e8351efea9e1a359ac#b099a2e589d0dc4d8f22e3e8351efea9e1a359ac"
+source = "git+https://github.com/EzraEllette/audiopipe.git?rev=eb660d74867a6492ebf68ad4798bdc74d3902fd7#eb660d74867a6492ebf68ad4798bdc74d3902fd7"
 dependencies = [
  "cc",
  "cmake",
@@ -11261,7 +11261,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-app"
-version = "2.7.128"
+version = "2.7.153"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -11399,7 +11399,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-audio"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "audiopipe",
@@ -11481,7 +11481,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-config"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "dirs 6.0.0",
  "screenpipe-cpu-features",
@@ -11494,7 +11494,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-connect"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -11542,7 +11542,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-core"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "accessibility",
  "accessibility-sys",
@@ -11598,15 +11598,16 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-cpu-features"
-version = "0.4.52"
+version = "0.4.58"
 
 [[package]]
 name = "screenpipe-db"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "chrono",
  "criterion",
+ "dunce",
  "fs2",
  "futures",
  "image 0.25.10",
@@ -11641,7 +11642,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-engine"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -11718,7 +11719,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-events"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11734,14 +11735,14 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-fs"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "screenpipe-overlay-win"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "serde",
  "serde_json",
@@ -11766,7 +11767,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-redact"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -11805,7 +11806,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-resource"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "serde",
  "sysinfo",
@@ -11825,7 +11826,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-screen"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "accessibility-sys",
  "anyhow",
@@ -11847,6 +11848,7 @@ dependencies = [
  "rusty-tesseract",
  "sck-rs",
  "screenpipe-a11y",
+ "screenpipe-config",
  "screenpipe-connect",
  "screenpipe-core",
  "screenpipe-db",
@@ -11857,8 +11859,10 @@ dependencies = [
  "tracing",
  "uiautomation",
  "url",
+ "uuid",
  "windows 0.58.0",
  "xcap",
+ "xcb",
  "zbus",
 ]
 
@@ -11893,7 +11897,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sqlite-coordinator"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "fs2",
  "libsqlite3-sys",
@@ -11908,7 +11912,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sqlite-recovery"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "cc",
  "libsqlite3-sys",
@@ -11916,7 +11920,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sync"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -11936,7 +11940,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-telemetry-wire"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "serde",
  "serde_json",
@@ -11947,7 +11951,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-vault"
-version = "0.4.52"
+version = "0.4.58"
 dependencies = [
  "argon2 0.5.3",
  "chacha20poly1305",

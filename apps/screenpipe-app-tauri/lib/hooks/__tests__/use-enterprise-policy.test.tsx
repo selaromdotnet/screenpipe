@@ -248,20 +248,18 @@ describe("enterprise policy runtime manual activation", () => {
     vi.useRealTimers();
   });
 
-  it.each([
-    [undefined, true],
-    [{}, true],
-    [{ parsed: true }, true],
-    [{ parsed: false }, false],
-  ])("pushes the parsed-data default to native sync while preserving %j", async (streams, expected) => {
+  it("delegates device side effects to native authorization without racing native settings", async () => {
     mocks.commands.getEnterpriseLicenseKey.mockResolvedValue(KEY);
-    mockEnterpriseApi({ policy: { syncStreams: streams } });
+    mockEnterpriseApi({ policy: { syncStreams: { parsed: false }, lockedSettings: { disableAudio: "true" } } });
     const hook = await renderEnterprisePolicy();
-    await waitFor(() => {
-      expect(mocks.commands.setSyncStreams).toHaveBeenCalledWith(
-        true, expected, true, true, true, true, "off", "off",
-      );
-    });
+    await waitFor(() => expect(hook.result.current.isEnterpriseAuthenticated).toBe(true));
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenCalledWith(true, "license_key", KEY);
+    expect(mocks.commands.setSyncStreams).not.toHaveBeenCalled();
+    expect(mocks.commands.setEnterprisePolicy).not.toHaveBeenCalled();
+    expect(mocks.syncManagedPipes).not.toHaveBeenCalled();
+    expect(mocks.commands.syncManagedTeamSkills).not.toHaveBeenCalled();
+    expect(mocks.commands.saveEnterpriseTeamConfig).not.toHaveBeenCalled();
+    expect(mocks.store.set).not.toHaveBeenCalled();
     hook.unmount();
   });
 
@@ -290,12 +288,12 @@ describe("enterprise policy runtime manual activation", () => {
     );
     expect(mocks.commands.getEnterpriseLicenseKey).toHaveBeenCalledTimes(1);
     expect(policyCalls).toHaveLength(1);
-    expect(mocks.syncManagedPipes).toHaveBeenCalledTimes(1);
+    expect(mocks.syncManagedPipes).not.toHaveBeenCalled();
 
     view.unmount();
   });
 
-  it("installs an explicitly returned organization skill in local AI agents", async () => {
+  it("renders returned organization skills while native policy owns installation", async () => {
     mocks.commands.getEnterpriseLicenseKey.mockResolvedValue(KEY);
     const managedSkills = [
       {
@@ -330,12 +328,8 @@ describe("enterprise policy runtime manual activation", () => {
     const { result } = await renderEnterprisePolicy();
 
     await waitFor(() => expect(result.current.isEnterpriseAuthenticated).toBe(true));
-    await waitFor(() =>
-      expect(mocks.commands.syncManagedTeamSkills).toHaveBeenCalledWith(
-        managedSkills,
-        true,
-      ),
-    );
+    expect(result.current.policy.managedSkills).toEqual(managedSkills);
+    expect(mocks.commands.syncManagedTeamSkills).not.toHaveBeenCalled();
   });
 
   it("preserves installed organization skills when the policy field is omitted", async () => {
@@ -415,12 +409,8 @@ describe("enterprise policy runtime manual activation", () => {
 
     const { result } = await renderEnterprisePolicy();
 
-    await waitFor(() =>
-      expect(mocks.commands.setEnterprisePolicy).toHaveBeenCalledWith(
-        ["referral", "autoStartEnabled"],
-        true,
-      ),
-    );
+    await waitFor(() => expect(result.current.isEnterpriseAuthenticated).toBe(true));
+    expect(mocks.commands.setEnterprisePolicy).not.toHaveBeenCalled();
     expect(result.current.isSettingLocked("autoStartEnabled")).toBe(true);
     expect(result.current.getManagedValue("autoStartEnabled")).toBe("true");
     expect(mocks.settings.autoStartEnabled).toBe(false);
@@ -440,12 +430,8 @@ describe("enterprise policy runtime manual activation", () => {
 
     const { result } = await renderEnterprisePolicy();
 
-    await waitFor(() =>
-      expect(mocks.commands.setEnterprisePolicy).toHaveBeenCalledWith(
-        ["referral", "autoStartEnabled"],
-        false,
-      ),
-    );
+    await waitFor(() => expect(result.current.isEnterpriseAuthenticated).toBe(true));
+    expect(mocks.commands.setEnterprisePolicy).not.toHaveBeenCalled();
     expect(result.current.isSettingLocked("autoStartEnabled")).toBe(false);
     expect(result.current.getManagedValue("autoStartEnabled")).toBeUndefined();
     expect(mocks.settings.autoStartEnabled).toBe(false);
@@ -462,12 +448,8 @@ describe("enterprise policy runtime manual activation", () => {
 
     const { result } = await renderEnterprisePolicy();
 
-    await waitFor(() =>
-      expect(mocks.commands.setEnterprisePolicy).toHaveBeenCalledWith(
-        ["referral", "autoStartEnabled"],
-        false,
-      ),
-    );
+    await waitFor(() => expect(result.current.isEnterpriseAuthenticated).toBe(true));
+    expect(mocks.commands.setEnterprisePolicy).not.toHaveBeenCalled();
     expect(result.current.isSettingLocked("autoStartEnabled")).toBe(false);
     expect(result.current.getManagedValue("autoStartEnabled")).toBeUndefined();
     expect(mocks.settings.autoStartEnabled).toBe(false);
@@ -484,12 +466,8 @@ describe("enterprise policy runtime manual activation", () => {
 
     const { result } = await renderEnterprisePolicy();
 
-    await waitFor(() =>
-      expect(mocks.commands.setEnterprisePolicy).toHaveBeenCalledWith(
-        ["referral"],
-        false,
-      ),
-    );
+    await waitFor(() => expect(result.current.isEnterpriseAuthenticated).toBe(true));
+    expect(mocks.commands.setEnterprisePolicy).not.toHaveBeenCalled();
     expect(result.current.isSettingLocked("autoStartEnabled")).toBe(false);
     expect(result.current.getManagedValue("autoStartEnabled")).toBeUndefined();
     expect(mocks.settings.autoStartEnabled).toBe(false);
@@ -628,6 +606,16 @@ describe("enterprise policy runtime manual activation", () => {
     expect(result.current.isEnterpriseAuthenticated).toBe(false);
   });
 
+  it("keeps enrollment working if the webview cannot determine its timezone",async()=>{
+    const timezone=vi.spyOn(Intl.DateTimeFormat.prototype,"resolvedOptions").mockImplementation(()=>{throw Error("unavailable");});
+    try {
+      mockEnterpriseApi({});const {result}=await renderEnterprisePolicy();
+      await act(async()=>{await result.current.submitLicenseKey(KEY);});
+      const call=mocks.tauriFetch.mock.calls.find(([url])=>String(url).includes("/api/enterprise/heartbeat"));
+      expect(call).toBeDefined();expect(JSON.parse(String(call?.[1]?.body))).not.toHaveProperty("timezone");
+    } finally {timezone.mockRestore();}
+  });
+
   it("sends only X-License-Key for key authentication", async () => {
     Object.assign(mocks.settings, { user: { token: "existing-account-token" } });
     mockEnterpriseApi({});
@@ -654,6 +642,7 @@ describe("enterprise policy runtime manual activation", () => {
     expect(keyHeartbeatCall?.[1]?.headers["X-License-Key"]).toBe(KEY);
     expect(keyHeartbeatCall?.[1]?.headers.Authorization).toBeUndefined();
     const heartbeatBody = JSON.parse(String(keyHeartbeatCall?.[1]?.body));
+    expect(heartbeatBody.timezone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
     expect(heartbeatBody.recording_status).toEqual({ frame_status: "ok", audio_status: "ok", schedule_paused: true,
       drm_content_paused: false, vision_reason: "no_displays_expected", audio_reason: "screen_locked", activity: "unknown" });
     expect(heartbeatBody).toMatchObject({
@@ -1021,7 +1010,7 @@ describe("enterprise policy runtime manual activation", () => {
     expect(heartbeatCall?.[1]?.connectTimeout).toBe(10_000);
   });
 
-  it.each(["store open", "settings read", "AI preset write", "AI preset save", "install metadata", "app update save"])(
+  it.each(["store open", "settings read", "install metadata"])(
     "finishes enterprise verification when %s never returns",
     async (stage) => {
       vi.useFakeTimers();
@@ -1031,13 +1020,8 @@ describe("enterprise policy runtime manual activation", () => {
       const pending = new Promise<never>(() => {});
       if (stage === "store open") vi.mocked(getStore).mockReturnValueOnce(pending);
       if (stage === "settings read") mocks.store.get.mockReturnValueOnce(pending);
-      if (stage === "AI preset write") mocks.store.set.mockReturnValueOnce(pending);
-      if (stage === "AI preset save") mocks.store.save.mockReturnValueOnce(pending);
       if (stage === "install metadata") {
         mocks.commands.getEnterpriseInstallMetadata.mockReturnValueOnce(pending);
-      }
-      if (stage === "app update save") {
-        mocks.store.save.mockResolvedValueOnce(undefined).mockReturnValueOnce(pending);
       }
 
       const { result, unmount } = await renderEnterprisePolicy();

@@ -32,8 +32,31 @@ const GPT56_CACHE = { cacheRead: 0.1, cacheWrite: 1.25 };
 const GEMINI25_CACHE = { cacheRead: 0.25 };
 
 const MODEL_PRICING: Record<string, ModelPricing> = {
+  // Gemini 4 on the native Vertex lane. Hydrogen/Carbon are flat priced (no
+  // long-context cliff); Argon keeps its launch pricing via argonPricing() in
+  // findPricing. All three bill cached input at 5% of the input rate.
   [GEMINI_ARGON_MODEL]: { input: 4, output: 20, cacheRead: 0.05 },
+  // https://ai.google.dev/gemini-api/docs/models (Gemini 4 Hydrogen, Carbon).
+  'gemini-4-hydrogen': { input: 1.50, output: 7.50, cacheRead: 0.05 },
+  'gemini-4-carbon': { input: 2, output: 10, cacheRead: 0.05 },
   // OpenAI API
+  // https://developers.openai.com/api/docs/models/gpt-6.1-sol (Standard, Low).
+  'gpt-6.1-sol': {
+    input: 2, output: 10, cacheRead: 0.05, cacheWrite: 1.25,
+    longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+  },
+  // GPT-6.2: Sol (Standard, Low) and Astra (Standard, Low). Both keep the
+  // 272K long-context tier and the 5% cached-input rate of the 6.x family.
+  // https://developers.openai.com/api/docs/models/gpt-6.2-sol
+  'gpt-6.2-sol': {
+    input: 2, output: 10, cacheRead: 0.05, cacheWrite: 1.25,
+    longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+  },
+  // https://developers.openai.com/api/docs/models/gpt-6.2-astra
+  'gpt-6.2-astra': {
+    input: 8, output: 40, cacheRead: 0.05, cacheWrite: 1.25,
+    longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+  },
   // https://developers.openai.com/api/docs/models/gpt-6-astra (Standard, Low).
   'gpt-6-astra': {
     input: 10.00, output: 50.00, ...GPT56_CACHE,
@@ -174,6 +197,14 @@ function findPricing(model: string | null | undefined): ModelPricing | null {
 export function getFlatGatewayTokenRates(model: string) {
   const pricing = findPricing(model);
   if (!pricing || pricing.longContext) return null;
+  return getBaseGatewayTokenRates(model);
+}
+
+/** Cloudflare meters the base schedule. The durable context ledger meters
+ * only the additional tier charge, using final provider usage. */
+export function getBaseGatewayTokenRates(model: string) {
+  const pricing = findPricing(model);
+  if (!pricing) return null;
   const input = pricing.input / 1_000_000;
   return {
     per_token_in: input,
@@ -181,6 +212,24 @@ export function getFlatGatewayTokenRates(model: string) {
     per_cache_read_token: input * (pricing.cacheRead ?? 1),
     per_cache_write_token: input * (pricing.cacheWrite ?? 1),
   };
+}
+
+export function hasContextPricing(model: string): boolean {
+  return findPricing(model)?.longContext !== undefined;
+}
+
+export function getContextPricingPremium(model: string, input: number, output: number, cache: CacheUsage = {}): number {
+  const pricing = findPricing(model);
+  if (!pricing) throw new Error('Missing gateway token prices');
+  if (!pricing.longContext || input <= pricing.longContext.threshold) return 0;
+  const rates = getBaseGatewayTokenRates(model);
+  if (!rates) throw new Error('Missing gateway token prices');
+  const read = Math.max(0, cache.cache_read_tokens ?? 0);
+  const write = Math.max(0, cache.cache_creation_tokens ?? 0);
+  const scale = read + write ? Math.min(input, read + write) / (read + write) : 0;
+  const base = (input - (read + write) * scale) * rates.per_token_in + output * rates.per_token_out +
+    read * scale * rates.per_cache_read_token + write * scale * rates.per_cache_write_token;
+  return Math.max(0, getModelCost(model, input, output, cache) - base);
 }
 
 /** Collapse versioned model IDs and arbitrary caller input to a bounded key. */

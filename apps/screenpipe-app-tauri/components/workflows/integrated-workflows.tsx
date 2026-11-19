@@ -13,6 +13,7 @@ import { ConnectionsSection } from "@/components/settings/connections-section";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WorkflowsApp, type WorkflowsAppProps, type WorkflowMap, type WorkflowComposerAccessoryProps } from "@screenpipe/workflows-ui";
 import { createFixtureWorkflowsPlatform } from "@screenpipe/workflows-ui/fixture";
+import { captureWorkflowView, withWorkflowUsage } from "@/lib/workflows/usage";
 import { desktopWorkflowsPlatform } from "@/lib/workflows/desktop-platform";
 import { ProductSwitcher, type ProductMode } from "./product-switcher";
 import { ComposerDictationControl } from "@/components/chat/standalone/composer-dictation-control";
@@ -33,13 +34,13 @@ function WorkflowDictation(props: WorkflowComposerAccessoryProps) {
 }
 const composerAccessory = (props: WorkflowComposerAccessoryProps) => <WorkflowDictation key={props.sessionId} {...props} />;
 
-const workflowAgentActions = (workflow: WorkflowMap) => <WorkflowAgentActions key={workflow.id || workflow.title} workflow={workflow} />;
+const workflowAgentActions = (workflow: WorkflowMap, closeSharing?: () => void) => <WorkflowAgentActions closeSharing={closeSharing} key={workflow.id || workflow.title} workflow={workflow} />;
 
 // Only the existing browser-mock build gets synthetic data. Native builds use
 // the parent PR's adapter, native recorder and app-local persistent storage.
 const platform = process.env.NEXT_PUBLIC_SCREENPIPE_WEB_DEV === "mock"
   ? createFixtureWorkflowsPlatform(undefined, typeof window === "undefined" ? "ready" : new URLSearchParams(window.location.search).get("workflowConnection") ?? "ready")
-  : desktopWorkflowsPlatform;
+  : withWorkflowUsage(desktopWorkflowsPlatform);
 export function DeviceWorkflows({ active, fullscreen = false, onModeChange, recordingStatus, navigationFooter, sourceControl }: { sourceControl?: React.ReactNode; active: boolean; fullscreen?: boolean; onModeChange: (mode: ProductMode) => void; recordingStatus: React.ReactNode; navigationFooter?: WorkflowsAppProps["navigationFooter"] }) {
   const enabled = useWorkflowsRolloutEnabled();
   const [readyWorkflowIds, setReadyWorkflowIds] = useState<string[]>([]);
@@ -90,7 +91,7 @@ export function DeviceWorkflows({ active, fullscreen = false, onModeChange, reco
         onConnectionClose={closeConnections}
       />}
 
-      <WorkflowsApp desktopAppearance modelControl={<WorkflowModelSelector preference={platform.modelPreference} />} readyWorkflowIds={readyWorkflowIds} reviewRequest={reviewRequest} onReviewRequestHandled={handleReview} onAnalysisUnavailable={() => setAccessRequested(true)} analysisUnavailableReason={analysisUnavailableReason} composerAccessory={composerAccessory} fullscreen={fullscreen} onShareWorkflow={openShare} onShareDocument={shareDocument} workflowAgentActions={workflowAgentActions} platform={platform} active={active} storageKey={null}
+      <WorkflowsApp onUsageEvent={captureWorkflowView} desktopAppearance modelControl={<WorkflowModelSelector preference={platform.modelPreference} />} readyWorkflowIds={readyWorkflowIds} reviewRequest={reviewRequest} onReviewRequestHandled={handleReview} onAnalysisUnavailable={() => setAccessRequested(true)} analysisUnavailableReason={analysisUnavailableReason} composerAccessory={composerAccessory} fullscreen={fullscreen} onShareWorkflow={openShare} onShareDocument={shareDocument} workflowAgentActions={workflowAgentActions} platform={platform} active={active} storageKey={null}
         toolbarAccessory={platform.managesAnalysis ? <WorkflowAccess requested={accessRequested} onRequestChange={setAccessRequested} active={active} onAccessChange={setAnalysisUnavailableReason} /> : process.env.NEXT_PUBLIC_SCREENPIPE_WEB_DEV === "mock" ? <WorkflowTasksPrompt active={active} tasks={fixtureWorkflowTasks} /> : undefined}
         recordingStatus={recordingStatus} navigationFooter={navigationFooter}
         sourceControl={sourceControl} navigationBrand={<ProductSwitcher mode="workflows" onChange={onModeChange} />} />
@@ -117,7 +118,7 @@ export function IntegratedWorkflows(props: Parameters<typeof DeviceWorkflows>[0]
     finally { setSaving(false); }
   }
   const sourceControl = <label className="relative flex shrink-0 flex-col gap-2 text-xs"><span className="sr-only">Workflow source</span>
-    <select aria-label="Workflow source" style={{ color: "var(--ink)", colorScheme: "light" }} className="w-36 rounded-md border border-transparent bg-transparent px-2 py-1.5 text-xs text-inherit opacity-75 hover:opacity-100 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" value={source} disabled={saving} onChange={event => void change(event.target.value as "device" | "cloud")}>
+    <select aria-label="Workflow source" style={{ color: "var(--ink)" }} className="w-36 rounded-md border border-transparent bg-transparent px-2 py-1.5 text-xs text-inherit opacity-75 hover:opacity-100 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" value={source} disabled={saving} onChange={event => void change(event.target.value as "device" | "cloud")}>
       <option value="cloud">Cloud workspace</option><option value="device">This device</option>
     </select>
     {error && <span role="alert" className="absolute left-0 top-full z-20 mt-1 w-60 rounded-md border bg-background p-3 text-foreground shadow-sm">{error}</span>}

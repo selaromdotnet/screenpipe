@@ -4,15 +4,15 @@
 import { expect, test } from 'bun:test';
 import { LocalGatewayHarness } from './local-gateway-harness';
 
-test('real Worker refuses client-supplied attribution and preserves ZDR on service traffic', async () => {
+test('real Worker refuses client-supplied attribution and enforces no-training on service traffic', async () => {
   let dispatches = 0;
   const harness = await LocalGatewayHarness.start({ experientialHybrid: true, cloudflareSpendRules: true,
     outboundResponse: async (request, body) => {
       if (!new URL(request.url).pathname.includes('/custom-experiential-fixture/')) return undefined;
       dispatches++;
-      expect(request.headers.get('X-Explabs-Tags')).toBeNull();
+      expect(JSON.parse(request.headers.get('X-Explabs-Tags')!)).toEqual({ training_allowed: 'false' });
       expect(Object.keys(JSON.parse(request.headers.get('cf-aig-metadata')!)).sort()).toEqual(['lane', 'plan', 'trial', 'user_id', 'workload']);
-      expect(body.provider).toEqual({ zdr: true });
+      expect(body.provider).toBeUndefined();
       expect(body.store).toBe(false);
       return Response.json({ id: 'fixture', model: body.model, choices: [{ message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 8, completion_tokens: 1 } }, { headers: { 'x-gateway-zdr': 'true' } });

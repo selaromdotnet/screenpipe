@@ -308,6 +308,7 @@
       "crate": "screenpipe-engine",
       "files": [
         "src/activity_ledger.rs",
+        "src/agent_chats.rs",
         "src/agent_profile.rs",
         "src/agent_skills.rs",
         "src/auth_key.rs",
@@ -378,9 +379,10 @@
     },
     {
       "id": "engine-local-api-search-integration",
-      "label": "Engine local API search route over indexed DB data",
+      "label": "Engine local search over indexed DB data",
       "crate": "screenpipe-engine",
       "files": [
+        "tests/cli_search_storage.rs",
         "tests/endpoint_test.rs"
       ],
       "platforms": [
@@ -398,7 +400,7 @@
       "criticality": "high",
       "confidence": "strong",
       "kind": "integration",
-      "notes": "Active /search route test builds an audio-disabled router, seeds captured-screen-shaped OCR data into an in-memory DB, and asserts the HTTP response and pagination."
+      "notes": "Active /search route tests seed captured-screen-shaped OCR data into an in-memory DB and assert the HTTP response and pagination. CLI tests search sealed hybrid and legacy histories in text and JSON, and verify missing-history and descriptor diagnostics."
     },
     {
       "id": "engine-db-recovery-cli",
@@ -586,6 +588,7 @@
         "src/recording_coverage.rs",
         "src/resource_monitor.rs",
         "src/telemetry_context.rs",
+        "src/telemetry_reporting.rs",
         "src/telemetry_tasks.rs"
       ],
       "platforms": [
@@ -693,6 +696,7 @@
         "src/storage/bulk/elements/lifecycle.rs",
         "src/storage/diagnostics.rs",
         "src/storage/lifecycle.rs",
+        "src/storage/mod.rs",
         "src/storage/parity.rs",
         "src/storage/reclaim.rs",
         "src/storage/schema.rs",
@@ -1157,6 +1161,12 @@
         "src/monitor.rs",
         "src/ocr_cache.rs",
         "src/snapshot_writer.rs",
+        "src/screenshot_privacy.rs",
+        "src/screenshot_privacy/scene.rs",
+        "src/screenshot_privacy/macos.rs",
+        "src/screenshot_privacy/stream.rs",
+        "src/screenshot_rate.rs",
+        "src/screenshot_privacy/windows.rs",
         "src/utils.rs",
         "tests/capture_error_test.rs",
         "tests/capture_retry_test.rs",
@@ -1219,6 +1229,8 @@
       "crate": "screenpipe-screen",
       "files": [
         "src/monitor/linux_portal.rs",
+        "src/monitor/linux_portal_dbus_tests.rs",
+        "src/monitor/linux_portal_token.rs",
         "src/monitor/linux_wayland.rs",
         "src/monitor/macos.rs",
         "src/monitor/windows.rs",

@@ -34,6 +34,7 @@
 //! section in `AGENTS.md` before touching those.
 
 pub mod activity_ledger;
+pub(crate) mod agent_chats;
 pub(crate) mod agent_profile;
 pub(crate) mod agent_skills;
 pub mod analytics;
@@ -99,6 +100,7 @@ pub mod structured_outputs;
 mod sync_api;
 pub mod sync_provider;
 pub mod telemetry_context;
+pub mod telemetry_reporting;
 mod telemetry_tasks;
 pub mod ui_recorder;
 // Exposed publicly so the commercial `screenpipe-sdk` (screenpipe/sdk repo)
