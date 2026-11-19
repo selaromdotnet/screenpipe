@@ -7,6 +7,7 @@
 //! The native app owns both the schedule and generation lifecycle. React only
 //! reads the persisted projection or asks the backend for an immediate run.
 
+mod markdown_export;
 mod quota;
 use quota::QuotaPause;
 use sha2::{Digest, Sha256};
@@ -481,6 +482,44 @@ async fn write_all(app: &AppHandle, history: &PersistedActivityHistory) -> Resul
     store.save().map_err(|error| error.to_string())?;
     store::reencrypt_store_file(app);
     Ok(())
+}
+
+/// Best-effort mirror of the given local days to `<data dir>/activities`.
+/// Uses the same visibility rules as `get_activity_history`, and never fails
+/// the caller: the store is the source of truth.
+fn export_markdown_days(
+    app: &AppHandle,
+    history: &PersistedActivityHistory,
+    days: impl IntoIterator<Item = chrono::NaiveDate>,
+) {
+    let dir = match crate::config::get_base_dir(app, None) {
+        Ok(base) => base.join(markdown_export::DIRECTORY),
+        Err(error) => {
+            warn!(%error, "activity history: markdown export has no data directory");
+            return;
+        }
+    };
+    let restricted = activity_history_is_restricted(app);
+    let now = Utc::now();
+    for day in days {
+        let Some((day_start, day_end)) = markdown_export::day_bounds(&Local, day) else {
+            continue;
+        };
+        let mut visible = PersistedActivityHistory {
+            entries: markdown_export::entries_for_day(&Local, day, &history.entries),
+            coverage: Vec::new(),
+        };
+        if restricted {
+            // Outside the free window: leave any earlier file untouched.
+            let Some((start, end)) = activity_access_range(day_start, day_end, now, true) else {
+                continue;
+            };
+            visible = restricted_history_in_range(visible, start, end);
+        }
+        if let Err(error) = markdown_export::write_day(&dir, &Local, day, &visible.entries, now) {
+            warn!(%error, %day, "activity history: markdown export failed");
+        }
+    }
 }
 
 fn history_in_range(
@@ -1660,6 +1699,11 @@ async fn generate_inner(
     }
     stored.coverage = merge_coverage(stored.coverage);
     write_all(app, &stored).await?;
+    export_markdown_days(
+        app,
+        &stored,
+        markdown_export::days_in_range(&Local, start, end),
+    );
     if source == "manual" {
         let settings = SettingsStore::get(app)?.ok_or("Settings are not available")?;
         set_next_run(
@@ -1921,6 +1965,12 @@ fn set_next_run(app: &AppHandle, at: DateTime<Utc>) -> Result<(), String> {
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        // Backfill files for history generated before the export existed, or
+        // while a write failed.
+        if let Ok(history) = read_all(&app) {
+            let days = markdown_export::entry_days(&Local, &history.entries);
+            export_markdown_days(&app, &history, days);
+        }
         let state = app.state::<ActivityHistoryState>();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
